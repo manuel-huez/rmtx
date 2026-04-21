@@ -16,12 +16,12 @@ import (
 	"github.com/manuel-huez/rmtx/internal/app"
 	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/config"
+	"github.com/manuel-huez/rmtx/internal/host"
 )
 
 const exitUsage = 2
 const tabWriterTabWidth = 8
 const tabWriterPadding = 2
-const cliVersion = "0.2.0"
 
 type remoteFlags struct {
 	hostAddr         *string
@@ -46,7 +46,7 @@ func run(ctx context.Context, args []string) int {
 
 	switch args[0] {
 	case "version", "--version", "-v":
-		_, _ = fmt.Fprintln(os.Stdout, cliVersion)
+		_, _ = fmt.Fprintln(os.Stdout, host.Version)
 		return 0
 	case "host":
 		return runHost(ctx, args[1:])
