@@ -11,9 +11,12 @@ import (
 )
 
 const (
-	DefaultPort    = 33221
-	DefaultService = "rmtx"
+	DefaultPort             = 33221
+	DefaultService          = "rmtx"
+	defaultDiscoveryTimeout = 750 * time.Millisecond
 )
+
+var ErrConfigNotFound = errors.New("config not found")
 
 var fileNames = []string{
 	".rmtx.json",
@@ -87,7 +90,7 @@ func Search(startDir string) (*Loaded, error) {
 
 		parent := filepath.Dir(current)
 		if parent == current {
-			return nil, nil
+			return nil, ErrConfigNotFound
 		}
 
 		current = parent
@@ -126,6 +129,10 @@ func Resolve(startDir, explicitConfig string) (*Loaded, error) {
 
 	loaded, err := Search(startDir)
 	if err != nil {
+		if errors.Is(err, ErrConfigNotFound) {
+			goto defaultConfig
+		}
+
 		return nil, err
 	}
 
@@ -133,7 +140,9 @@ func Resolve(startDir, explicitConfig string) (*Loaded, error) {
 		return loaded, nil
 	}
 
+defaultConfig:
 	root, err := filepath.Abs(startDir)
+
 	if err != nil {
 		return nil, fmt.Errorf("resolve default root: %w", err)
 	}
@@ -158,7 +167,7 @@ func (c Config) DiscoveryEnabled() bool {
 func (c Config) DiscoveryTimeout() time.Duration {
 	d, err := time.ParseDuration(c.Discovery.Timeout)
 	if err != nil {
-		return 750 * time.Millisecond
+		return defaultDiscoveryTimeout
 	}
 
 	return d

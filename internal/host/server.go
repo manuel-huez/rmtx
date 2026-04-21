@@ -14,11 +14,19 @@ import (
 	"sync"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
 const Version = "0.1.0"
+const (
+	defaultDirMode   = 0o755
+	streamBufferSize = 32 * 1024
+	splitNEquals     = 2
+	pipeCount        = 2
+	exitCodeNotFound = 127
+)
 
 type Options struct {
 	ListenAddr       string
@@ -64,11 +72,11 @@ func New(opts Options) (*Server, error) {
 		opts.Logger = log.New(io.Discard, "", 0)
 	}
 
-	if err := os.MkdirAll(opts.StateDir, 0o755); err != nil {
+	if err := os.MkdirAll(opts.StateDir, defaultDirMode); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(opts.StateDir, "sessions"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(opts.StateDir, "sessions"), defaultDirMode); err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 
@@ -93,7 +101,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.opts.ListenAddr, err)
 	}
-	defer ln.Close()
+
+	defer func() { _ = ln.Close() }()
 
 	s.listener = ln
 	s.logger.Printf("listening on %s", ln.Addr().String())
@@ -111,7 +120,8 @@ func (s *Server) Serve(ctx context.Context) error {
 				s.logger.Printf("discovery advertise failed: %v", err)
 			} else {
 				s.advertiser = adv
-				defer adv.Close()
+
+				defer func() { _ = adv.Close() }()
 			}
 		}
 	}
@@ -138,74 +148,95 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(parent context.Context, raw net.Conn) {
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	conn := protocol.NewConn(raw)
+	if err := s.handleConnSession(parent, conn); err != nil {
+		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
+	}
+}
+
+func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
 	if err := s.authenticate(conn); err != nil {
-		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
-		return
+		return err
 	}
 
-	head, err := conn.ReadHeader()
+	request, err := readRunRequest(conn)
 	if err != nil {
-		return
+		return err
 	}
 
-	if head.Type != protocol.MsgRunRequest {
-		_ = conn.WriteJSON(
-			protocol.MsgError,
-			protocol.ErrorMessage{
-				Message: fmt.Sprintf("expected %s, got %s", protocol.MsgRunRequest, head.Type),
-			},
-		)
-
-		return
-	}
-
-	request, err := protocol.DecodeData[protocol.RunRequest](head)
-	if err != nil {
-		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
-		return
-	}
-
-	if len(request.Command) == 0 {
-		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: "missing command"})
-		return
-	}
-
-	missing := s.blobStore.MissingHashes(request.Manifest)
-	if err := conn.WriteJSON(
-		protocol.MsgNeedBlobs,
-		protocol.NeedBlobs{Hashes: missing},
-	); err != nil {
-		return
-	}
-
-	if err := s.receiveBlobs(conn); err != nil {
-		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
-		return
+	if err := s.prepareWorkspace(conn, request.Manifest); err != nil {
+		return err
 	}
 
 	workspace, err := os.MkdirTemp(filepath.Join(s.opts.StateDir, "sessions"), "session-")
 	if err != nil {
-		_ = conn.WriteJSON(
-			protocol.MsgError,
-			protocol.ErrorMessage{Message: fmt.Sprintf("create workspace: %v", err)},
-		)
-
-		return
+		return fmt.Errorf("create workspace: %w", err)
 	}
-	defer os.RemoveAll(workspace)
+
+	defer func() { _ = os.RemoveAll(workspace) }()
 
 	if err := syncfs.MaterializeWorkspace(workspace, request.Manifest, s.blobStore); err != nil {
-		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
-		return
+		return err
 	}
 
 	if err := conn.WriteJSON(protocol.MsgWorkspaceReady, nil); err != nil {
-		return
+		return err
 	}
 
+	code := s.executeRequest(parent, conn, workspace, request)
+	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
+		return err
+	}
+
+	return s.sendWorkspaceChanges(conn, workspace, request)
+}
+
+func readRunRequest(conn *protocol.Conn) (protocol.RunRequest, error) {
+	head, err := conn.ReadHeader()
+	if err != nil {
+		return protocol.RunRequest{}, err
+	}
+
+	if head.Type != protocol.MsgRunRequest {
+		return protocol.RunRequest{}, fmt.Errorf(
+			"expected %s, got %s",
+			protocol.MsgRunRequest,
+			head.Type,
+		)
+	}
+
+	request, err := protocol.DecodeData[protocol.RunRequest](head)
+	if err != nil {
+		return protocol.RunRequest{}, err
+	}
+
+	if len(request.Command) == 0 {
+		return protocol.RunRequest{}, errors.New("missing command")
+	}
+
+	return request, nil
+}
+
+func (s *Server) prepareWorkspace(conn *protocol.Conn, manifest []syncfs.Entry) error {
+	missing := s.blobStore.MissingHashes(manifest)
+	if err := conn.WriteJSON(
+		protocol.MsgNeedBlobs,
+		protocol.NeedBlobs{Hashes: missing},
+	); err != nil {
+		return err
+	}
+
+	return s.receiveBlobs(conn)
+}
+
+func (s *Server) executeRequest(
+	parent context.Context,
+	conn *protocol.Conn,
+	workspace string,
+	request protocol.RunRequest,
+) int {
 	sessionCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -214,18 +245,17 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 		s.logger.Printf("session %s exited with error: %v", request.Session, runErr)
 	}
 
-	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
-		return
-	}
+	return code
+}
 
+func (s *Server) sendWorkspaceChanges(
+	conn *protocol.Conn,
+	workspace string,
+	request protocol.RunRequest,
+) error {
 	post, err := syncfs.BuildManifest(workspace, request.Mounts)
 	if err != nil {
-		_ = conn.WriteJSON(
-			protocol.MsgError,
-			protocol.ErrorMessage{Message: fmt.Sprintf("scan workspace changes: %v", err)},
-		)
-
-		return
+		return fmt.Errorf("scan workspace changes: %w", err)
 	}
 
 	changed, deleted := syncfs.Diff(request.Manifest, post.Entries)
@@ -233,47 +263,46 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 		protocol.MsgChangeSet,
 		protocol.ChangeSet{Entries: changed, Deleted: deleted},
 	); err != nil {
-		return
+		return err
 	}
 
+	if err := sendChangedFileBlobs(conn, workspace, changed); err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+}
+
+func sendChangedFileBlobs(conn *protocol.Conn, workspace string, changed []syncfs.Entry) error {
 	for _, entry := range changed {
 		if entry.Kind != syncfs.KindFile {
 			continue
 		}
 
-		path := filepath.Join(workspace, filepath.FromSlash(entry.Path))
-
-		f, err := os.Open(path)
-		if err != nil {
-			_ = conn.WriteJSON(
-				protocol.MsgError,
-				protocol.ErrorMessage{
-					Message: fmt.Sprintf("open change blob %s: %v", entry.Path, err),
-				},
-			)
-
-			return
+		if err := sendChangedFileBlob(conn, workspace, entry); err != nil {
+			return err
 		}
-
-		if err := conn.WriteFrom(
-			protocol.MsgChangeBlob,
-			protocol.BlobInfo{
-				Path: entry.Path,
-				Hash: entry.Hash,
-				Size: entry.Size,
-				Mode: entry.Mode,
-			},
-			f,
-			entry.Size,
-		); err != nil {
-			f.Close()
-			return
-		}
-
-		_ = f.Close()
 	}
 
-	_ = conn.WriteJSON(protocol.MsgChangesDone, nil)
+	return nil
+}
+
+func sendChangedFileBlob(conn *protocol.Conn, workspace string, entry syncfs.Entry) error {
+	path := filepath.Join(workspace, filepath.FromSlash(entry.Path))
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open change blob %s: %w", entry.Path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	return conn.WriteFrom(
+		protocol.MsgChangeBlob,
+		protocol.BlobInfo{Path: entry.Path, Hash: entry.Hash, Size: entry.Size, Mode: entry.Mode},
+		f,
+		entry.Size,
+	)
 }
 
 func (s *Server) authenticate(conn *protocol.Conn) error {
@@ -384,7 +413,7 @@ func (s *Server) runCommand(
 	}
 
 	var outWG sync.WaitGroup
-	outWG.Add(2)
+	outWG.Add(pipeCount)
 
 	go func() {
 		defer outWG.Done()
@@ -418,7 +447,7 @@ func (s *Server) runCommand(
 }
 
 func (s *Server) consumeStdin(conn *protocol.Conn, stdin io.WriteCloser) error {
-	defer stdin.Close()
+	defer func() { _ = stdin.Close() }()
 
 	for {
 		head, err := conn.ReadHeader()
@@ -448,7 +477,7 @@ func (s *Server) consumeStdin(conn *protocol.Conn, stdin io.WriteCloser) error {
 }
 
 func streamPipe(conn *protocol.Conn, src io.Reader, stream string) error {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, streamBufferSize)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
@@ -480,11 +509,11 @@ func mergeEnv(base []string, overrides map[string]string) []string {
 
 	order := make([]string, 0, len(base)+len(overrides))
 	for _, entry := range base {
-		parts := strings.SplitN(entry, "=", 2)
+		parts := strings.SplitN(entry, "=", splitNEquals)
 		k := parts[0]
 
 		v := ""
-		if len(parts) == 2 {
+		if len(parts) == splitNEquals {
 			v = parts[1]
 		}
 
@@ -521,7 +550,7 @@ func exitCode(err error) int {
 		return exitErr.ExitCode()
 	}
 
-	return 127
+	return exitCodeNotFound
 }
 
 func secureJoin(root, rel string) (string, error) {
@@ -529,21 +558,10 @@ func secureJoin(root, rel string) (string, error) {
 		rel = "."
 	}
 
-	joined := filepath.Join(root, filepath.FromSlash(rel))
-
-	absRoot, err := filepath.Abs(root)
+	joined, err := pathutil.SecureJoin(root, filepath.FromSlash(rel))
 	if err != nil {
-		return "", err
-	}
-
-	absJoined, err := filepath.Abs(joined)
-	if err != nil {
-		return "", err
-	}
-
-	if absJoined != absRoot && !strings.HasPrefix(absJoined, absRoot+string(os.PathSeparator)) {
 		return "", fmt.Errorf("workdir %s escapes workspace", rel)
 	}
 
-	return absJoined, nil
+	return joined, nil
 }

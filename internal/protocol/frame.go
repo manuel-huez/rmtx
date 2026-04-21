@@ -28,7 +28,6 @@ func NewConn(conn net.Conn) *Conn {
 }
 
 func (c *Conn) Raw() net.Conn { return c.conn }
-func (c *Conn) Close() error  { return c.conn.Close() }
 
 func (c *Conn) WriteJSON(msgType string, payload any) error {
 	return c.write(msgType, payload, nil, 0)
@@ -40,6 +39,27 @@ func (c *Conn) WriteBytes(msgType string, payload any, data []byte) error {
 
 func (c *Conn) WriteFrom(msgType string, payload any, src io.Reader, payloadLen int64) error {
 	return c.write(msgType, payload, src, payloadLen)
+}
+
+func writePayload(w *bufio.Writer, data any, payloadLen int64) error {
+	switch v := data.(type) {
+	case []byte:
+		if int64(len(v)) != payloadLen {
+			return fmt.Errorf("payload length mismatch: %d != %d", len(v), payloadLen)
+		}
+
+		if _, err := w.Write(v); err != nil {
+			return fmt.Errorf("write frame payload: %w", err)
+		}
+	case io.Reader:
+		if _, err := io.CopyN(w, v, payloadLen); err != nil {
+			return fmt.Errorf("stream frame payload: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported payload type %T", data)
+	}
+
+	return nil
 }
 
 func (c *Conn) write(msgType string, payload any, data any, payloadLen int64) error {
@@ -71,21 +91,8 @@ func (c *Conn) write(msgType string, payload any, data any, payloadLen int64) er
 	}
 
 	if payloadLen > 0 {
-		switch v := data.(type) {
-		case []byte:
-			if int64(len(v)) != payloadLen {
-				return fmt.Errorf("payload length mismatch: %d != %d", len(v), payloadLen)
-			}
-
-			if _, err := c.w.Write(v); err != nil {
-				return fmt.Errorf("write frame payload: %w", err)
-			}
-		case io.Reader:
-			if _, err := io.CopyN(c.w, v, payloadLen); err != nil {
-				return fmt.Errorf("stream frame payload: %w", err)
-			}
-		default:
-			return fmt.Errorf("unsupported payload type %T", data)
+		if err := writePayload(c.w, data, payloadLen); err != nil {
+			return err
 		}
 	}
 
@@ -115,33 +122,7 @@ func (c *Conn) ReadHeader() (Header, error) {
 	return h, nil
 }
 
-func (c *Conn) ReadPayload(h Header) ([]byte, error) {
-	if h.PayloadLen == 0 {
-		return nil, nil
-	}
-
-	buf := make([]byte, h.PayloadLen)
-	if _, err := io.ReadFull(c.r, buf); err != nil {
-		return nil, fmt.Errorf("read frame payload: %w", err)
-	}
-
-	return buf, nil
-}
-
 func (c *Conn) PayloadReader(h Header) io.Reader { return io.LimitReader(c.r, h.PayloadLen) }
-
-func (c *Conn) CopyPayload(h Header, dst io.Writer) error {
-	if h.PayloadLen == 0 {
-		return nil
-	}
-
-	_, err := io.CopyN(dst, c.r, h.PayloadLen)
-	if err != nil {
-		return fmt.Errorf("copy payload: %w", err)
-	}
-
-	return nil
-}
 
 func (c *Conn) DiscardPayload(h Header) error {
 	if h.PayloadLen == 0 {

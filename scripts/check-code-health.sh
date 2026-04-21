@@ -59,13 +59,13 @@ run_golangci_lint() {
 }
 
 run_go_deadcode() {
-  deadcode ./cmd/rmtx ./internal/...
+  deadcode -test ./cmd/remotex ./internal/...
 }
 
 run_jscpd() {
   # Enforce zero production-code clones while ignoring intentionally repetitive
   # test scaffolding and harness setup.
-  npx --yes jscpd internal/ python/ \
+  npx --yes jscpd cmd/ internal/ \
     --ignore "**/*_test.go" \
     --threshold 0
 }

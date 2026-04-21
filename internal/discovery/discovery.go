@@ -14,6 +14,11 @@ import (
 )
 
 const DefaultDiscoveryPort = 33222
+const (
+	discoveryTimeoutDefault = 750 * time.Millisecond
+	discoveryPacketSize     = 2048
+	ipv4Len                 = 4
+)
 
 type Result struct {
 	Instance string
@@ -69,11 +74,11 @@ func (r *Responder) Close() error {
 }
 
 func (r *Responder) serve(ctx context.Context, service, instance string, port int) {
-	defer r.conn.Close()
+	defer func() { _ = r.conn.Close() }()
 
 	go func() { <-ctx.Done(); _ = r.conn.Close() }()
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, discoveryPacketSize)
 	for {
 		n, addr, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -102,14 +107,15 @@ func (r *Responder) serve(ctx context.Context, service, instance string, port in
 
 func DiscoverOne(ctx context.Context, service string, timeout time.Duration) (Result, error) {
 	if timeout <= 0 {
-		timeout = 750 * time.Millisecond
+		timeout = discoveryTimeoutDefault
 	}
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return Result{}, fmt.Errorf("listen for discovery responses: %w", err)
 	}
-	defer conn.Close()
+
+	defer func() { _ = conn.Close() }()
 
 	query, err := json.Marshal(packet{Type: "query", Service: service})
 	if err != nil {
@@ -120,48 +126,80 @@ func DiscoverOne(ctx context.Context, service string, timeout time.Duration) (Re
 		_, _ = conn.WriteToUDP(query, target)
 	}
 
-	results := map[string]Result{}
-	buf := make([]byte, 2048)
-
-	deadline := time.Now().Add(timeout)
-	for {
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			return Result{}, err
-		}
-
-		n, addr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				return Result{}, ctx.Err()
-			default:
-			}
-
-			return Result{}, fmt.Errorf("read discovery response: %w", err)
-		}
-
-		var pkt packet
-		if err := json.Unmarshal(buf[:n], &pkt); err != nil {
-			continue
-		}
-
-		if pkt.Type != "response" || pkt.Service != service || pkt.Port == 0 {
-			continue
-		}
-
-		address := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.Port))
-		results[address] = Result{Instance: pkt.Name, Address: address, Port: pkt.Port}
+	results, err := collectResponses(ctx, conn, service, timeout)
+	if err != nil {
+		return Result{}, err
 	}
 
 	if len(results) == 0 {
 		return Result{}, fmt.Errorf("no host discovered via %s within %s", service, timeout)
 	}
 
+	return selectSingleResult(results)
+}
+
+func collectResponses(
+	ctx context.Context,
+	conn *net.UDPConn,
+	service string,
+	timeout time.Duration,
+) (map[string]Result, error) {
+	results := map[string]Result{}
+	buf := make([]byte, discoveryPacketSize)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return nil, err
+		}
+
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			shouldStop, readErr := handleReadError(ctx, err)
+			if shouldStop {
+				return results, nil
+			}
+
+			if readErr != nil {
+				return nil, readErr
+			}
+
+			continue
+		}
+
+		recordResponse(results, service, buf[:n], addr)
+	}
+}
+
+func handleReadError(ctx context.Context, err error) (bool, error) {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true, nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+		return false, fmt.Errorf("read discovery response: %w", err)
+	}
+}
+
+func recordResponse(results map[string]Result, service string, raw []byte, addr *net.UDPAddr) {
+	var pkt packet
+	if err := json.Unmarshal(raw, &pkt); err != nil {
+		return
+	}
+
+	if pkt.Type != "response" || pkt.Service != service || pkt.Port == 0 {
+		return
+	}
+
+	address := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.Port))
+	results[address] = Result{Instance: pkt.Name, Address: address, Port: pkt.Port}
+}
+
+func selectSingleResult(results map[string]Result) (Result, error) {
 	ordered := make([]Result, 0, len(results))
 	for _, r := range results {
 		ordered = append(ordered, r)
@@ -252,7 +290,7 @@ func broadcastAddr(ipNet *net.IPNet) net.IP {
 		return nil
 	}
 
-	b := make(net.IP, 4)
+	b := make(net.IP, ipv4Len)
 	for i := range 4 {
 		b[i] = ip4[i] | ^mask[i]
 	}

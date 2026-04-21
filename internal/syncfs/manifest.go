@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 type EntryKind string
@@ -22,6 +24,12 @@ const (
 	KindFile    EntryKind = "file"
 	KindDir     EntryKind = "dir"
 	KindSymlink EntryKind = "symlink"
+)
+
+const (
+	minWorkers      = 2
+	defaultDirMode  = 0o755
+	defaultFileMode = 0o644
 )
 
 type MountSpec struct {
@@ -55,19 +63,15 @@ type hashResult struct {
 }
 
 func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
-	root, err := filepath.Abs(root)
+	root, mounts, err := normalizeBuildInputs(root, mounts)
 	if err != nil {
-		return BuildResult{}, fmt.Errorf("resolve root: %w", err)
-	}
-
-	if len(mounts) == 0 {
-		mounts = []MountSpec{{Path: "."}}
+		return BuildResult{}, err
 	}
 
 	jobs := make(chan hashJob)
 	results := make(chan hashResult)
 
-	workers := max(runtime.GOMAXPROCS(0), 2)
+	workers := max(runtime.GOMAXPROCS(0), minWorkers)
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -93,108 +97,10 @@ func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
 
 	entries := map[string]Entry{}
 	blobSources := map[string]string{}
-	jobCount := 0
 
-	for _, mount := range mounts {
-		mountPath, err := resolveMount(root, mount.Path)
-		if err != nil {
-			close(jobs)
-
-			for range results {
-			}
-
-			return BuildResult{}, err
-		}
-
-		if _, err := os.Lstat(mountPath); err != nil {
-			close(jobs)
-
-			for range results {
-			}
-
-			return BuildResult{}, fmt.Errorf("stat mount %s: %w", mount.Path, err)
-		}
-
-		walkErr := filepath.WalkDir(
-			mountPath,
-			func(absPath string, d fs.DirEntry, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-
-				relRoot, err := filepath.Rel(root, absPath)
-				if err != nil {
-					return err
-				}
-
-				relRoot = normalizeRel(relRoot)
-
-				relMount, err := filepath.Rel(mountPath, absPath)
-				if err != nil {
-					return err
-				}
-
-				relMount = normalizeRel(relMount)
-				if isExcluded(relRoot, relMount, mount.Exclude) {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-
-					return nil
-				}
-
-				if relRoot == "." {
-					return nil
-				}
-
-				if _, exists := entries[relRoot]; exists {
-					return nil
-				}
-
-				info, err := d.Info()
-				if err != nil {
-					return err
-				}
-
-				mode := info.Mode()
-				switch {
-				case mode&os.ModeSymlink != 0:
-					target, err := os.Readlink(absPath)
-					if err != nil {
-						return fmt.Errorf("read symlink %s: %w", absPath, err)
-					}
-
-					entries[relRoot] = Entry{
-						Path:     relRoot,
-						Kind:     KindSymlink,
-						Linkname: target,
-						Mode:     uint32(mode.Perm()),
-					}
-				case d.IsDir():
-					entries[relRoot] = Entry{
-						Path: relRoot,
-						Kind: KindDir,
-						Mode: uint32(mode.Perm()),
-					}
-				case mode.IsRegular():
-					jobCount++
-
-					jobs <- hashJob{AbsPath: absPath, Entry: Entry{Path: relRoot, Kind: KindFile, Size: info.Size(), Mode: uint32(mode.Perm())}}
-				default:
-					return nil
-				}
-
-				return nil
-			},
-		)
-		if walkErr != nil {
-			close(jobs)
-
-			for range results {
-			}
-
-			return BuildResult{}, fmt.Errorf("walk mount %s: %w", mount.Path, walkErr)
-		}
+	jobCount, err := enqueueMountJobs(root, mounts, entries, jobs, results)
+	if err != nil {
+		return BuildResult{}, err
 	}
 
 	close(jobs)
@@ -206,9 +112,7 @@ func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
 		}
 
 		if res.Err != nil {
-			for range results {
-			}
-
+			drainResults(results)
 			return BuildResult{}, res.Err
 		}
 
@@ -229,6 +133,193 @@ func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 
 	return BuildResult{Entries: out, BlobSources: blobSources}, nil
+}
+
+func normalizeBuildInputs(root string, mounts []MountSpec) (string, []MountSpec, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve root: %w", err)
+	}
+
+	if len(mounts) == 0 {
+		mounts = []MountSpec{{Path: "."}}
+	}
+
+	return absRoot, mounts, nil
+}
+
+func enqueueMountJobs(
+	root string,
+	mounts []MountSpec,
+	entries map[string]Entry,
+	jobs chan<- hashJob,
+	results <-chan hashResult,
+) (int, error) {
+	jobCount := 0
+
+	for _, mount := range mounts {
+		addedJobs, walkErr := walkMount(root, mount, entries, jobs)
+		if walkErr != nil {
+			close(jobs)
+			drainResults(results)
+
+			return 0, walkErr
+		}
+
+		jobCount += addedJobs
+	}
+
+	return jobCount, nil
+}
+
+func walkMount(
+	root string,
+	mount MountSpec,
+	entries map[string]Entry,
+	jobs chan<- hashJob,
+) (int, error) {
+	mountPath, err := resolveAndStatMount(root, mount.Path)
+	if err != nil {
+		return 0, err
+	}
+
+	jobCount := 0
+
+	walkErr := filepath.WalkDir(
+		mountPath,
+		func(absPath string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+
+			relRoot, relMount, err := computeRelativePaths(root, mountPath, absPath)
+			if err != nil {
+				return err
+			}
+
+			if excludedDir, skip := shouldSkipEntry(relRoot, relMount, mount.Exclude, d); skip {
+				if excludedDir {
+					return filepath.SkipDir
+				}
+
+				return nil
+			}
+
+			if relRoot == "." {
+				return nil
+			}
+
+			if _, exists := entries[relRoot]; exists {
+				return nil
+			}
+
+			entry, isFile, err := buildEntry(absPath, relRoot, d)
+			if err != nil {
+				return err
+			}
+
+			if isFile {
+				jobCount++
+
+				jobs <- hashJob{AbsPath: absPath, Entry: entry}
+
+				return nil
+			}
+
+			if entry.Kind != "" {
+				entries[relRoot] = entry
+			}
+
+			return nil
+		},
+	)
+	if walkErr != nil {
+		return 0, fmt.Errorf("walk mount %s: %w", mount.Path, walkErr)
+	}
+
+	return jobCount, nil
+}
+
+func resolveAndStatMount(root, mountPath string) (string, error) {
+	resolved, err := resolveMount(root, mountPath)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := os.Lstat(resolved); err != nil {
+		return "", fmt.Errorf("stat mount %s: %w", mountPath, err)
+	}
+
+	return resolved, nil
+}
+
+func computeRelativePaths(root, mountPath, absPath string) (string, string, error) {
+	relRoot, err := filepath.Rel(root, absPath)
+	if err != nil {
+		return "", "", err
+	}
+
+	relMount, err := filepath.Rel(mountPath, absPath)
+	if err != nil {
+		return "", "", err
+	}
+
+	return normalizeRel(relRoot), normalizeRel(relMount), nil
+}
+
+func shouldSkipEntry(relRoot, relMount string, exclude []string, d fs.DirEntry) (bool, bool) {
+	if !isExcluded(relRoot, relMount, exclude) {
+		return false, false
+	}
+
+	if d.IsDir() {
+		return true, true
+	}
+
+	return false, true
+}
+
+func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
+	info, err := d.Info()
+	if err != nil {
+		return Entry{}, false, err
+	}
+
+	mode := info.Mode()
+	switch {
+	case mode&os.ModeSymlink != 0:
+		target, err := os.Readlink(absPath)
+		if err != nil {
+			return Entry{}, false, fmt.Errorf("read symlink %s: %w", absPath, err)
+		}
+
+		return Entry{
+			Path:     relRoot,
+			Kind:     KindSymlink,
+			Linkname: target,
+			Mode:     uint32(mode.Perm()),
+		}, false, nil
+	case d.IsDir():
+		return Entry{
+			Path: relRoot,
+			Kind: KindDir,
+			Mode: uint32(mode.Perm()),
+		}, false, nil
+	case mode.IsRegular():
+		return Entry{
+			Path: relRoot,
+			Kind: KindFile,
+			Size: info.Size(),
+			Mode: uint32(mode.Perm()),
+		}, true, nil
+	default:
+		return Entry{}, false, nil
+	}
+}
+
+func drainResults(results <-chan hashResult) {
+	for range results {
+	}
 }
 
 func Diff(before, after []Entry) (changed []Entry, deleted []string) {
@@ -308,25 +399,37 @@ func ApplyNonFileEntries(root string, entries []Entry) error {
 			return err
 		}
 
-		switch entry.Kind {
-		case KindDir:
-			if err := os.MkdirAll(target, fileMode(entry.Mode, 0o755)); err != nil {
-				return fmt.Errorf("mkdir %s: %w", entry.Path, err)
-			}
-
-			if err := os.Chmod(target, fileMode(entry.Mode, 0o755)); err != nil {
-				return fmt.Errorf("chmod dir %s: %w", entry.Path, err)
-			}
-		case KindSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return fmt.Errorf("mkdir symlink parent %s: %w", entry.Path, err)
-			}
-
-			_ = os.RemoveAll(target)
-			if err := os.Symlink(entry.Linkname, target); err != nil {
-				return fmt.Errorf("symlink %s: %w", entry.Path, err)
-			}
+		if err := applyNonFileEntry(entry, target); err != nil {
+			return err
 		}
+	}
+
+	return nil
+}
+
+func applyNonFileEntry(entry Entry, target string) error {
+	switch entry.Kind {
+	case KindDir:
+		if err := os.MkdirAll(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
+			return fmt.Errorf("mkdir %s: %w", entry.Path, err)
+		}
+
+		if err := os.Chmod(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
+			return fmt.Errorf("chmod dir %s: %w", entry.Path, err)
+		}
+	case KindSymlink:
+		if err := os.MkdirAll(filepath.Dir(target), defaultDirMode); err != nil {
+			return fmt.Errorf("mkdir symlink parent %s: %w", entry.Path, err)
+		}
+
+		_ = os.RemoveAll(target)
+		if err := os.Symlink(entry.Linkname, target); err != nil {
+			return fmt.Errorf("symlink %s: %w", entry.Path, err)
+		}
+	case KindFile:
+		return nil
+	default:
+		return fmt.Errorf("unsupported entry kind %q for %s", entry.Kind, entry.Path)
 	}
 
 	return nil
@@ -342,20 +445,24 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), defaultDirMode); err != nil {
 		return fmt.Errorf("mkdir file parent %s: %w", entry.Path, err)
 	}
 
 	_ = os.RemoveAll(target)
 	tmp := target + ".rmtx-tmp"
 
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileMode(entry.Mode, 0o644))
+	f, err := os.OpenFile(
+		tmp,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		fileMode(entry.Mode, defaultFileMode),
+	)
 	if err != nil {
 		return fmt.Errorf("create file %s: %w", entry.Path, err)
 	}
 
 	if _, err := io.Copy(f, src); err != nil {
-		f.Close()
+		_ = f.Close()
 
 		_ = os.Remove(tmp)
 
@@ -367,7 +474,7 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return fmt.Errorf("close file %s: %w", entry.Path, err)
 	}
 
-	if err := os.Chmod(tmp, fileMode(entry.Mode, 0o644)); err != nil {
+	if err := os.Chmod(tmp, fileMode(entry.Mode, defaultFileMode)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("chmod file %s: %w", entry.Path, err)
 	}
@@ -404,24 +511,7 @@ func resolveMount(root, mountPath string) (string, error) {
 }
 
 func secureJoin(root, rel string) (string, error) {
-	clean := filepath.Clean(rel)
-	joined := filepath.Join(root, clean)
-
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-
-	absJoined, err := filepath.Abs(joined)
-	if err != nil {
-		return "", err
-	}
-
-	if absJoined != absRoot && !strings.HasPrefix(absJoined, absRoot+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path %s escapes root %s", rel, root)
-	}
-
-	return absJoined, nil
+	return pathutil.SecureJoin(root, rel)
 }
 
 func normalizeRel(rel string) string {
@@ -519,7 +609,8 @@ func hashFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open file %s: %w", path, err)
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {

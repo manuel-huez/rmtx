@@ -13,6 +13,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/host"
 )
 
+//nolint:cyclop // integration setup/verification naturally has several branch checks.
 func TestRunExecEndToEndSyncsBackChanges(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based integration test")
@@ -67,7 +68,7 @@ func TestRunExecEndToEndSyncsBackChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	defer os.Unsetenv("FORWARD_ME")
+	defer func() { _ = os.Unsetenv("FORWARD_ME") }()
 
 	var stdout, stderr bytes.Buffer
 

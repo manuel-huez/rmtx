@@ -8,6 +8,8 @@ import (
 	"fmt"
 )
 
+const nonceSize = 32
+
 func SignToken(token, nonce string) string {
 	mac := hmac.New(sha256.New, []byte(token))
 	_, _ = mac.Write([]byte(nonce))
@@ -21,7 +23,7 @@ func VerifyToken(token, nonce, signature string) bool {
 }
 
 func RandomNonce() (string, error) {
-	buf := make([]byte, 32)
+	buf := make([]byte, nonceSize)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate nonce: %w", err)
 	}

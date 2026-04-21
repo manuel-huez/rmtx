@@ -33,19 +33,80 @@ type ExecOptions struct {
 	Project      string
 }
 
+const stdinBufferSize = 32 * 1024
+
+func closeQuietly(c io.Closer) {
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
 func Run(ctx context.Context, opts ExecOptions) (int, error) {
+	root, workdir, err := resolvePaths(&opts)
+	if err != nil {
+		return 1, err
+	}
+
+	manifest, request, err := buildRunRequest(root, workdir, &opts)
+	if err != nil {
+		return 1, err
+	}
+
+	conn, err := dialAndAuthenticate(ctx, opts.Address, opts.Token)
+	if err != nil {
+		return 1, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	if err := runHandshake(conn, request, manifest.BlobSources); err != nil {
+		return 1, err
+	}
+
+	return processExecFrames(conn, root, opts)
+}
+
+func resolvePaths(opts *ExecOptions) (string, string, error) {
+	if err := validateExecOptions(opts); err != nil {
+		return "", "", err
+	}
+
+	setDefaultOutputs(opts)
+
+	root, err := resolveRoot(opts.Root)
+	if err != nil {
+		return "", "", err
+	}
+
+	cwd, err := resolveCWD(opts.CWD)
+	if err != nil {
+		return "", "", err
+	}
+
+	workdir, err := computeWorkdir(root, cwd)
+	if err != nil {
+		return "", "", err
+	}
+
+	return root, workdir, nil
+}
+
+func validateExecOptions(opts *ExecOptions) error {
 	if strings.TrimSpace(opts.Address) == "" {
-		return 1, errors.New("host address is required")
+		return errors.New("host address is required")
 	}
 
 	if strings.TrimSpace(opts.Token) == "" {
-		return 1, errors.New("client token is required")
+		return errors.New("client token is required")
 	}
 
 	if len(opts.Command) == 0 {
-		return 1, errors.New("command is required")
+		return errors.New("command is required")
 	}
 
+	return nil
+}
+
+func setDefaultOutputs(opts *ExecOptions) {
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
@@ -53,48 +114,67 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
 	}
+}
 
-	if strings.TrimSpace(opts.Root) == "" {
+func resolveRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return 1, fmt.Errorf("get working directory: %w", err)
+			return "", fmt.Errorf("get working directory: %w", err)
 		}
 
-		opts.Root = cwd
+		root = cwd
 	}
 
-	root, err := filepath.Abs(opts.Root)
+	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return 1, fmt.Errorf("resolve root: %w", err)
+		return "", fmt.Errorf("resolve root: %w", err)
 	}
 
-	cwd := opts.CWD
-	if strings.TrimSpace(cwd) == "" {
-		cwd, err = os.Getwd()
-		if err != nil {
-			return 1, fmt.Errorf("get working directory: %w", err)
-		}
+	return absRoot, nil
+}
+
+func resolveCWD(cwd string) (string, error) {
+	if strings.TrimSpace(cwd) != "" {
+		return cwd, nil
 	}
 
+	current, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+
+	return current, nil
+}
+
+func computeWorkdir(root, cwd string) (string, error) {
 	workdir, err := filepath.Rel(root, cwd)
 	if err != nil {
-		return 1, fmt.Errorf("compute workdir: %w", err)
+		return "", fmt.Errorf("compute workdir: %w", err)
 	}
 
 	workdir = filepath.ToSlash(filepath.Clean(workdir))
 	if strings.HasPrefix(workdir, "../") || workdir == ".." {
-		return 1, fmt.Errorf("current directory %s is outside project root %s", cwd, root)
+		return "", fmt.Errorf("current directory %s is outside project root %s", cwd, root)
 	}
 
+	return workdir, nil
+}
+
+func buildRunRequest(
+	root string,
+	workdir string,
+	opts *ExecOptions,
+) (syncfs.BuildResult, protocol.RunRequest, error) {
 	manifest, err := syncfs.BuildManifest(root, opts.Mounts)
 	if err != nil {
-		return 1, err
+		return syncfs.BuildResult{}, protocol.RunRequest{}, err
 	}
 
 	if opts.Session == "" {
 		opts.Session, err = protocol.RandomNonce()
 		if err != nil {
-			return 1, err
+			return syncfs.BuildResult{}, protocol.RunRequest{}, err
 		}
 	}
 
@@ -108,62 +188,55 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		Project:  opts.Project,
 		RootHint: filepath.Base(root),
 	}
+
+	return manifest, request, nil
+}
+
+func dialAndAuthenticate(ctx context.Context, address, token string) (*protocol.Conn, error) {
 	dialer := net.Dialer{}
 
-	raw, err := dialer.DialContext(ctx, "tcp", opts.Address)
+	raw, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		return 1, fmt.Errorf("dial host %s: %w", opts.Address, err)
+		return nil, fmt.Errorf("dial host %s: %w", address, err)
 	}
-	defer raw.Close()
 
 	conn := protocol.NewConn(raw)
-	if err := authenticate(conn, opts.Token); err != nil {
-		return 1, err
+	if err := authenticate(conn, token); err != nil {
+		closeQuietly(raw)
+		return nil, err
 	}
 
+	return conn, nil
+}
+
+func runHandshake(
+	conn *protocol.Conn,
+	request protocol.RunRequest,
+	blobSources map[string]string,
+) error {
 	if err := conn.WriteJSON(protocol.MsgRunRequest, request); err != nil {
-		return 1, err
+		return err
 	}
 
-	head, err := conn.ReadHeader()
+	need, err := expectDataFrame[protocol.NeedBlobs](conn, protocol.MsgNeedBlobs)
 	if err != nil {
-		return 1, err
+		return err
 	}
 
-	if head.Type == protocol.MsgError {
-		return 1, decodeServerError(head)
-	}
-
-	if head.Type != protocol.MsgNeedBlobs {
-		return 1, fmt.Errorf("expected %s, got %s", protocol.MsgNeedBlobs, head.Type)
-	}
-
-	need, err := protocol.DecodeData[protocol.NeedBlobs](head)
-	if err != nil {
-		return 1, err
-	}
-
-	if err := sendMissingBlobs(conn, need.Hashes, manifest.BlobSources); err != nil {
-		return 1, err
+	if err := sendMissingBlobs(conn, need.Hashes, blobSources); err != nil {
+		return err
 	}
 
 	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
-		return 1, err
+		return err
 	}
 
-	head, err = conn.ReadHeader()
-	if err != nil {
-		return 1, err
-	}
+	_, err = expectFrame(conn, protocol.MsgWorkspaceReady)
 
-	if head.Type == protocol.MsgError {
-		return 1, decodeServerError(head)
-	}
+	return err
+}
 
-	if head.Type != protocol.MsgWorkspaceReady {
-		return 1, fmt.Errorf("expected %s, got %s", protocol.MsgWorkspaceReady, head.Type)
-	}
-
+func processExecFrames(conn *protocol.Conn, root string, opts ExecOptions) (int, error) {
 	stdinErrCh := make(chan error, 1)
 
 	go func() { stdinErrCh <- sendStdin(conn, opts.Stdin, opts.ForwardStdin) }()
@@ -176,80 +249,144 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 			return exitCode, err
 		}
 
-		switch head.Type {
-		case protocol.MsgError:
-			return exitCode, decodeServerError(head)
-		case protocol.MsgExecOutput:
-			info, err := protocol.DecodeData[protocol.OutputInfo](head)
-			if err != nil {
-				return exitCode, err
-			}
+		done, updatedExitCode, err := handleExecFrame(conn, head, root, opts, exitCode)
+		if err != nil {
+			return updatedExitCode, err
+		}
 
-			dst := opts.Stdout
-			if info.Stream == "stderr" {
-				dst = opts.Stderr
-			}
+		exitCode = updatedExitCode
 
-			if _, err := io.Copy(dst, conn.PayloadReader(head)); err != nil {
-				return exitCode, err
-			}
-		case protocol.MsgExecExit:
-			info, err := protocol.DecodeData[protocol.ExitInfo](head)
-			if err != nil {
-				return exitCode, err
-			}
-
-			exitCode = info.Code
-		case protocol.MsgChangeSet:
-			changes, err := protocol.DecodeData[protocol.ChangeSet](head)
-			if err != nil {
-				return exitCode, err
-			}
-
-			if err := syncfs.DeletePaths(root, changes.Deleted); err != nil {
-				return exitCode, err
-			}
-
-			nonFiles := make([]syncfs.Entry, 0, len(changes.Entries))
-			for _, entry := range changes.Entries {
-				if entry.Kind != syncfs.KindFile {
-					nonFiles = append(nonFiles, entry)
-				}
-			}
-
-			if err := syncfs.ApplyNonFileEntries(root, nonFiles); err != nil {
-				return exitCode, err
-			}
-		case protocol.MsgChangeBlob:
-			info, err := protocol.DecodeData[protocol.BlobInfo](head)
-			if err != nil {
-				return exitCode, err
-			}
-
-			entry := syncfs.Entry{
-				Path: info.Path,
-				Kind: syncfs.KindFile,
-				Hash: info.Hash,
-				Size: head.PayloadLen,
-				Mode: info.Mode,
-			}
-			if err := syncfs.WriteFile(root, entry, conn.PayloadReader(head)); err != nil {
-				return exitCode, err
-			}
-		case protocol.MsgChangesDone:
+		if done {
 			if err := <-stdinErrCh; err != nil {
 				return exitCode, err
 			}
 
 			return exitCode, nil
-		default:
-			if err := conn.DiscardPayload(head); err != nil {
-				return exitCode, err
-			}
-
-			return exitCode, fmt.Errorf("unexpected frame %s", head.Type)
 		}
 	}
+}
+
+func handleExecFrame(
+	conn *protocol.Conn,
+	head protocol.Header,
+	root string,
+	opts ExecOptions,
+	exitCode int,
+) (bool, int, error) {
+	switch head.Type {
+	case protocol.MsgError:
+		return false, exitCode, decodeServerError(head)
+	case protocol.MsgExecOutput:
+		return false, exitCode, copyExecOutput(conn, head, opts)
+	case protocol.MsgExecExit:
+		code, err := decodeExitCode(head)
+		return false, code, err
+	case protocol.MsgChangeSet:
+		return false, exitCode, applyChangeSet(conn, head, root)
+	case protocol.MsgChangeBlob:
+		return false, exitCode, applyChangeBlob(conn, head, root)
+	case protocol.MsgChangesDone:
+		return true, exitCode, nil
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, exitCode, err
+		}
+
+		return false, exitCode, fmt.Errorf("unexpected frame %s", head.Type)
+	}
+}
+
+func copyExecOutput(conn *protocol.Conn, head protocol.Header, opts ExecOptions) error {
+	info, err := protocol.DecodeData[protocol.OutputInfo](head)
+	if err != nil {
+		return err
+	}
+
+	dst := opts.Stdout
+	if info.Stream == "stderr" {
+		dst = opts.Stderr
+	}
+
+	_, err = io.Copy(dst, conn.PayloadReader(head))
+
+	return err
+}
+
+func decodeExitCode(head protocol.Header) (int, error) {
+	info, err := protocol.DecodeData[protocol.ExitInfo](head)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Code, nil
+}
+
+func applyChangeSet(conn *protocol.Conn, head protocol.Header, root string) error {
+	changes, err := protocol.DecodeData[protocol.ChangeSet](head)
+	if err != nil {
+		return err
+	}
+
+	if err := syncfs.DeletePaths(root, changes.Deleted); err != nil {
+		return err
+	}
+
+	return syncfs.ApplyNonFileEntries(root, filterNonFileEntries(changes.Entries))
+}
+
+func applyChangeBlob(conn *protocol.Conn, head protocol.Header, root string) error {
+	info, err := protocol.DecodeData[protocol.BlobInfo](head)
+	if err != nil {
+		return err
+	}
+
+	entry := syncfs.Entry{
+		Path: info.Path,
+		Kind: syncfs.KindFile,
+		Hash: info.Hash,
+		Size: head.PayloadLen,
+		Mode: info.Mode,
+	}
+
+	return syncfs.WriteFile(root, entry, conn.PayloadReader(head))
+}
+
+func filterNonFileEntries(entries []syncfs.Entry) []syncfs.Entry {
+	nonFiles := make([]syncfs.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile {
+			nonFiles = append(nonFiles, entry)
+		}
+	}
+
+	return nonFiles
+}
+
+func expectFrame(conn *protocol.Conn, wantType string) (protocol.Header, error) {
+	head, err := conn.ReadHeader()
+	if err != nil {
+		return protocol.Header{}, err
+	}
+
+	if head.Type == protocol.MsgError {
+		return protocol.Header{}, decodeServerError(head)
+	}
+
+	if head.Type != wantType {
+		return protocol.Header{}, fmt.Errorf("expected %s, got %s", wantType, head.Type)
+	}
+
+	return head, nil
+}
+
+func expectDataFrame[T any](conn *protocol.Conn, wantType string) (T, error) {
+	head, err := expectFrame(conn, wantType)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+
+	return protocol.DecodeData[T](head)
 }
 
 func authenticate(conn *protocol.Conn, token string) error {
@@ -309,7 +446,7 @@ func sendMissingBlobs(conn *protocol.Conn, hashes []string, blobSources map[stri
 
 		info, err := f.Stat()
 		if err != nil {
-			f.Close()
+			closeQuietly(f)
 			return fmt.Errorf("stat blob source %s: %w", srcPath, err)
 		}
 
@@ -319,11 +456,11 @@ func sendMissingBlobs(conn *protocol.Conn, hashes []string, blobSources map[stri
 			f,
 			info.Size(),
 		); err != nil {
-			f.Close()
+			closeQuietly(f)
 			return err
 		}
 
-		_ = f.Close()
+		closeQuietly(f)
 	}
 
 	return nil
@@ -334,7 +471,7 @@ func sendStdin(conn *protocol.Conn, src io.Reader, enabled bool) error {
 		return conn.WriteJSON(protocol.MsgStdinClose, nil)
 	}
 
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, stdinBufferSize)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {

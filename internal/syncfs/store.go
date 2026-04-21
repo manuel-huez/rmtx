@@ -10,19 +10,24 @@ import (
 
 type BlobStore struct{ root string }
 
+const (
+	hashPrefixLen       = 2
+	blobDefaultFileMode = 0o644
+	blobDefaultDirPerm  = 0o755
+)
+
 func NewBlobStore(root string) *BlobStore { return &BlobStore{root: root} }
-func (s *BlobStore) Root() string         { return s.root }
 
 func (s *BlobStore) Ensure() error {
-	return os.MkdirAll(s.root, 0o755)
+	return os.MkdirAll(s.root, blobDefaultDirPerm)
 }
 
 func (s *BlobStore) Path(hash string) string {
-	if len(hash) < 2 {
+	if len(hash) < hashPrefixLen {
 		return filepath.Join(s.root, hash)
 	}
 
-	return filepath.Join(s.root, hash[:2], hash)
+	return filepath.Join(s.root, hash[:hashPrefixLen], hash)
 }
 
 func (s *BlobStore) Has(hash string) bool {
@@ -54,7 +59,7 @@ func (s *BlobStore) MissingHashes(entries []Entry) []string {
 
 func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
 	path := s.Path(hash)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create blob dir: %w", err)
 	}
 
@@ -65,13 +70,13 @@ func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
 
 	tmp := path + ".tmp"
 
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, blobDefaultFileMode)
 	if err != nil {
 		return fmt.Errorf("create blob file: %w", err)
 	}
 
 	if _, err := io.CopyN(f, src, size); err != nil {
-		f.Close()
+		_ = f.Close()
 
 		_ = os.Remove(tmp)
 
@@ -94,7 +99,7 @@ func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
 func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
 	src := s.Path(hash)
 
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dest), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create destination dir: %w", err)
 	}
 
@@ -106,7 +111,8 @@ func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("open blob %s: %w", hash, err)
 	}
-	defer in.Close()
+
+	defer func() { _ = in.Close() }()
 
 	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
@@ -114,7 +120,7 @@ func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return fmt.Errorf("copy blob: %w", err)
 	}
 
@@ -126,7 +132,7 @@ func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
 }
 
 func MaterializeWorkspace(root string, entries []Entry, store *BlobStore) error {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create workspace root: %w", err)
 	}
 
@@ -144,7 +150,11 @@ func MaterializeWorkspace(root string, entries []Entry, store *BlobStore) error 
 			return err
 		}
 
-		if err := store.Materialize(entry.Hash, target, fileMode(entry.Mode, 0o644)); err != nil {
+		if err := store.Materialize(
+			entry.Hash,
+			target,
+			fileMode(entry.Mode, blobDefaultFileMode),
+		); err != nil {
 			return fmt.Errorf("materialize %s: %w", entry.Path, err)
 		}
 	}

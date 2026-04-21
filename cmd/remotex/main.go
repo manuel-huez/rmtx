@@ -13,17 +13,20 @@ import (
 	"github.com/manuel-huez/rmtx/internal/config"
 )
 
+const exitUsage = 2
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	code := run(ctx, os.Args[1:])
 
-	os.Exit(run(ctx, os.Args[1:]))
+	cancel()
+	os.Exit(code)
 }
 
 func run(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		printUsage(os.Stderr)
-		return 2
+		return exitUsage
 	}
 
 	switch args[0] {
@@ -59,7 +62,7 @@ func runHost(ctx context.Context, args []string) int {
 
 	noDiscovery := fs.Bool("no-discovery", false, "disable LAN discovery")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitUsage
 	}
 
 	logger := log.New(os.Stderr, "rmtx: ", log.LstdFlags)
@@ -91,12 +94,12 @@ func runExecWithFlags(ctx context.Context, args []string) int {
 
 	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitUsage
 	}
 
 	if fs.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "error: missing command")
-		return 2
+		return exitUsage
 	}
 
 	return runExec(
@@ -137,7 +140,7 @@ func runExec(ctx context.Context, params app.ExecParams) int {
 }
 
 func printUsage(f *os.File) {
-	fmt.Fprint(f, `rmtx runs local commands on a host machine over the local network.
+	if _, err := fmt.Fprint(f, `rmtx runs local commands on a host machine over the local network.
 
 Usage:
   rmtx host [flags]
@@ -148,5 +151,7 @@ Examples:
   rmtx host --listen :33221
   rmtx go run ./cmd/api
   rmtx exec --host 192.168.1.42:33221 -- go test ./...
-`)
+`); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "failed to print usage:", err)
+	}
 }
