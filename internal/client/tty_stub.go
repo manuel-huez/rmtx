@@ -4,7 +4,7 @@ package client
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
@@ -20,7 +20,7 @@ func startTTYInput(
 	_ = conn
 	_ = opts
 
-	return nil, nil, fmt.Errorf("interactive TTY is not supported on this platform")
+	return nil, nil, errors.New("interactive TTY is not supported on this platform")
 }
 
 func (s *ttyInputSession) Close() {}

@@ -16,6 +16,7 @@ const (
 	DefaultPort             = 33221
 	DefaultService          = "rmtx"
 	defaultDiscoveryTimeout = 750 * time.Millisecond
+	defaultContextName      = "context"
 	contextHashLen          = 12
 )
 
@@ -24,8 +25,6 @@ var ErrConfigNotFound = errors.New("config not found")
 var fileNames = []string{
 	".rmtx.json",
 	"rmtx.json",
-	".remotex.json",
-	"remotex.json",
 }
 
 type ContextConfig struct {
@@ -133,11 +132,7 @@ func Load(path string) (*Loaded, error) {
 }
 
 func Resolve(startDir, explicitConfig string) (*Loaded, error) {
-	if strings.TrimSpace(explicitConfig) != "" {
-		return Load(explicitConfig)
-	}
-
-	loaded, err := Search(startDir)
+	loaded, err := loadExplicitOrSearch(startDir, explicitConfig)
 	if err != nil {
 		if errors.Is(err, ErrConfigNotFound) {
 			goto defaultConfig
@@ -152,6 +147,7 @@ func Resolve(startDir, explicitConfig string) (*Loaded, error) {
 
 defaultConfig:
 	root, err := filepath.Abs(startDir)
+
 	if err != nil {
 		return nil, fmt.Errorf("resolve default root: %w", err)
 	}
@@ -162,11 +158,7 @@ defaultConfig:
 }
 
 func ResolveRequired(startDir, explicitConfig string) (*Loaded, error) {
-	if strings.TrimSpace(explicitConfig) != "" {
-		return Load(explicitConfig)
-	}
-
-	loaded, err := Search(startDir)
+	loaded, err := loadExplicitOrSearch(startDir, explicitConfig)
 	if err != nil {
 		if errors.Is(err, ErrConfigNotFound) {
 			return nil, fmt.Errorf(
@@ -179,6 +171,14 @@ func ResolveRequired(startDir, explicitConfig string) (*Loaded, error) {
 	}
 
 	return loaded, nil
+}
+
+func loadExplicitOrSearch(startDir, explicitConfig string) (*Loaded, error) {
+	if strings.TrimSpace(explicitConfig) != "" {
+		return Load(explicitConfig)
+	}
+
+	return Search(startDir)
 }
 
 func WithDefaults(cfg Config) Config {
@@ -222,7 +222,7 @@ func (l Loaded) ContextName() string {
 
 	name := filepath.Base(l.Root)
 	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "context"
+		return defaultContextName
 	}
 
 	return name
@@ -244,7 +244,7 @@ func (l Loaded) ContextIdentity() string {
 func (l Loaded) ContextID() string {
 	name := slug(l.ContextName())
 	if name == "" {
-		name = "context"
+		name = defaultContextName
 	}
 
 	sum := sha256.Sum256([]byte(l.ContextIdentity()))
@@ -287,19 +287,23 @@ func slug(value string) string {
 	}
 
 	var b strings.Builder
+
 	lastDash := false
 
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z':
 			b.WriteRune(r)
+
 			lastDash = false
 		case r >= '0' && r <= '9':
 			b.WriteRune(r)
+
 			lastDash = false
 		default:
 			if !lastDash && b.Len() > 0 {
 				b.WriteByte('-')
+
 				lastDash = true
 			}
 		}

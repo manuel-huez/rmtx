@@ -130,34 +130,3 @@ func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
 
 	return os.Chmod(dest, mode)
 }
-
-func MaterializeWorkspace(root string, entries []Entry, store *BlobStore) error {
-	if err := os.MkdirAll(root, blobDefaultDirPerm); err != nil {
-		return fmt.Errorf("create workspace root: %w", err)
-	}
-
-	if err := ApplyNonFileEntries(root, entries); err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if entry.Kind != KindFile {
-			continue
-		}
-
-		target, err := secureJoin(root, entry.Path)
-		if err != nil {
-			return err
-		}
-
-		if err := store.Materialize(
-			entry.Hash,
-			target,
-			fileMode(entry.Mode, blobDefaultFileMode),
-		); err != nil {
-			return fmt.Errorf("materialize %s: %w", entry.Path, err)
-		}
-	}
-
-	return nil
-}

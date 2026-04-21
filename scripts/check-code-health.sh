@@ -59,7 +59,7 @@ run_golangci_lint() {
 }
 
 run_go_deadcode() {
-  deadcode -test ./cmd/remotex ./internal/...
+  deadcode -test ./cmd/rmtx ./internal/...
 }
 
 run_jscpd() {

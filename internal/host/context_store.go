@@ -21,6 +21,7 @@ const (
 	contextWorkspaceDir = "workspace"
 	contextMetaFile     = "context.json"
 	contextManifestFile = "tracked-manifest.json"
+	contextFileMode     = 0o644
 )
 
 type contextMetadata struct {
@@ -88,13 +89,9 @@ func (s *Server) contextIsActive(id string) bool {
 }
 
 func (s *Server) ensureContext(id, name, rootHint string) (contextHandle, error) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return contextHandle{}, errors.New("context id is required")
-	}
-
-	if !validContextID(id) {
-		return contextHandle{}, fmt.Errorf("invalid context id %q", id)
+	id, err := normalizeContextID(id)
+	if err != nil {
+		return contextHandle{}, err
 	}
 
 	handle := contextHandle{
@@ -102,11 +99,9 @@ func (s *Server) ensureContext(id, name, rootHint string) (contextHandle, error)
 		workspace: filepath.Join(s.contextsRoot(), id, contextWorkspaceDir),
 	}
 
-	created := false
-	if _, err := os.Stat(handle.dir); errors.Is(err, os.ErrNotExist) {
-		created = true
-	} else if err != nil {
-		return contextHandle{}, fmt.Errorf("stat context dir: %w", err)
+	created, err := contextDirCreated(handle.dir)
+	if err != nil {
+		return contextHandle{}, err
 	}
 
 	if err := os.MkdirAll(handle.workspace, defaultDirMode); err != nil {
@@ -118,28 +113,7 @@ func (s *Server) ensureContext(id, name, rootHint string) (contextHandle, error)
 		return contextHandle{}, err
 	}
 
-	now := time.Now().UTC()
-	if meta.ID == "" {
-		meta.ID = id
-	}
-
-	if meta.Name == "" {
-		meta.Name = fallbackContextName(name, rootHint, id)
-	}
-
-	if strings.TrimSpace(name) != "" {
-		meta.Name = strings.TrimSpace(name)
-	}
-
-	if strings.TrimSpace(rootHint) != "" {
-		meta.RootHint = strings.TrimSpace(rootHint)
-	}
-
-	if meta.CreatedAt.IsZero() {
-		meta.CreatedAt = now
-	}
-
-	meta.UpdatedAt = now
+	meta = hydrateContextMetadata(meta, id, name, rootHint, time.Now().UTC())
 
 	if err := saveContextMetadata(handle.dir, meta); err != nil {
 		return contextHandle{}, err
@@ -153,10 +127,12 @@ func (s *Server) ensureContext(id, name, rootHint string) (contextHandle, error)
 
 func loadContextMetadata(dir string) (contextMetadata, error) {
 	path := filepath.Join(dir, contextMetaFile)
+
 	content, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return contextMetadata{}, nil
 	}
+
 	if err != nil {
 		return contextMetadata{}, fmt.Errorf("read context metadata: %w", err)
 	}
@@ -175,10 +151,12 @@ func saveContextMetadata(dir string, meta contextMetadata) error {
 
 func (s *Server) loadTrackedManifest(id string) ([]syncfs.Entry, error) {
 	path := filepath.Join(s.contextsRoot(), id, contextManifestFile)
+
 	content, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("read tracked manifest: %w", err)
 	}
@@ -206,7 +184,7 @@ func writeJSONAtomically(path string, value any) error {
 	}
 
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(content, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(tmp, append(content, '\n'), contextFileMode); err != nil {
 		return fmt.Errorf("write temp json: %w", err)
 	}
 
@@ -222,9 +200,11 @@ func fallbackContextName(name, rootHint, id string) string {
 	if strings.TrimSpace(name) != "" {
 		return strings.TrimSpace(name)
 	}
+
 	if strings.TrimSpace(rootHint) != "" {
 		return strings.TrimSpace(rootHint)
 	}
+
 	return id
 }
 
@@ -243,11 +223,68 @@ func validContextID(id string) bool {
 	return true
 }
 
+func normalizeContextID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", errors.New("context id is required")
+	}
+
+	if !validContextID(id) {
+		return "", fmt.Errorf("invalid context id %q", id)
+	}
+
+	return id, nil
+}
+
+func contextDirCreated(dir string) (bool, error) {
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return false, fmt.Errorf("stat context dir: %w", err)
+	}
+
+	return false, nil
+}
+
+func hydrateContextMetadata(
+	meta contextMetadata,
+	id, name, rootHint string,
+	now time.Time,
+) contextMetadata {
+	name = strings.TrimSpace(name)
+	rootHint = strings.TrimSpace(rootHint)
+
+	if meta.ID == "" {
+		meta.ID = id
+	}
+
+	if meta.Name == "" {
+		meta.Name = fallbackContextName(name, rootHint, id)
+	}
+
+	if name != "" {
+		meta.Name = name
+	}
+
+	if rootHint != "" {
+		meta.RootHint = rootHint
+	}
+
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = now
+	}
+
+	meta.UpdatedAt = now
+
+	return meta
+}
+
 func (s *Server) listContexts() ([]protocol.ContextSummary, error) {
 	entries, err := os.ReadDir(s.contextsRoot())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("list contexts: %w", err)
 	}
@@ -259,6 +296,7 @@ func (s *Server) listContexts() ([]protocol.ContextSummary, error) {
 		}
 
 		id := entry.Name()
+
 		meta, err := loadContextMetadata(filepath.Join(s.contextsRoot(), id))
 		if err != nil {
 			return nil, err
@@ -267,6 +305,7 @@ func (s *Server) listContexts() ([]protocol.ContextSummary, error) {
 		if meta.ID == "" {
 			meta.ID = id
 		}
+
 		if meta.Name == "" {
 			meta.Name = id
 		}
@@ -294,59 +333,22 @@ func (s *Server) listContexts() ([]protocol.ContextSummary, error) {
 	return out, nil
 }
 
-func (s *Server) deleteContexts(req protocol.DeleteContextsRequest) (protocol.DeleteContextsResponse, error) {
+func (s *Server) deleteContexts(
+	req protocol.DeleteContextsRequest,
+) (protocol.DeleteContextsResponse, error) {
 	contexts, err := s.listContexts()
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
 	}
 
-	targets := map[string]protocol.ContextSummary{}
-	if req.All {
-		for _, context := range contexts {
-			targets[context.ID] = context
-		}
+	targets, notFound, err := selectDeleteTargets(req, contexts)
+	if err != nil {
+		return protocol.DeleteContextsResponse{}, err
 	}
 
-	if strings.TrimSpace(req.OlderThan) != "" {
-		olderThan, err := time.ParseDuration(req.OlderThan)
-		if err != nil {
-			return protocol.DeleteContextsResponse{}, fmt.Errorf("parse older-than: %w", err)
-		}
-
-		cutoff := time.Now().UTC().Add(-olderThan)
-		for _, context := range contexts {
-			if !context.UpdatedAt.IsZero() && context.UpdatedAt.Before(cutoff) {
-				targets[context.ID] = context
-			}
-		}
-	}
-
-	contextByID := map[string]protocol.ContextSummary{}
-	for _, context := range contexts {
-		contextByID[context.ID] = context
-	}
-
-	var notFound []string
-	for _, id := range req.IDs {
-		context, ok := contextByID[id]
-		if !ok {
-			notFound = append(notFound, id)
-			continue
-		}
-
-		targets[id] = context
-	}
-
-	deleted := make([]protocol.ContextSummary, 0, len(targets))
-	for id, context := range targets {
-		release := s.acquireContext(id)
-		err := os.RemoveAll(context.Path)
-		release()
-		if err != nil {
-			return protocol.DeleteContextsResponse{}, fmt.Errorf("delete context %s: %w", id, err)
-		}
-
-		deleted = append(deleted, context)
+	deleted, err := s.removeContexts(targets)
+	if err != nil {
+		return protocol.DeleteContextsResponse{}, err
 	}
 
 	sort.Slice(deleted, func(i, j int) bool { return deleted[i].ID < deleted[j].ID })
@@ -356,6 +358,112 @@ func (s *Server) deleteContexts(req protocol.DeleteContextsRequest) (protocol.De
 		Deleted:  deleted,
 		NotFound: notFound,
 	}, nil
+}
+
+func selectDeleteTargets(
+	req protocol.DeleteContextsRequest,
+	contexts []protocol.ContextSummary,
+) (map[string]protocol.ContextSummary, []string, error) {
+	targets := map[string]protocol.ContextSummary{}
+	if req.All {
+		addAllTargets(targets, contexts)
+	}
+
+	if err := addOlderThanTargets(targets, req.OlderThan, contexts); err != nil {
+		return nil, nil, err
+	}
+
+	contextByID := mapContextsByID(contexts)
+	notFound := addExplicitIDTargets(targets, req.IDs, contextByID)
+
+	return targets, notFound, nil
+}
+
+func addAllTargets(targets map[string]protocol.ContextSummary, contexts []protocol.ContextSummary) {
+	for _, context := range contexts {
+		targets[context.ID] = context
+	}
+}
+
+func addOlderThanTargets(
+	targets map[string]protocol.ContextSummary,
+	olderThanValue string,
+	contexts []protocol.ContextSummary,
+) error {
+	if strings.TrimSpace(olderThanValue) == "" {
+		return nil
+	}
+
+	olderThan, err := time.ParseDuration(olderThanValue)
+	if err != nil {
+		return fmt.Errorf("parse older-than: %w", err)
+	}
+
+	cutoff := time.Now().UTC().Add(-olderThan)
+	for _, context := range contexts {
+		if !context.UpdatedAt.IsZero() && context.UpdatedAt.Before(cutoff) {
+			targets[context.ID] = context
+		}
+	}
+
+	return nil
+}
+
+func mapContextsByID(contexts []protocol.ContextSummary) map[string]protocol.ContextSummary {
+	contextByID := make(map[string]protocol.ContextSummary, len(contexts))
+	for _, context := range contexts {
+		contextByID[context.ID] = context
+	}
+
+	return contextByID
+}
+
+func addExplicitIDTargets(
+	targets map[string]protocol.ContextSummary,
+	ids []string,
+	contextByID map[string]protocol.ContextSummary,
+) []string {
+	var notFound []string
+
+	for _, id := range ids {
+		context, ok := contextByID[id]
+		if !ok {
+			notFound = append(notFound, id)
+			continue
+		}
+
+		targets[id] = context
+	}
+
+	return notFound
+}
+
+func (s *Server) removeContexts(
+	targets map[string]protocol.ContextSummary,
+) ([]protocol.ContextSummary, error) {
+	deleted := make([]protocol.ContextSummary, 0, len(targets))
+	for id, context := range targets {
+		if err := s.removeContextDir(id, context.Path); err != nil {
+			return nil, err
+		}
+
+		deleted = append(deleted, context)
+	}
+
+	return deleted, nil
+}
+
+func (s *Server) removeContextDir(id, path string) error {
+	release := s.acquireContext(id)
+	err := os.RemoveAll(path)
+
+	release()
+
+	if err != nil {
+		return fmt.Errorf("delete context %s: %w", id, err)
+	}
+
+	return nil
 }
 
 func (s *Server) syncContextFromClient(
@@ -383,7 +491,10 @@ func (s *Server) syncContextFromClient(
 		return fmt.Errorf("delete tracked paths in context %s: %w", contextID, err)
 	}
 
-	if err := syncfs.ApplyNonFileEntries(workspace, filterChangedNonFileEntries(changed)); err != nil {
+	if err := syncfs.ApplyNonFileEntries(
+		workspace,
+		syncfs.NonFileEntries(changed),
+	); err != nil {
 		return fmt.Errorf("apply non-file entries in context %s: %w", contextID, err)
 	}
 
@@ -412,15 +523,4 @@ func (s *Server) syncContextFromClient(
 	}
 
 	return nil
-}
-
-func filterChangedNonFileEntries(entries []syncfs.Entry) []syncfs.Entry {
-	nonFiles := make([]syncfs.Entry, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Kind != syncfs.KindFile {
-			nonFiles = append(nonFiles, entry)
-		}
-	}
-
-	return nonFiles
 }

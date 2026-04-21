@@ -27,11 +27,17 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 	}
 	defer closeQuietly(conn.Raw())
 
-	if err := conn.WriteJSON(protocol.MsgListContextsRequest, protocol.ListContextsRequest{}); err != nil {
+	if err := conn.WriteJSON(
+		protocol.MsgListContextsRequest,
+		protocol.ListContextsRequest{},
+	); err != nil {
 		return nil, err
 	}
 
-	resp, err := expectDataFrame[protocol.ListContextsResponse](conn, protocol.MsgListContextsResponse)
+	resp, err := expectDataFrame[protocol.ListContextsResponse](
+		conn,
+		protocol.MsgListContextsResponse,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -55,5 +61,8 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 		return DeleteContextsResult{}, err
 	}
 
-	return expectDataFrame[protocol.DeleteContextsResponse](conn, protocol.MsgDeleteContextsResponse)
+	return expectDataFrame[protocol.DeleteContextsResponse](
+		conn,
+		protocol.MsgDeleteContextsResponse,
+	)
 }

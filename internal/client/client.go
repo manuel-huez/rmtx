@@ -215,6 +215,7 @@ func buildRunRequest(
 	}
 
 	rows, cols := 0, 0
+
 	if opts.TTY {
 		sizeFile := opts.StdoutFile
 		if !terminal.IsTerminal(sizeFile) {
@@ -222,6 +223,7 @@ func buildRunRequest(
 		}
 
 		var sizeErr error
+
 		rows, cols, sizeErr = terminal.Size(sizeFile)
 		if sizeErr != nil {
 			rows, cols = 0, 0
@@ -302,6 +304,7 @@ func processExecFrames(
 	}
 
 	stdinErrCh := make(chan error, 1)
+
 	go func() { stdinErrCh <- sendStdin(conn, opts.Stdin, opts.ForwardStdin) }()
 
 	exitCode := 0
@@ -339,6 +342,7 @@ func processTTYExecFrames(
 	if err != nil {
 		return 1, err
 	}
+
 	if session != nil {
 		defer session.Close()
 	}
@@ -364,19 +368,29 @@ func processTTYExecFrames(
 		exitCode = updatedExitCode
 
 		if done {
-			if inputErrCh != nil {
-				select {
-				case inputErr := <-inputErrCh:
-					if inputErr != nil && !errors.Is(inputErr, io.EOF) {
-						return exitCode, inputErr
-					}
-				default:
-				}
+			if err := consumeTTYInputErr(inputErrCh); err != nil {
+				return exitCode, err
 			}
 
 			return exitCode, nil
 		}
 	}
+}
+
+func consumeTTYInputErr(inputErrCh <-chan error) error {
+	if inputErrCh == nil {
+		return nil
+	}
+
+	select {
+	case inputErr := <-inputErrCh:
+		if inputErr != nil && !errors.Is(inputErr, io.EOF) {
+			return inputErr
+		}
+	default:
+	}
+
+	return nil
 }
 
 func handleExecFrame(
@@ -444,7 +458,7 @@ func applyChangeSet(conn *protocol.Conn, head protocol.Header, root string) erro
 		return err
 	}
 
-	return syncfs.ApplyNonFileEntries(root, filterNonFileEntries(changes.Entries))
+	return syncfs.ApplyNonFileEntries(root, syncfs.NonFileEntries(changes.Entries))
 }
 
 func applyChangeBlob(conn *protocol.Conn, head protocol.Header, root string) error {
@@ -462,17 +476,6 @@ func applyChangeBlob(conn *protocol.Conn, head protocol.Header, root string) err
 	}
 
 	return syncfs.WriteFile(root, entry, conn.PayloadReader(head))
-}
-
-func filterNonFileEntries(entries []syncfs.Entry) []syncfs.Entry {
-	nonFiles := make([]syncfs.Entry, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Kind != syncfs.KindFile {
-			nonFiles = append(nonFiles, entry)
-		}
-	}
-
-	return nonFiles
 }
 
 func expectFrame(conn *protocol.Conn, wantType string) (protocol.Header, error) {

@@ -31,7 +31,7 @@ func TestRunExecRequiresLocalConfig(t *testing.T) {
 	}
 }
 
-//nolint:cyclop // integration setup/verification naturally has several branch checks.
+//nolint:cyclop,gocognit,maintidx // integration setup/verification naturally has many branch checks.
 func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based integration test")
@@ -53,6 +53,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() { errCh <- server.Serve(ctx) }()
 
 	addr := waitForAddr(t, server)
@@ -66,27 +67,35 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
   "env": {"forward": ["FORWARD_ME"]},
   "discovery": {"enabled": false}
 }`
+
 	configPath := filepath.Join(project, ".rmtx.json")
 	if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(project, "hello.txt"), []byte("initial\n"), 0o644); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(project, "hello.txt"),
+		[]byte("initial\n"),
+		0o644,
+	); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := os.Setenv("FORWARD_ME", "visible-value"); err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = os.Unsetenv("FORWARD_ME") }()
 
 	loaded, err := config.ResolveRequired(project, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	contextID := loaded.ContextID()
 
 	var stdout1, stderr1 bytes.Buffer
+
 	code, err := RunExec(ctx, project, ExecParams{
 		AddressOverride: addr,
 		TokenOverride:   "secret-token",
@@ -129,6 +138,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	}
 
 	var stdout2, stderr2 bytes.Buffer
+
 	code, err = RunExec(ctx, project, ExecParams{
 		AddressOverride: addr,
 		TokenOverride:   "secret-token",

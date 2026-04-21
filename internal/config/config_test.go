@@ -95,6 +95,7 @@ func TestLoadedContextIDUsesStableExplicitName(t *testing.T) {
 	}
 
 	id1 := loaded.ContextID()
+
 	id2 := loaded.ContextID()
 	if id1 == "" || id1 != id2 {
 		t.Fatalf("expected stable context id, got %q and %q", id1, id2)

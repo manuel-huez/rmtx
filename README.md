@@ -35,8 +35,6 @@ The execution model is now context-based:
 go build ./cmd/rmtx
 ```
 
-A legacy entrypoint still exists at `./cmd/remotex`.
-
 ## Running
 
 On the host machine:
@@ -70,11 +68,6 @@ The client searches upward from the current directory for:
 
 - `.rmtx.json`
 - `rmtx.json`
-
-Legacy names are still accepted:
-
-- `.remotex.json`
-- `remotex.json`
 
 Remote execution now requires one of these config files.
 
@@ -206,7 +199,6 @@ The repository includes:
 ## Repository layout
 
 - `cmd/rmtx`: primary CLI entrypoint.
-- `cmd/remotex`: legacy CLI entrypoint.
 - `internal/app`: CLI orchestration and config/discovery wiring.
 - `internal/client`: client-side sync, execution flow, TTY handling, and control commands.
 - `internal/host`: host-side server, persistent context management, and execution flow.

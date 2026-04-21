@@ -85,7 +85,10 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(opts.StateDir, contextDirName), defaultDirMode); err != nil {
+	if err := os.MkdirAll(
+		filepath.Join(opts.StateDir, contextDirName),
+		defaultDirMode,
+	); err != nil {
 		return nil, fmt.Errorf("create context dir: %w", err)
 	}
 
@@ -135,6 +138,7 @@ func (s *Server) Serve(ctx context.Context) error {
 				s.logger.Printf("discovery advertise failed: %v", err)
 			} else {
 				s.advertiser = adv
+
 				defer func() { _ = adv.Close() }()
 			}
 		}
@@ -180,40 +184,7 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 		return err
 	}
 
-	switch head.Type {
-	case protocol.MsgRunRequest:
-		req, err := protocol.DecodeData[protocol.RunRequest](head)
-		if err != nil {
-			return err
-		}
-
-		return s.handleRunRequest(parent, conn, req)
-	case protocol.MsgPingRequest:
-		if err := conn.DiscardPayload(head); err != nil {
-			return err
-		}
-
-		return s.handlePing(conn)
-	case protocol.MsgListContextsRequest:
-		if err := conn.DiscardPayload(head); err != nil {
-			return err
-		}
-
-		return s.handleListContexts(conn)
-	case protocol.MsgDeleteContextsRequest:
-		req, err := protocol.DecodeData[protocol.DeleteContextsRequest](head)
-		if err != nil {
-			return err
-		}
-
-		return s.handleDeleteContexts(conn, req)
-	default:
-		if err := conn.DiscardPayload(head); err != nil {
-			return err
-		}
-
-		return fmt.Errorf("unexpected request %s", head.Type)
-	}
+	return s.dispatchSessionRequest(parent, conn, head)
 }
 
 func (s *Server) handleRunRequest(
@@ -221,11 +192,8 @@ func (s *Server) handleRunRequest(
 	conn *protocol.Conn,
 	request protocol.RunRequest,
 ) error {
-	if len(request.Command) == 0 {
-		return errors.New("missing command")
-	}
-	if strings.TrimSpace(request.ContextID) == "" {
-		return errors.New("missing context id")
+	if err := validateRunRequest(request); err != nil {
+		return err
 	}
 
 	release := s.acquireContext(request.ContextID)
@@ -255,17 +223,103 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	if err := conn.WriteJSON(
-		protocol.MsgWorkspaceReady,
-		protocol.WorkspaceReady{
-			ContextID: request.ContextID,
-			Created:   handle.created,
-			Workspace: handle.workspace,
-		},
-	); err != nil {
+	if err := writeWorkspaceReady(conn, request.ContextID, handle); err != nil {
 		return err
 	}
 
+	if err := s.executeAndSyncRun(parent, conn, handle, request); err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+}
+
+func (s *Server) dispatchSessionRequest(
+	parent context.Context,
+	conn *protocol.Conn,
+	head protocol.Header,
+) error {
+	switch head.Type {
+	case protocol.MsgRunRequest:
+		return s.dispatchRunRequest(parent, conn, head)
+	case protocol.MsgPingRequest:
+		return s.discardAndHandle(head, conn, s.handlePing)
+	case protocol.MsgListContextsRequest:
+		return s.discardAndHandle(head, conn, s.handleListContexts)
+	case protocol.MsgDeleteContextsRequest:
+		return s.dispatchDeleteContexts(conn, head)
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("unexpected request %s", head.Type)
+	}
+}
+
+func (s *Server) dispatchRunRequest(
+	parent context.Context,
+	conn *protocol.Conn,
+	head protocol.Header,
+) error {
+	req, err := protocol.DecodeData[protocol.RunRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleRunRequest(parent, conn, req)
+}
+
+func (s *Server) dispatchDeleteContexts(conn *protocol.Conn, head protocol.Header) error {
+	req, err := protocol.DecodeData[protocol.DeleteContextsRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleDeleteContexts(conn, req)
+}
+
+func (s *Server) discardAndHandle(
+	head protocol.Header,
+	conn *protocol.Conn,
+	handler func(*protocol.Conn) error,
+) error {
+	if err := conn.DiscardPayload(head); err != nil {
+		return err
+	}
+
+	return handler(conn)
+}
+
+func validateRunRequest(request protocol.RunRequest) error {
+	if len(request.Command) == 0 {
+		return errors.New("missing command")
+	}
+
+	if strings.TrimSpace(request.ContextID) == "" {
+		return errors.New("missing context id")
+	}
+
+	return nil
+}
+
+func writeWorkspaceReady(conn *protocol.Conn, contextID string, handle contextHandle) error {
+	return conn.WriteJSON(
+		protocol.MsgWorkspaceReady,
+		protocol.WorkspaceReady{
+			ContextID: contextID,
+			Created:   handle.created,
+			Workspace: handle.workspace,
+		},
+	)
+}
+
+func (s *Server) executeAndSyncRun(
+	parent context.Context,
+	conn *protocol.Conn,
+	handle contextHandle,
+	request protocol.RunRequest,
+) error {
 	code := s.executeRequest(parent, conn, handle.workspace, request)
 	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
 		return err
@@ -276,7 +330,12 @@ func (s *Server) handleRunRequest(
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}
 
-	if err := s.sendWorkspaceChanges(conn, handle.workspace, request.Manifest, post.Entries); err != nil {
+	if err := s.sendWorkspaceChanges(
+		conn,
+		handle.workspace,
+		request.Manifest,
+		post.Entries,
+	); err != nil {
 		return err
 	}
 
@@ -289,7 +348,7 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+	return nil
 }
 
 func (s *Server) handlePing(conn *protocol.Conn) error {
@@ -510,15 +569,7 @@ func (s *Server) runPipeCommand(
 	workdir string,
 	request protocol.RunRequest,
 ) (int, error) {
-	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
-	cmd.Dir = workdir
-	cmd.Env = mergeEnv(os.Environ(), request.Env)
-	cmd.Env = append(
-		cmd.Env,
-		"RMTX=1",
-		"RMTX_WORKSPACE="+workspace,
-		"RMTX_CONTEXT_ID="+request.ContextID,
-	)
+	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -559,6 +610,7 @@ func (s *Server) runPipeCommand(
 	}()
 
 	stdinDone := make(chan error, 1)
+
 	go func() { stdinDone <- s.consumePipeInput(conn, stdin) }()
 
 	waitErr := cmd.Wait()
@@ -588,15 +640,7 @@ func (s *Server) runTTYCommand(
 
 	defer func() { _ = master.Close() }()
 
-	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
-	cmd.Dir = workdir
-	cmd.Env = mergeEnv(os.Environ(), request.Env)
-	cmd.Env = append(
-		cmd.Env,
-		"RMTX=1",
-		"RMTX_WORKSPACE="+workspace,
-		"RMTX_CONTEXT_ID="+request.ContextID,
-	)
+	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
 
 	cmd.Stdin = slave
 	cmd.Stdout = slave
@@ -615,6 +659,7 @@ func (s *Server) runTTYCommand(
 	_ = slave.Close()
 
 	outputDone := make(chan error, 1)
+
 	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
 
 	go func() {
@@ -647,19 +692,13 @@ func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) err
 			return err
 		}
 
-		switch head.Type {
-		case protocol.MsgStdinData:
-			if _, err := io.Copy(stdin, conn.PayloadReader(head)); err != nil {
-				return err
-			}
-		case protocol.MsgStdinClose:
-			return nil
-		default:
-			if err := conn.DiscardPayload(head); err != nil {
-				return err
-			}
+		done, err := s.handleInputFrame(conn, head, stdin, false)
+		if err != nil {
+			return err
+		}
 
-			return fmt.Errorf("unexpected frame during stdin phase: %s", head.Type)
+		if done {
+			return nil
 		}
 	}
 }
@@ -675,29 +714,80 @@ func (s *Server) consumeTTYInput(conn *protocol.Conn, master *os.File) error {
 			return err
 		}
 
-		switch head.Type {
-		case protocol.MsgStdinData:
-			if _, err := io.Copy(master, conn.PayloadReader(head)); err != nil {
-				return err
-			}
-		case protocol.MsgStdinClose:
-			return nil
-		case protocol.MsgResizeTTY:
-			size, err := protocol.DecodeData[protocol.TTYSize](head)
-			if err != nil {
-				return err
-			}
-
-			if err := resizePTY(master, size.Rows, size.Cols); err != nil {
-				return err
-			}
-		default:
-			if err := conn.DiscardPayload(head); err != nil {
-				return err
-			}
-
-			return fmt.Errorf("unexpected frame during TTY phase: %s", head.Type)
+		done, err := s.handleInputFrame(conn, head, master, true)
+		if err != nil {
+			return err
 		}
+
+		if done {
+			return nil
+		}
+	}
+}
+
+func (s *Server) newSessionCommand(
+	ctx context.Context,
+	workspace string,
+	workdir string,
+	request protocol.RunRequest,
+) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
+	cmd.Dir = workdir
+	cmd.Env = mergeEnv(os.Environ(), request.Env)
+	cmd.Env = append(
+		cmd.Env,
+		"RMTX=1",
+		"RMTX_WORKSPACE="+workspace,
+		"RMTX_CONTEXT_ID="+request.ContextID,
+	)
+
+	return cmd
+}
+
+func (s *Server) handleInputFrame(
+	conn *protocol.Conn,
+	head protocol.Header,
+	writer io.Writer,
+	allowResize bool,
+) (bool, error) {
+	switch head.Type {
+	case protocol.MsgStdinData:
+		_, err := io.Copy(writer, conn.PayloadReader(head))
+		return false, err
+	case protocol.MsgStdinClose:
+		return true, nil
+	case protocol.MsgResizeTTY:
+		if !allowResize {
+			if err := conn.DiscardPayload(head); err != nil {
+				return false, err
+			}
+
+			return false, fmt.Errorf("unexpected frame during stdin phase: %s", head.Type)
+		}
+
+		size, err := protocol.DecodeData[protocol.TTYSize](head)
+		if err != nil {
+			return false, err
+		}
+
+		if file, ok := writer.(*os.File); ok {
+			if err := resizePTY(file, size.Rows, size.Cols); err != nil {
+				return false, err
+			}
+		}
+
+		return false, nil
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, err
+		}
+
+		phase := "stdin"
+		if allowResize {
+			phase = "TTY"
+		}
+
+		return false, fmt.Errorf("unexpected frame during %s phase: %s", phase, head.Type)
 	}
 }
 

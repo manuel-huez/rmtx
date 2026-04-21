@@ -51,6 +51,17 @@ type BuildResult struct {
 	BlobSources map[string]string
 }
 
+func NonFileEntries(entries []Entry) []Entry {
+	nonFiles := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Kind != KindFile {
+			nonFiles = append(nonFiles, entry)
+		}
+	}
+
+	return nonFiles
+}
+
 type hashJob struct {
 	AbsPath string
 	Entry   Entry

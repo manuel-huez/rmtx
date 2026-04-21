@@ -139,7 +139,11 @@ func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingI
 	return client.Ping(ctx, client.RemoteOptions{Address: address, Token: token})
 }
 
-func RunListContexts(ctx context.Context, cwd string, params RemoteParams) ([]client.ContextInfo, error) {
+func RunListContexts(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+) ([]client.ContextInfo, error) {
 	address, token, _, err := resolveRemoteTarget(ctx, cwd, params)
 	if err != nil {
 		return nil, err
@@ -148,7 +152,11 @@ func RunListContexts(ctx context.Context, cwd string, params RemoteParams) ([]cl
 	return client.ListContexts(ctx, client.RemoteOptions{Address: address, Token: token})
 }
 
-func RunDeleteContexts(ctx context.Context, cwd string, params ContextDeleteParams) (client.DeleteContextsResult, error) {
+func RunDeleteContexts(
+	ctx context.Context,
+	cwd string,
+	params ContextDeleteParams,
+) (client.DeleteContextsResult, error) {
 	address, token, loaded, err := resolveRemoteTarget(
 		ctx,
 		cwd,
@@ -239,9 +247,11 @@ func resolveTTY(params ExecParams) (bool, error) {
 		}
 
 		return true, nil
-	default:
+	case TTYAuto:
 		return ShouldUseTTY(params.StdinFile, params.StdoutFile, params.StderrFile), nil
 	}
+
+	return false, fmt.Errorf("unsupported tty mode %q", params.TTYMode)
 }
 
 func resolveRemoteTarget(
@@ -292,7 +302,10 @@ func resolveRemoteTarget(
 	}
 
 	if token == "" {
-		return "", "", loaded, fmt.Errorf("no token configured; set %s or use --token", tokenEnvName(cfg))
+		return "", "", loaded, fmt.Errorf(
+			"no token configured; set %s or use --token",
+			tokenEnvName(cfg),
+		)
 	}
 
 	return address, token, loaded, nil

@@ -86,7 +86,10 @@ func (s *ttyInputSession) startResizeWatcher(opts ExecOptions) {
 					continue
 				}
 
-				_ = s.conn.WriteJSON(protocol.MsgResizeTTY, protocol.TTYSize{Rows: rows, Cols: cols})
+				_ = s.conn.WriteJSON(
+					protocol.MsgResizeTTY,
+					protocol.TTYSize{Rows: rows, Cols: cols},
+				)
 			}
 		}
 	}()
