@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
@@ -19,13 +21,15 @@ import (
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
+
 const (
 	defaultDirMode   = 0o755
 	streamBufferSize = 32 * 1024
 	splitNEquals     = 2
 	pipeCount        = 2
 	exitCodeNotFound = 127
+	defaultFileMode  = 0o644
 )
 
 type Options struct {
@@ -44,6 +48,11 @@ type Server struct {
 	blobStore  *syncfs.BlobStore
 	logger     *log.Logger
 	advertiser *discovery.Responder
+
+	contextLocksMu sync.Mutex
+	contextLocks   map[string]*sync.Mutex
+	activeMu       sync.Mutex
+	activeContexts map[string]int
 }
 
 func New(opts Options) (*Server, error) {
@@ -76,8 +85,8 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(opts.StateDir, "sessions"), defaultDirMode); err != nil {
-		return nil, fmt.Errorf("create session dir: %w", err)
+	if err := os.MkdirAll(filepath.Join(opts.StateDir, contextDirName), defaultDirMode); err != nil {
+		return nil, fmt.Errorf("create context dir: %w", err)
 	}
 
 	store := syncfs.NewBlobStore(filepath.Join(opts.StateDir, "blobs"))
@@ -85,7 +94,13 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("prepare blob store: %w", err)
 	}
 
-	return &Server{opts: opts, blobStore: store, logger: opts.Logger}, nil
+	return &Server{
+		opts:           opts,
+		blobStore:      store,
+		logger:         opts.Logger,
+		contextLocks:   map[string]*sync.Mutex{},
+		activeContexts: map[string]int{},
+	}, nil
 }
 
 func (s *Server) Addr() string {
@@ -120,7 +135,6 @@ func (s *Server) Serve(ctx context.Context) error {
 				s.logger.Printf("discovery advertise failed: %v", err)
 			} else {
 				s.advertiser = adv
-
 				defer func() { _ = adv.Close() }()
 			}
 		}
@@ -161,74 +175,170 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 		return err
 	}
 
-	request, err := readRunRequest(conn)
-	if err != nil {
-		return err
-	}
-
-	if err := s.prepareWorkspace(conn, request.Manifest); err != nil {
-		return err
-	}
-
-	workspace, err := os.MkdirTemp(filepath.Join(s.opts.StateDir, "sessions"), "session-")
-	if err != nil {
-		return fmt.Errorf("create workspace: %w", err)
-	}
-
-	defer func() { _ = os.RemoveAll(workspace) }()
-
-	if err := syncfs.MaterializeWorkspace(workspace, request.Manifest, s.blobStore); err != nil {
-		return err
-	}
-
-	if err := conn.WriteJSON(protocol.MsgWorkspaceReady, nil); err != nil {
-		return err
-	}
-
-	code := s.executeRequest(parent, conn, workspace, request)
-	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
-		return err
-	}
-
-	return s.sendWorkspaceChanges(conn, workspace, request)
-}
-
-func readRunRequest(conn *protocol.Conn) (protocol.RunRequest, error) {
 	head, err := conn.ReadHeader()
 	if err != nil {
-		return protocol.RunRequest{}, err
+		return err
 	}
 
-	if head.Type != protocol.MsgRunRequest {
-		return protocol.RunRequest{}, fmt.Errorf(
-			"expected %s, got %s",
-			protocol.MsgRunRequest,
-			head.Type,
-		)
-	}
+	switch head.Type {
+	case protocol.MsgRunRequest:
+		req, err := protocol.DecodeData[protocol.RunRequest](head)
+		if err != nil {
+			return err
+		}
 
-	request, err := protocol.DecodeData[protocol.RunRequest](head)
-	if err != nil {
-		return protocol.RunRequest{}, err
-	}
+		return s.handleRunRequest(parent, conn, req)
+	case protocol.MsgPingRequest:
+		if err := conn.DiscardPayload(head); err != nil {
+			return err
+		}
 
-	if len(request.Command) == 0 {
-		return protocol.RunRequest{}, errors.New("missing command")
-	}
+		return s.handlePing(conn)
+	case protocol.MsgListContextsRequest:
+		if err := conn.DiscardPayload(head); err != nil {
+			return err
+		}
 
-	return request, nil
+		return s.handleListContexts(conn)
+	case protocol.MsgDeleteContextsRequest:
+		req, err := protocol.DecodeData[protocol.DeleteContextsRequest](head)
+		if err != nil {
+			return err
+		}
+
+		return s.handleDeleteContexts(conn, req)
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("unexpected request %s", head.Type)
+	}
 }
 
-func (s *Server) prepareWorkspace(conn *protocol.Conn, manifest []syncfs.Entry) error {
-	missing := s.blobStore.MissingHashes(manifest)
-	if err := conn.WriteJSON(
-		protocol.MsgNeedBlobs,
-		protocol.NeedBlobs{Hashes: missing},
+func (s *Server) handleRunRequest(
+	parent context.Context,
+	conn *protocol.Conn,
+	request protocol.RunRequest,
+) error {
+	if len(request.Command) == 0 {
+		return errors.New("missing command")
+	}
+	if strings.TrimSpace(request.ContextID) == "" {
+		return errors.New("missing context id")
+	}
+
+	release := s.acquireContext(request.ContextID)
+	defer release()
+
+	handle, err := s.ensureContext(request.ContextID, request.ContextName, request.RootHint)
+	if err != nil {
+		return err
+	}
+
+	currentManifest, err := s.loadTrackedManifest(request.ContextID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.syncContextFromClient(
+		conn,
+		request.ContextID,
+		handle.workspace,
+		currentManifest,
+		request.Manifest,
 	); err != nil {
 		return err
 	}
 
-	return s.receiveBlobs(conn)
+	if err := s.saveTrackedManifest(request.ContextID, request.Manifest); err != nil {
+		return err
+	}
+
+	if err := conn.WriteJSON(
+		protocol.MsgWorkspaceReady,
+		protocol.WorkspaceReady{
+			ContextID: request.ContextID,
+			Created:   handle.created,
+			Workspace: handle.workspace,
+		},
+	); err != nil {
+		return err
+	}
+
+	code := s.executeRequest(parent, conn, handle.workspace, request)
+	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
+		return err
+	}
+
+	post, err := syncfs.BuildManifest(handle.workspace, request.Mounts)
+	if err != nil {
+		return fmt.Errorf("scan workspace changes: %w", err)
+	}
+
+	if err := s.sendWorkspaceChanges(conn, handle.workspace, request.Manifest, post.Entries); err != nil {
+		return err
+	}
+
+	if err := s.saveTrackedManifest(request.ContextID, post.Entries); err != nil {
+		return err
+	}
+
+	handle.meta.UpdatedAt = time.Now().UTC()
+	if err := saveContextMetadata(handle.dir, handle.meta); err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+}
+
+func (s *Server) handlePing(conn *protocol.Conn) error {
+	contexts, err := s.listContexts()
+	if err != nil {
+		return err
+	}
+
+	name := strings.TrimSpace(s.opts.AdvertiseName)
+	if name == "" {
+		if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
+			name = hostName
+		} else {
+			name = "rmtx-host"
+		}
+	}
+
+	return conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
+		Online:       true,
+		Version:      Version,
+		Name:         name,
+		Address:      s.Addr(),
+		Now:          time.Now().UTC(),
+		ContextCount: len(contexts),
+	})
+}
+
+func (s *Server) handleListContexts(conn *protocol.Conn) error {
+	contexts, err := s.listContexts()
+	if err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(
+		protocol.MsgListContextsResponse,
+		protocol.ListContextsResponse{Contexts: contexts},
+	)
+}
+
+func (s *Server) handleDeleteContexts(
+	conn *protocol.Conn,
+	req protocol.DeleteContextsRequest,
+) error {
+	resp, err := s.deleteContexts(req)
+	if err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(protocol.MsgDeleteContextsResponse, resp)
 }
 
 func (s *Server) executeRequest(
@@ -242,7 +352,12 @@ func (s *Server) executeRequest(
 
 	code, runErr := s.runCommand(sessionCtx, cancel, conn, workspace, request)
 	if runErr != nil {
-		s.logger.Printf("session %s exited with error: %v", request.Session, runErr)
+		s.logger.Printf(
+			"session %s context %s exited with error: %v",
+			request.Session,
+			request.ContextID,
+			runErr,
+		)
 	}
 
 	return code
@@ -251,14 +366,10 @@ func (s *Server) executeRequest(
 func (s *Server) sendWorkspaceChanges(
 	conn *protocol.Conn,
 	workspace string,
-	request protocol.RunRequest,
+	before []syncfs.Entry,
+	after []syncfs.Entry,
 ) error {
-	post, err := syncfs.BuildManifest(workspace, request.Mounts)
-	if err != nil {
-		return fmt.Errorf("scan workspace changes: %w", err)
-	}
-
-	changed, deleted := syncfs.Diff(request.Manifest, post.Entries)
+	changed, deleted := syncfs.Diff(before, after)
 	if err := conn.WriteJSON(
 		protocol.MsgChangeSet,
 		protocol.ChangeSet{Entries: changed, Deleted: deleted},
@@ -266,11 +377,7 @@ func (s *Server) sendWorkspaceChanges(
 		return err
 	}
 
-	if err := sendChangedFileBlobs(conn, workspace, changed); err != nil {
-		return err
-	}
-
-	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+	return sendChangedFileBlobs(conn, workspace, changed)
 }
 
 func sendChangedFileBlobs(conn *protocol.Conn, workspace string, changed []syncfs.Entry) error {
@@ -388,10 +495,30 @@ func (s *Server) runCommand(
 		return 1, err
 	}
 
+	if request.TTY {
+		return s.runTTYCommand(ctx, cancel, conn, workspace, workdir, request)
+	}
+
+	return s.runPipeCommand(ctx, cancel, conn, workspace, workdir, request)
+}
+
+func (s *Server) runPipeCommand(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+	workspace string,
+	workdir string,
+	request protocol.RunRequest,
+) (int, error) {
 	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
 	cmd.Dir = workdir
 	cmd.Env = mergeEnv(os.Environ(), request.Env)
-	cmd.Env = append(cmd.Env, "RMTX=1", "RMTX_WORKSPACE="+workspace)
+	cmd.Env = append(
+		cmd.Env,
+		"RMTX=1",
+		"RMTX_WORKSPACE="+workspace,
+		"RMTX_CONTEXT_ID="+request.ContextID,
+	)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -422,6 +549,7 @@ func (s *Server) runCommand(
 			cancel()
 		}
 	}()
+
 	go func() {
 		defer outWG.Done()
 
@@ -431,8 +559,7 @@ func (s *Server) runCommand(
 	}()
 
 	stdinDone := make(chan error, 1)
-
-	go func() { stdinDone <- s.consumeStdin(conn, stdin) }()
+	go func() { stdinDone <- s.consumePipeInput(conn, stdin) }()
 
 	waitErr := cmd.Wait()
 	_ = stdin.Close()
@@ -446,7 +573,68 @@ func (s *Server) runCommand(
 	return exitCode(waitErr), waitErr
 }
 
-func (s *Server) consumeStdin(conn *protocol.Conn, stdin io.WriteCloser) error {
+func (s *Server) runTTYCommand(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+	workspace string,
+	workdir string,
+	request protocol.RunRequest,
+) (int, error) {
+	master, slave, err := openPTY(request.TTYRows, request.TTYCols)
+	if err != nil {
+		return 1, err
+	}
+
+	defer func() { _ = master.Close() }()
+
+	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
+	cmd.Dir = workdir
+	cmd.Env = mergeEnv(os.Environ(), request.Env)
+	cmd.Env = append(
+		cmd.Env,
+		"RMTX=1",
+		"RMTX_WORKSPACE="+workspace,
+		"RMTX_CONTEXT_ID="+request.ContextID,
+	)
+
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		Ctty:    int(slave.Fd()),
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = slave.Close()
+		return exitCode(err), fmt.Errorf("start TTY command: %w", err)
+	}
+
+	_ = slave.Close()
+
+	outputDone := make(chan error, 1)
+	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
+
+	go func() {
+		if err := s.consumeTTYInput(conn, master); err != nil && !errors.Is(err, io.EOF) {
+			s.logger.Printf("TTY input forwarding ended: %v", err)
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	_ = master.Close()
+
+	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
+		cancel()
+		return exitCode(waitErr), err
+	}
+
+	return exitCode(waitErr), waitErr
+}
+
+func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) error {
 	defer func() { _ = stdin.Close() }()
 
 	for {
@@ -472,6 +660,43 @@ func (s *Server) consumeStdin(conn *protocol.Conn, stdin io.WriteCloser) error {
 			}
 
 			return fmt.Errorf("unexpected frame during stdin phase: %s", head.Type)
+		}
+	}
+}
+
+func (s *Server) consumeTTYInput(conn *protocol.Conn, master *os.File) error {
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+
+			return err
+		}
+
+		switch head.Type {
+		case protocol.MsgStdinData:
+			if _, err := io.Copy(master, conn.PayloadReader(head)); err != nil {
+				return err
+			}
+		case protocol.MsgStdinClose:
+			return nil
+		case protocol.MsgResizeTTY:
+			size, err := protocol.DecodeData[protocol.TTYSize](head)
+			if err != nil {
+				return err
+			}
+
+			if err := resizePTY(master, size.Rows, size.Cols); err != nil {
+				return err
+			}
+		default:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+
+			return fmt.Errorf("unexpected frame during TTY phase: %s", head.Type)
 		}
 	}
 }
@@ -506,8 +731,8 @@ func mergeEnv(base []string, overrides map[string]string) []string {
 	}
 
 	merged := map[string]string{}
-
 	order := make([]string, 0, len(base)+len(overrides))
+
 	for _, entry := range base {
 		parts := strings.SplitN(entry, "=", splitNEquals)
 		k := parts[0]

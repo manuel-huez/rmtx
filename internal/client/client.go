@@ -14,6 +14,7 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
+	"github.com/manuel-huez/rmtx/internal/terminal"
 )
 
 type ExecOptions struct {
@@ -28,9 +29,31 @@ type ExecOptions struct {
 	Stdout       io.Writer
 	Stderr       io.Writer
 	Stdin        io.Reader
+	StdinFile    *os.File
+	StdoutFile   *os.File
+	StderrFile   *os.File
 	ForwardStdin bool
 	Session      string
 	Project      string
+	ContextID    string
+	ContextName  string
+	TTY          bool
+}
+
+type RemoteOptions struct {
+	Address string
+	Token   string
+}
+
+type PingInfo = protocol.PingResponse
+type ContextInfo = protocol.ContextSummary
+type DeleteContextsResult = protocol.DeleteContextsResponse
+
+type DeleteContextsOptions struct {
+	Remote    RemoteOptions
+	IDs       []string
+	All       bool
+	OlderThan string
 }
 
 const stdinBufferSize = 32 * 1024
@@ -62,7 +85,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 
-	return processExecFrames(conn, root, opts)
+	return processExecFrames(ctx, conn, root, opts)
 }
 
 func resolvePaths(opts *ExecOptions) (string, string, error) {
@@ -101,6 +124,10 @@ func validateExecOptions(opts *ExecOptions) error {
 
 	if len(opts.Command) == 0 {
 		return errors.New("command is required")
+	}
+
+	if strings.TrimSpace(opts.ContextID) == "" {
+		return errors.New("context id is required")
 	}
 
 	return nil
@@ -178,15 +205,43 @@ func buildRunRequest(
 		}
 	}
 
+	env := collectEnv(opts.ForwardEnv, opts.ExtraEnv)
+	if opts.TTY {
+		if _, ok := env["TERM"]; !ok {
+			if term := strings.TrimSpace(os.Getenv("TERM")); term != "" {
+				env["TERM"] = term
+			}
+		}
+	}
+
+	rows, cols := 0, 0
+	if opts.TTY {
+		sizeFile := opts.StdoutFile
+		if !terminal.IsTerminal(sizeFile) {
+			sizeFile = opts.StdinFile
+		}
+
+		var sizeErr error
+		rows, cols, sizeErr = terminal.Size(sizeFile)
+		if sizeErr != nil {
+			rows, cols = 0, 0
+		}
+	}
+
 	request := protocol.RunRequest{
-		WorkDir:  workdir,
-		Command:  append([]string(nil), opts.Command...),
-		Env:      collectEnv(opts.ForwardEnv, opts.ExtraEnv),
-		Mounts:   append([]syncfs.MountSpec(nil), opts.Mounts...),
-		Manifest: manifest.Entries,
-		Session:  opts.Session,
-		Project:  opts.Project,
-		RootHint: filepath.Base(root),
+		ContextID:   opts.ContextID,
+		ContextName: opts.ContextName,
+		WorkDir:     workdir,
+		Command:     append([]string(nil), opts.Command...),
+		Env:         env,
+		Mounts:      append([]syncfs.MountSpec(nil), opts.Mounts...),
+		Manifest:    manifest.Entries,
+		Session:     opts.Session,
+		Project:     opts.Project,
+		RootHint:    filepath.Base(root),
+		TTY:         opts.TTY,
+		TTYRows:     rows,
+		TTYCols:     cols,
 	}
 
 	return manifest, request, nil
@@ -231,14 +286,22 @@ func runHandshake(
 		return err
 	}
 
-	_, err = expectFrame(conn, protocol.MsgWorkspaceReady)
+	_, err = expectDataFrame[protocol.WorkspaceReady](conn, protocol.MsgWorkspaceReady)
 
 	return err
 }
 
-func processExecFrames(conn *protocol.Conn, root string, opts ExecOptions) (int, error) {
-	stdinErrCh := make(chan error, 1)
+func processExecFrames(
+	ctx context.Context,
+	conn *protocol.Conn,
+	root string,
+	opts ExecOptions,
+) (int, error) {
+	if opts.TTY {
+		return processTTYExecFrames(ctx, conn, root, opts)
+	}
 
+	stdinErrCh := make(chan error, 1)
 	go func() { stdinErrCh <- sendStdin(conn, opts.Stdin, opts.ForwardStdin) }()
 
 	exitCode := 0
@@ -259,6 +322,56 @@ func processExecFrames(conn *protocol.Conn, root string, opts ExecOptions) (int,
 		if done {
 			if err := <-stdinErrCh; err != nil {
 				return exitCode, err
+			}
+
+			return exitCode, nil
+		}
+	}
+}
+
+func processTTYExecFrames(
+	ctx context.Context,
+	conn *protocol.Conn,
+	root string,
+	opts ExecOptions,
+) (int, error) {
+	session, inputErrCh, err := startTTYInput(ctx, conn, opts)
+	if err != nil {
+		return 1, err
+	}
+	if session != nil {
+		defer session.Close()
+	}
+
+	exitCode := 0
+
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return exitCode, err
+		}
+
+		if head.Type == protocol.MsgExecExit && session != nil {
+			session.Close()
+			session = nil
+		}
+
+		done, updatedExitCode, err := handleExecFrame(conn, head, root, opts, exitCode)
+		if err != nil {
+			return updatedExitCode, err
+		}
+
+		exitCode = updatedExitCode
+
+		if done {
+			if inputErrCh != nil {
+				select {
+				case inputErr := <-inputErrCh:
+					if inputErr != nil && !errors.Is(inputErr, io.EOF) {
+						return exitCode, inputErr
+					}
+				default:
+				}
 			}
 
 			return exitCode, nil

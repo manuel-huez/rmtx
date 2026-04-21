@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ const (
 	DefaultPort             = 33221
 	DefaultService          = "rmtx"
 	defaultDiscoveryTimeout = 750 * time.Millisecond
+	contextHashLen          = 12
 )
 
 var ErrConfigNotFound = errors.New("config not found")
@@ -21,10 +24,17 @@ var ErrConfigNotFound = errors.New("config not found")
 var fileNames = []string{
 	".rmtx.json",
 	"rmtx.json",
+	".remotex.json",
+	"remotex.json",
+}
+
+type ContextConfig struct {
+	Name string `json:"name,omitempty"`
 }
 
 type Config struct {
 	Version   int             `json:"version,omitempty"`
+	Context   ContextConfig   `json:"context,omitempty"`
 	Host      string          `json:"host,omitempty"`
 	Token     string          `json:"token,omitempty"`
 	TokenEnv  string          `json:"token_env,omitempty"`
@@ -142,7 +152,6 @@ func Resolve(startDir, explicitConfig string) (*Loaded, error) {
 
 defaultConfig:
 	root, err := filepath.Abs(startDir)
-
 	if err != nil {
 		return nil, fmt.Errorf("resolve default root: %w", err)
 	}
@@ -150,6 +159,26 @@ defaultConfig:
 	cfg := normalize(Default())
 
 	return &Loaded{Path: "", Root: root, Config: cfg}, nil
+}
+
+func ResolveRequired(startDir, explicitConfig string) (*Loaded, error) {
+	if strings.TrimSpace(explicitConfig) != "" {
+		return Load(explicitConfig)
+	}
+
+	loaded, err := Search(startDir)
+	if err != nil {
+		if errors.Is(err, ErrConfigNotFound) {
+			return nil, fmt.Errorf(
+				"local config file is required; create one of %s",
+				strings.Join(fileNames[:2], ", "),
+			)
+		}
+
+		return nil, err
+	}
+
+	return loaded, nil
 }
 
 func WithDefaults(cfg Config) Config {
@@ -186,6 +215,43 @@ func (c Config) TokenValue() string {
 	return os.Getenv(envName)
 }
 
+func (l Loaded) ContextName() string {
+	if strings.TrimSpace(l.Config.Context.Name) != "" {
+		return strings.TrimSpace(l.Config.Context.Name)
+	}
+
+	name := filepath.Base(l.Root)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "context"
+	}
+
+	return name
+}
+
+func (l Loaded) ContextIdentity() string {
+	if strings.TrimSpace(l.Config.Context.Name) != "" {
+		return "name:" + strings.TrimSpace(l.Config.Context.Name)
+	}
+
+	root := l.Root
+	if root == "" && l.Path != "" {
+		root = filepath.Dir(l.Path)
+	}
+
+	return "root:" + filepath.Clean(root)
+}
+
+func (l Loaded) ContextID() string {
+	name := slug(l.ContextName())
+	if name == "" {
+		name = "context"
+	}
+
+	sum := sha256.Sum256([]byte(l.ContextIdentity()))
+
+	return fmt.Sprintf("%s-%s", name, hex.EncodeToString(sum[:])[:contextHashLen])
+}
+
 func normalize(cfg Config) Config {
 	if cfg.Version == 0 {
 		cfg.Version = 1
@@ -212,4 +278,37 @@ func normalize(cfg Config) Config {
 	}
 
 	return cfg
+}
+
+func slug(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	lastDash := false
+
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			lastDash = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "context"
+	}
+
+	return out
 }

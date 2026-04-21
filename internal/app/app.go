@@ -16,6 +16,15 @@ import (
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
+	"github.com/manuel-huez/rmtx/internal/terminal"
+)
+
+type TTYMode int
+
+const (
+	TTYAuto TTYMode = iota
+	TTYForce
+	TTYDisable
 )
 
 type ExecParams struct {
@@ -28,6 +37,28 @@ type ExecParams struct {
 	Stderr           io.Writer
 	Stdin            io.Reader
 	ForwardStdin     bool
+	StdinFile        *os.File
+	StdoutFile       *os.File
+	StderrFile       *os.File
+	TTYMode          TTYMode
+}
+
+type RemoteParams struct {
+	AddressOverride  string
+	ConfigPath       string
+	TokenOverride    string
+	DiscoveryTimeout time.Duration
+}
+
+type ContextDeleteParams struct {
+	AddressOverride  string
+	ConfigPath       string
+	TokenOverride    string
+	DiscoveryTimeout time.Duration
+	IDs              []string
+	All              bool
+	OlderThan        time.Duration
+	Current          bool
 }
 
 type HostParams struct {
@@ -41,7 +72,7 @@ type HostParams struct {
 }
 
 func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
-	loaded, err := config.Resolve(cwd, params.ConfigPath)
+	loaded, err := config.ResolveRequired(cwd, params.ConfigPath)
 	if err != nil {
 		return 1, err
 	}
@@ -62,6 +93,11 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		return 1, fmt.Errorf("no token configured; set %s or use --token", tokenEnvName(cfg))
 	}
 
+	useTTY, err := resolveTTY(params)
+	if err != nil {
+		return 1, err
+	}
+
 	mounts := make([]syncfs.MountSpec, 0, len(cfg.Mounts))
 	for _, mount := range cfg.Mounts {
 		mounts = append(
@@ -69,6 +105,8 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 			syncfs.MountSpec{Path: mount.Path, Exclude: append([]string(nil), mount.Exclude...)},
 		)
 	}
+
+	forwardStdin := params.ForwardStdin || useTTY || ShouldForwardStdin(params.StdinFile)
 
 	return client.Run(ctx, client.ExecOptions{
 		Address:      address,
@@ -81,9 +119,73 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		Stdout:       params.Stdout,
 		Stderr:       params.Stderr,
 		Stdin:        params.Stdin,
-		ForwardStdin: params.ForwardStdin,
+		StdinFile:    params.StdinFile,
+		StdoutFile:   params.StdoutFile,
+		StderrFile:   params.StderrFile,
+		ForwardStdin: forwardStdin,
 		Project:      filepath.Base(loaded.Root),
+		ContextID:    loaded.ContextID(),
+		ContextName:  loaded.ContextName(),
+		TTY:          useTTY,
 	})
+}
+
+func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingInfo, error) {
+	address, token, _, err := resolveRemoteTarget(ctx, cwd, params)
+	if err != nil {
+		return client.PingInfo{}, err
+	}
+
+	return client.Ping(ctx, client.RemoteOptions{Address: address, Token: token})
+}
+
+func RunListContexts(ctx context.Context, cwd string, params RemoteParams) ([]client.ContextInfo, error) {
+	address, token, _, err := resolveRemoteTarget(ctx, cwd, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return client.ListContexts(ctx, client.RemoteOptions{Address: address, Token: token})
+}
+
+func RunDeleteContexts(ctx context.Context, cwd string, params ContextDeleteParams) (client.DeleteContextsResult, error) {
+	address, token, loaded, err := resolveRemoteTarget(
+		ctx,
+		cwd,
+		RemoteParams{
+			AddressOverride:  params.AddressOverride,
+			ConfigPath:       params.ConfigPath,
+			TokenOverride:    params.TokenOverride,
+			DiscoveryTimeout: params.DiscoveryTimeout,
+		},
+	)
+	if err != nil {
+		return client.DeleteContextsResult{}, err
+	}
+
+	ids := append([]string(nil), params.IDs...)
+	if params.Current {
+		if loaded == nil {
+			loaded, err = config.ResolveRequired(cwd, params.ConfigPath)
+			if err != nil {
+				return client.DeleteContextsResult{}, err
+			}
+		}
+
+		ids = append(ids, loaded.ContextID())
+	}
+
+	req := client.DeleteContextsOptions{
+		Remote: client.RemoteOptions{Address: address, Token: token},
+		IDs:    ids,
+		All:    params.All,
+	}
+
+	if params.OlderThan > 0 {
+		req.OlderThan = params.OlderThan.String()
+	}
+
+	return client.DeleteContexts(ctx, req)
 }
 
 func RunHost(ctx context.Context, params HostParams) error {
@@ -119,6 +221,81 @@ func ShouldForwardStdin(f *os.File) bool {
 	}
 
 	return info.Mode()&os.ModeCharDevice == 0
+}
+
+func ShouldUseTTY(stdin, stdout, stderr *os.File) bool {
+	_ = stderr
+
+	return terminal.IsTerminal(stdin) && terminal.IsTerminal(stdout)
+}
+
+func resolveTTY(params ExecParams) (bool, error) {
+	switch params.TTYMode {
+	case TTYDisable:
+		return false, nil
+	case TTYForce:
+		if !ShouldUseTTY(params.StdinFile, params.StdoutFile, params.StderrFile) {
+			return false, errors.New("TTY requested but local stdin/stdout are not terminals")
+		}
+
+		return true, nil
+	default:
+		return ShouldUseTTY(params.StdinFile, params.StdoutFile, params.StderrFile), nil
+	}
+}
+
+func resolveRemoteTarget(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+) (string, string, *config.Loaded, error) {
+	var (
+		loaded *config.Loaded
+		err    error
+	)
+
+	if strings.TrimSpace(params.ConfigPath) != "" {
+		loaded, err = config.Load(params.ConfigPath)
+		if err != nil {
+			return "", "", nil, err
+		}
+	} else {
+		loaded, err = config.Search(cwd)
+		if err != nil && !errors.Is(err, config.ErrConfigNotFound) {
+			return "", "", nil, err
+		}
+
+		if errors.Is(err, config.ErrConfigNotFound) {
+			loaded = nil
+		}
+	}
+
+	cfg := config.Default()
+	if loaded != nil {
+		cfg = config.WithDefaults(loaded.Config)
+	} else {
+		cfg = config.WithDefaults(cfg)
+	}
+
+	address, err := resolveHost(ctx, cfg, params.AddressOverride, params.DiscoveryTimeout)
+	if err != nil {
+		return "", "", loaded, err
+	}
+
+	token := strings.TrimSpace(params.TokenOverride)
+	if token == "" {
+		if loaded != nil {
+			token = strings.TrimSpace(cfg.TokenValue())
+		} else {
+			token = strings.TrimSpace(os.Getenv("RMTX_TOKEN"))
+		}
+	}
+
+	if token == "" {
+		return "", "", loaded, fmt.Errorf("no token configured; set %s or use --token", tokenEnvName(cfg))
+	}
+
+	return address, token, loaded, nil
 }
 
 func resolveHost(

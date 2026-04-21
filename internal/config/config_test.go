@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +58,45 @@ func TestResolveReturnsDefaultsWithoutConfig(t *testing.T) {
 
 	if !loaded.Config.DiscoveryEnabled() {
 		t.Fatal("expected discovery to be enabled by default")
+	}
+}
+
+func TestResolveRequiredFailsWithoutConfig(t *testing.T) {
+	root := t.TempDir()
+
+	_, err := ResolveRequired(root, "")
+	if err == nil {
+		t.Fatal("expected missing config error")
+	}
+
+	if !strings.Contains(err.Error(), "local config file is required") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadedContextIDUsesStableExplicitName(t *testing.T) {
+	root := t.TempDir()
+
+	if err := os.WriteFile(
+		filepath.Join(root, ".rmtx.json"),
+		[]byte(`{"version":1,"context":{"name":"shared context"}}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := ResolveRequired(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := loaded.ContextName(); got != "shared context" {
+		t.Fatalf("unexpected context name: %s", got)
+	}
+
+	id1 := loaded.ContextID()
+	id2 := loaded.ContextID()
+	if id1 == "" || id1 != id2 {
+		t.Fatalf("expected stable context id, got %q and %q", id1, id2)
 	}
 }
