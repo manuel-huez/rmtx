@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
@@ -625,60 +624,6 @@ func (s *Server) runPipeCommand(
 	return exitCode(waitErr), waitErr
 }
 
-func (s *Server) runTTYCommand(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	conn *protocol.Conn,
-	workspace string,
-	workdir string,
-	request protocol.RunRequest,
-) (int, error) {
-	master, slave, err := openPTY(request.TTYRows, request.TTYCols)
-	if err != nil {
-		return 1, err
-	}
-
-	defer func() { _ = master.Close() }()
-
-	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
-
-	cmd.Stdin = slave
-	cmd.Stdout = slave
-	cmd.Stderr = slave
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid:  true,
-		Setctty: true,
-		Ctty:    int(slave.Fd()),
-	}
-
-	if err := cmd.Start(); err != nil {
-		_ = slave.Close()
-		return exitCode(err), fmt.Errorf("start TTY command: %w", err)
-	}
-
-	_ = slave.Close()
-
-	outputDone := make(chan error, 1)
-
-	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
-
-	go func() {
-		if err := s.consumeTTYInput(conn, master); err != nil && !errors.Is(err, io.EOF) {
-			s.logger.Printf("TTY input forwarding ended: %v", err)
-		}
-	}()
-
-	waitErr := cmd.Wait()
-	_ = master.Close()
-
-	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
-		cancel()
-		return exitCode(waitErr), err
-	}
-
-	return exitCode(waitErr), waitErr
-}
-
 func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) error {
 	defer func() { _ = stdin.Close() }()
 
@@ -693,28 +638,6 @@ func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) err
 		}
 
 		done, err := s.handleInputFrame(conn, head, stdin, false)
-		if err != nil {
-			return err
-		}
-
-		if done {
-			return nil
-		}
-	}
-}
-
-func (s *Server) consumeTTYInput(conn *protocol.Conn, master *os.File) error {
-	for {
-		head, err := conn.ReadHeader()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-
-			return err
-		}
-
-		done, err := s.handleInputFrame(conn, head, master, true)
 		if err != nil {
 			return err
 		}
@@ -765,18 +688,7 @@ func (s *Server) handleInputFrame(
 			return false, fmt.Errorf("unexpected frame during stdin phase: %s", head.Type)
 		}
 
-		size, err := protocol.DecodeData[protocol.TTYSize](head)
-		if err != nil {
-			return false, err
-		}
-
-		if file, ok := writer.(*os.File); ok {
-			if err := resizePTY(file, size.Rows, size.Cols); err != nil {
-				return false, err
-			}
-		}
-
-		return false, nil
+		return false, handleTTYResize(head, writer)
 	default:
 		if err := conn.DiscardPayload(head); err != nil {
 			return false, err
@@ -789,6 +701,26 @@ func (s *Server) handleInputFrame(
 
 		return false, fmt.Errorf("unexpected frame during %s phase: %s", phase, head.Type)
 	}
+}
+
+func handleTTYResize(head protocol.Header, writer io.Writer) error {
+	size, err := protocol.DecodeData[protocol.TTYSize](head)
+	if err != nil {
+		return err
+	}
+
+	if resizer, ok := writer.(interface {
+		ResizeTTY(rows, cols int) error
+	}); ok {
+		return resizer.ResizeTTY(size.Rows, size.Cols)
+	}
+
+	file, ok := writer.(*os.File)
+	if !ok {
+		return nil
+	}
+
+	return resizePTY(file, size.Rows, size.Cols)
 }
 
 func streamPipe(conn *protocol.Conn, src io.Reader, stream string) error {

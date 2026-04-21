@@ -42,6 +42,7 @@ func openPTY(rows, cols int) (*os.File, *os.File, error) {
 	if err := resizePTY(master, rows, cols); err != nil {
 		_ = slave.Close()
 		_ = master.Close()
+
 		return nil, nil, err
 	}
 

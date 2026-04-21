@@ -14,3 +14,8 @@ func openPTY(rows, cols int) (*os.File, *os.File, error) {
 func resizePTY(f *os.File, rows, cols int) error {
 	return errors.New("interactive TTY is not supported on this platform")
 }
+
+var (
+	_ = openPTY
+	_ = resizePTY
+)

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build windows
 
 package client
 
@@ -6,20 +6,20 @@ import (
 	"context"
 	"io"
 	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/terminal"
 )
 
+const resizePollInterval = 250 * time.Millisecond
+
 type ttyInputSession struct {
-	stdin   *os.File
-	state   terminal.State
-	signals chan os.Signal
-	done    chan struct{}
-	conn    *protocol.Conn
-	closed  chan struct{}
+	stdin  *os.File
+	state  terminal.State
+	done   chan struct{}
+	conn   *protocol.Conn
+	closed chan struct{}
 }
 
 func startTTYInput(
@@ -40,8 +40,8 @@ func startTTYInput(
 		stdin:  opts.StdinFile,
 		state:  state,
 		done:   make(chan struct{}),
-		closed: make(chan struct{}),
 		conn:   conn,
+		closed: make(chan struct{}),
 	}
 
 	session.startResizeWatcher(opts)
@@ -75,19 +75,28 @@ func (s *ttyInputSession) startResizeWatcher(opts ExecOptions) {
 		return
 	}
 
-	s.signals = make(chan os.Signal, 1)
-	signal.Notify(s.signals, syscall.SIGWINCH)
+	rows, cols, err := terminal.Size(sizeFile)
+	if err != nil {
+		rows, cols = 0, 0
+	}
 
 	go func() {
+		ticker := time.NewTicker(resizePollInterval)
+		defer ticker.Stop()
+
+		lastRows, lastCols := rows, cols
+
 		for {
 			select {
 			case <-s.done:
 				return
-			case <-s.signals:
+			case <-ticker.C:
 				rows, cols, err := terminal.Size(sizeFile)
-				if err != nil {
+				if err != nil || (rows == lastRows && cols == lastCols) {
 					continue
 				}
+
+				lastRows, lastCols = rows, cols
 
 				_ = s.conn.WriteJSON(
 					protocol.MsgResizeTTY,
@@ -103,10 +112,6 @@ func (s *ttyInputSession) Close() {
 	case <-s.done:
 	default:
 		close(s.done)
-	}
-
-	if s.signals != nil {
-		signal.Stop(s.signals)
 	}
 
 	_ = terminal.Restore(s.stdin, s.state)

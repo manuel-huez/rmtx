@@ -3,7 +3,7 @@
 package terminal
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"syscall"
 	"unsafe"
@@ -32,7 +32,7 @@ func IsTerminal(f *os.File) bool {
 
 func MakeRaw(f *os.File) (State, error) {
 	if f == nil {
-		return State{}, fmt.Errorf("terminal file is required")
+		return State{}, errors.New("terminal file is required")
 	}
 
 	current, err := getTermios(f.Fd())
@@ -67,7 +67,7 @@ func Restore(f *os.File, state State) error {
 
 func Size(f *os.File) (int, int, error) {
 	if f == nil {
-		return 0, 0, fmt.Errorf("terminal file is required")
+		return 0, 0, errors.New("terminal file is required")
 	}
 
 	ws, err := getWinsize(f.Fd())
