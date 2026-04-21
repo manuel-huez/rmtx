@@ -23,3 +23,12 @@ for goos in "${format_goos[@]}"; do
 done
 
 golangci-lint fmt
+
+# Native darwin formatter runs can still miss one Linux-only whitespace rewrite
+# that CI applies in signal-driven TTY files. Normalize that pattern locally so
+# `./scripts/format-code.sh` and the Linux formatter gate converge.
+while IFS= read -r file; do
+  perl -0pi -e \
+    's/(\n[ \t]*signal\.Notify\([^\n]+\)\n)(\n*)([ \t]*[[:alnum:]_.]+\s*=\s*func\(\)\s*\{)/$1\n$3/g' \
+    "$file"
+done < <(rg --files cmd internal -g '*.go')

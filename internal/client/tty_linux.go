@@ -18,6 +18,7 @@ func (s *ttyInputSession) startResizeWatcher(opts ExecOptions) {
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGWINCH)
+
 	s.closeFn = func() {
 		signal.Stop(signals)
 	}
