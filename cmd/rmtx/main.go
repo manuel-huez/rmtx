@@ -21,6 +21,7 @@ import (
 const exitUsage = 2
 const tabWriterTabWidth = 8
 const tabWriterPadding = 2
+const cliVersion = "0.2.0"
 
 type remoteFlags struct {
 	hostAddr         *string
@@ -44,6 +45,9 @@ func run(ctx context.Context, args []string) int {
 	}
 
 	switch args[0] {
+	case "version", "--version", "-v":
+		_, _ = fmt.Fprintln(os.Stdout, cliVersion)
+		return 0
 	case "host":
 		return runHost(ctx, args[1:])
 	case "exec":
@@ -380,6 +384,7 @@ Usage:
   rmtx exec [flags] -- <command> [args...]
   rmtx ping [flags]
   rmtx context [list|delete|prune] [flags]
+  rmtx version
   rmtx <command> [args...]
 
 Examples:
@@ -387,6 +392,7 @@ Examples:
   rmtx go test ./...
   rmtx exec --tty -- bash
   rmtx ping
+  rmtx version
   rmtx context list
   rmtx context delete --current
 `); err != nil {

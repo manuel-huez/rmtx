@@ -35,6 +35,20 @@ The execution model is now context-based:
 go build ./cmd/rmtx
 ```
 
+## Installing (Go)
+
+Install the CLI directly from the module:
+
+```bash
+go install github.com/manuel-huez/rmtx/cmd/rmtx@latest
+```
+
+Make sure your Go bin directory is on `PATH` (usually `$(go env GOPATH)/bin` or `~/go/bin`), then verify:
+
+```bash
+rmtx version
+```
+
 ## Running
 
 On the host machine:
