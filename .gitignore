@@ -1,3 +1,5 @@
-rmtx
+/rmtx
 *.test
 coverage.out
+
+.DS_Store
