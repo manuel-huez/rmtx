@@ -1,0 +1,35 @@
+name: Code Health
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  code-health:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Go tooling
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
+          go install golang.org/x/tools/cmd/deadcode@v0.41.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run repo formatters
+        run: ./scripts/format-code.sh
+
+      - name: Fail on formatter changes
+        run: git diff --exit-code
+
+      - name: Run full code health checks
+        run: ./scripts/check-code-health.sh

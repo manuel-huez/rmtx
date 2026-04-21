@@ -1,0 +1,55 @@
+version: "2"
+
+# AGENT NOTE: This configuration is intentionally full-fidelity. Never add partial
+# modes or reduce its reporting scope to speed up hooks. If you need a narrower
+# local check, run the underlying tools directly instead of changing this config.
+# If you believe that the checks are too strict, make your case to the user, but do
+# not change the config on your own.
+
+run:
+  tests: true
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - cyclop
+    - dupl
+    - errorlint
+    - errcheck
+    - exhaustive
+    - gocognit
+    - goconst
+    - gocritic
+    - govet
+    - ineffassign
+    - intrange
+    - maintidx
+    - mnd
+    - modernize
+    - nestif
+    - nilnesserr
+    - nilerr
+    - nilnil
+    - perfsprint
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - thelper
+    - unconvert
+    - unused
+    - usestdlibvars
+    - wastedassign
+    - wsl_v5
+
+  settings:
+    cyclop:
+      max-complexity: 12
+
+formatters:
+  enable:
+    - golines

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "host": "192.168.1.42:33221",
+  "token_env": "RMTX_TOKEN",
+  "mounts": [
+    {
+      "path": ".",
+      "exclude": [".git/**", "node_modules/**", "tmp/**"]
+    }
+  ],
+  "env": {
+    "forward": ["GOPRIVATE", "CGO_ENABLED", "AWS_PROFILE"]
+  },
+  "discovery": {
+    "enabled": true,
+    "service": "rmtx",
+    "timeout": "750ms"
+  }
+}
