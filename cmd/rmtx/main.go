@@ -289,6 +289,7 @@ func runInit(ctx context.Context, args []string) int {
 		"pairing code; omit to request one from selected host",
 		"path to create .rmtx.json",
 	)
+
 	fingerprint := fs.String(
 		"fingerprint",
 		"",
@@ -313,17 +314,7 @@ func runInit(ctx context.Context, args []string) int {
 		cwd,
 		params,
 		func(ctx context.Context, cwd string, params app.PairParams) (string, error) {
-			result, err := app.RunInit(ctx, cwd, app.InitParams{
-				AddressOverride:  params.AddressOverride,
-				Fingerprint:      params.Fingerprint,
-				ConfigPath:       params.ConfigPath,
-				DiscoveryTimeout: params.DiscoveryTimeout,
-				Code:             params.Code,
-				ClientLabel:      params.ClientLabel,
-				SelectionIndex:   params.SelectionIndex,
-				Stdin:            params.Stdin,
-				Stdout:           params.Stdout,
-			})
+			result, err := app.RunInit(ctx, cwd, app.InitParams(params))
 			if err != nil {
 				return "", err
 			}

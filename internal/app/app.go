@@ -336,17 +336,7 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 
 //nolint:cyclop // Init flow discovers pairable hosts, writes config, then completes pairing.
 func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, error) {
-	pairParams := PairParams{
-		AddressOverride:  params.AddressOverride,
-		Fingerprint:      params.Fingerprint,
-		ConfigPath:       params.ConfigPath,
-		DiscoveryTimeout: params.DiscoveryTimeout,
-		Code:             params.Code,
-		ClientLabel:      params.ClientLabel,
-		SelectionIndex:   params.SelectionIndex,
-		Stdin:            params.Stdin,
-		Stdout:           params.Stdout,
-	}
+	pairParams := PairParams(params)
 	preparePairIO(&pairParams)
 
 	configPath, err := resolveInitConfigPath(cwd, params.ConfigPath)
