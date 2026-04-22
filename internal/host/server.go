@@ -24,7 +24,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
-const Version = "0.6.3"
+const Version = "0.6.4"
 
 const (
 	defaultDirMode   = 0o755

@@ -231,33 +231,17 @@ func runPing(ctx context.Context, args []string) int {
 }
 
 func runPair(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("rmtx pair", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	common := bindPairLikeFlags(
-		fs,
+	cwd, params, code := preparePairLikeExecution(
+		args,
+		"rmtx pair",
 		"host address, e.g. 192.168.1.20:33221",
 		"pairing code; omit to request one from host",
 		"path to .rmtx.json",
-	)
-
-	fingerprint := fs.String(
-		"fingerprint",
-		"",
 		"expected host TLS fingerprint; required unless config tls.host_fingerprint is set",
 	)
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-
-	cwd, code := mustGetwdOrExit()
 	if code != 0 {
 		return code
 	}
-
-	params := pairLikeParams(common)
-	params.Fingerprint = *fingerprint
-	params.Stdin = os.Stdin
-	params.Stdout = os.Stdout
 
 	return executePairLike(
 		ctx,
@@ -280,34 +264,17 @@ func runPair(ctx context.Context, args []string) int {
 }
 
 func runInit(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("rmtx init", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-
-	common := bindPairLikeFlags(
-		fs,
+	cwd, params, code := preparePairLikeExecution(
+		args,
+		"rmtx init",
 		"preferred discovered host address, e.g. 192.168.1.20:33221",
 		"pairing code; omit to request one from selected host",
 		"path to create .rmtx.json",
-	)
-
-	fingerprint := fs.String(
-		"fingerprint",
-		"",
 		"expected host TLS fingerprint; required for manual init when discovery is unavailable",
 	)
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-
-	cwd, code := mustGetwdOrExit()
 	if code != 0 {
 		return code
 	}
-
-	params := pairLikeParams(common)
-	params.Fingerprint = *fingerprint
-	params.Stdin = os.Stdin
-	params.Stdout = os.Stdout
 
 	return executePairLike(
 		ctx,
@@ -354,6 +321,49 @@ func pairLikeParams(flags pairLikeFlags) app.PairParams {
 		ClientLabel:      *flags.label,
 		SelectionIndex:   *flags.selectIndex,
 	}
+}
+
+func preparePairLikeCommand(
+	args []string,
+	fs *flag.FlagSet,
+	common pairLikeFlags,
+	fingerprint *string,
+) (string, app.PairParams, int) {
+	if err := fs.Parse(args); err != nil {
+		return "", app.PairParams{}, exitUsage
+	}
+
+	cwd, code := mustGetwdOrExit()
+	if code != 0 {
+		return "", app.PairParams{}, code
+	}
+
+	params := pairLikeParams(common)
+	if fingerprint != nil {
+		params.Fingerprint = *fingerprint
+	}
+
+	params.Stdin = os.Stdin
+	params.Stdout = os.Stdout
+
+	return cwd, params, 0
+}
+
+func preparePairLikeExecution(
+	args []string,
+	command string,
+	hostHelp string,
+	codeHelp string,
+	configHelp string,
+	fingerprintHelp string,
+) (string, app.PairParams, int) {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	common := bindPairLikeFlags(fs, hostHelp, codeHelp, configHelp)
+	fingerprint := fs.String("fingerprint", "", fingerprintHelp)
+
+	return preparePairLikeCommand(args, fs, common, fingerprint)
 }
 
 func executePairLike(
