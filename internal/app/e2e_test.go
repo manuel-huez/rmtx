@@ -803,54 +803,18 @@ func TestRunInitManualHostBypassesDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if result.Host.Address != addr {
-		t.Fatalf("unexpected paired address: got %s want %s", result.Host.Address, addr)
-	}
-
-	if result.Host.Fingerprint != server.Fingerprint() {
-		t.Fatalf(
-			"unexpected paired fingerprint: got %s want %s",
-			result.Host.Fingerprint,
-			server.Fingerprint(),
-		)
-	}
+	assertHostRecord(t, result.Host, addr, server.Fingerprint())
 
 	loaded, err := config.ResolveRequired(project, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if loaded.Config.TLS.HostFingerprint != server.Fingerprint() {
-		t.Fatalf(
-			"unexpected config fingerprint: got %s want %s",
-			loaded.Config.TLS.HostFingerprint,
-			server.Fingerprint(),
-		)
-	}
-
-	output := stdout.String()
-	if strings.Contains(output, "Select host: ") {
-		t.Fatalf("did not expect discovery selection prompt, got %q", output)
-	}
-
-	if !strings.Contains(output, "Trust host") {
-		t.Fatalf("expected trust prompt, got %q", output)
-	}
-
-	if !strings.Contains(output, "Enter code: ") {
-		t.Fatalf("expected code prompt, got %q", output)
-	}
+	assertConfigFingerprint(t, loaded.Config.TLS.HostFingerprint, server.Fingerprint())
+	assertManualInitOutput(t, stdout.String())
 
 	cancel()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("server exited with error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server shutdown")
-	}
+	waitForServerShutdown(t, "manual-host", errCh)
 }
 
 func TestRunInitFailsWhenConfigAlreadyExists(t *testing.T) {
@@ -978,6 +942,51 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 }
 
+func assertHostRecord(
+	t *testing.T,
+	record clientstate.HostRecord,
+	wantAddress string,
+	wantFingerprint string,
+) {
+	t.Helper()
+
+	if record.Address != wantAddress {
+		t.Fatalf("unexpected paired address: got %s want %s", record.Address, wantAddress)
+	}
+
+	if record.Fingerprint != wantFingerprint {
+		t.Fatalf(
+			"unexpected paired fingerprint: got %s want %s",
+			record.Fingerprint,
+			wantFingerprint,
+		)
+	}
+}
+
+func assertConfigFingerprint(t *testing.T, got string, want string) {
+	t.Helper()
+
+	if got != want {
+		t.Fatalf("unexpected config fingerprint: got %s want %s", got, want)
+	}
+}
+
+func assertManualInitOutput(t *testing.T, output string) {
+	t.Helper()
+
+	if strings.Contains(output, "Select host: ") {
+		t.Fatalf("did not expect discovery selection prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Trust host") {
+		t.Fatalf("expected trust prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Enter code: ") {
+		t.Fatalf("expected code prompt, got %q", output)
+	}
+}
+
 func startPairCodeInput(codeCh <-chan string, writer *io.PipeWriter) <-chan error {
 	return startScriptedPairInput("", codeCh, writer)
 }
@@ -1026,6 +1035,19 @@ func setDiscoverAllHostsForTest(
 	discoverAllHosts = fn
 
 	t.Cleanup(func() { discoverAllHosts = prev })
+}
+
+func waitForServerShutdown(t *testing.T, name string, errCh <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("%s server exited with error: %v", name, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s shutdown", name)
+	}
 }
 
 func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
