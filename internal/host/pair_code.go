@@ -21,6 +21,10 @@ type PairCodeInfo struct {
 }
 
 func CreatePairCodeInfo(stateDir string, ttl time.Duration) (PairCodeInfo, error) {
+	return createPairCodeInfo(stateDir, "", ttl)
+}
+
+func createPairCodeInfo(stateDir, hostName string, ttl time.Duration) (PairCodeInfo, error) {
 	if strings.TrimSpace(stateDir) == "" {
 		home, _ := os.UserHomeDir()
 		if home == "" {
@@ -30,10 +34,7 @@ func CreatePairCodeInfo(stateDir string, ttl time.Duration) (PairCodeInfo, error
 		stateDir = filepath.Join(home, ".local", "state", "rmtx")
 	}
 
-	serverName := defaultHostName
-	if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
-		serverName = hostName
-	}
+	serverName := effectiveHostName(hostName)
 
 	pki, err := security.EnsureHostPKI(stateDir, serverName)
 	if err != nil {
@@ -57,4 +58,16 @@ func CreatePairCodeInfo(stateDir string, ttl time.Duration) (PairCodeInfo, error
 		HostFingerprint:   fingerprint,
 		HostFingerprintID: security.ShortFingerprint(fingerprint),
 	}, nil
+}
+
+func effectiveHostName(hostName string) string {
+	if strings.TrimSpace(hostName) != "" {
+		return strings.TrimSpace(hostName)
+	}
+
+	if localHostName, err := os.Hostname(); err == nil && strings.TrimSpace(localHostName) != "" {
+		return localHostName
+	}
+
+	return defaultHostName
 }

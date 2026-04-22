@@ -532,6 +532,22 @@ type PairOptions struct {
 }
 
 type PairResult = protocol.PairResponse
+type PairCodeResult = protocol.PairCodeResponse
+
+func RequestPairCode(ctx context.Context, opts PairOptions) (PairCodeResult, error) {
+	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, nil, nil)
+	if err != nil {
+		return PairCodeResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	req := protocol.PairCodeRequest{ClientLabel: opts.ClientLabel}
+	if err := conn.WriteJSON(protocol.MsgPairCodeRequest, req); err != nil {
+		return PairCodeResult{}, err
+	}
+
+	return expectDataFrame[protocol.PairCodeResponse](conn, protocol.MsgPairCodeResponse)
+}
 
 func PairHost(ctx context.Context, opts PairOptions) (PairResult, error) {
 	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, nil, nil)

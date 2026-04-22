@@ -230,16 +230,11 @@ func runPair(ctx context.Context, args []string) int {
 	)
 	cfgPath := fs.String("config", "", "path to .rmtx.json")
 	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
-	code := fs.String("code", "", "pairing code")
+	code := fs.String("code", "", "pairing code; omit to request one from host")
 	label := fs.String("label", "", "client label")
 
 	selectIndex := fs.Int("select", 0, "discovered host index")
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-
-	if strings.TrimSpace(*code) == "" {
-		fmt.Fprintln(os.Stderr, "error: pairing code is required")
 		return exitUsage
 	}
 
@@ -479,6 +474,7 @@ Usage:
 
 Examples:
   rmtx host --listen :33221
+  rmtx pair
   rmtx host pair-code
   rmtx go test ./...
   rmtx pair --code 123456

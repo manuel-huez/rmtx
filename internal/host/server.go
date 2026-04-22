@@ -24,7 +24,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 const (
 	defaultDirMode   = 0o755
@@ -153,6 +153,10 @@ func (s *Server) Addr() string {
 
 func (s *Server) Fingerprint() string {
 	return s.fingerprint
+}
+
+func (s *Server) hostName() string {
+	return effectiveHostName(s.opts.AdvertiseName)
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -293,6 +297,10 @@ func (s *Server) dispatchSessionRequest(
 	conn *protocol.Conn,
 	head protocol.Header,
 ) error {
+	if head.Type == protocol.MsgPairCodeRequest {
+		return s.dispatchPairCodeRequest(conn, head)
+	}
+
 	if head.Type == protocol.MsgPairRequest {
 		return s.dispatchPairRequest(conn, head)
 	}
@@ -317,6 +325,15 @@ func (s *Server) dispatchSessionRequest(
 
 		return fmt.Errorf("unexpected request %s", head.Type)
 	}
+}
+
+func (s *Server) dispatchPairCodeRequest(conn *protocol.Conn, head protocol.Header) error {
+	req, err := protocol.DecodeData[protocol.PairCodeRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handlePairCodeRequest(conn, req)
 }
 
 func (s *Server) dispatchPairRequest(conn *protocol.Conn, head protocol.Header) error {
@@ -428,19 +445,10 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		return err
 	}
 
-	name := strings.TrimSpace(s.opts.AdvertiseName)
-	if name == "" {
-		if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
-			name = hostName
-		} else {
-			name = "rmtx-host"
-		}
-	}
-
 	return conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
 		Online:       true,
 		Version:      Version,
-		Name:         name,
+		Name:         s.hostName(),
 		Address:      s.Addr(),
 		Fingerprint:  s.fingerprint,
 		Now:          time.Now().UTC(),
@@ -567,6 +575,36 @@ func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, e
 	}
 
 	return clientCert, nil
+}
+
+func (s *Server) handlePairCodeRequest(conn *protocol.Conn, req protocol.PairCodeRequest) error {
+	info, err := createPairCodeInfo(s.opts.StateDir, s.hostName(), 0)
+	if err != nil {
+		return err
+	}
+
+	clientLabel := strings.TrimSpace(req.ClientLabel)
+	if clientLabel == "" {
+		clientLabel = "unknown-client"
+	}
+
+	remoteAddr := "unknown"
+	if raw := conn.Raw(); raw != nil && raw.RemoteAddr() != nil {
+		remoteAddr = raw.RemoteAddr().String()
+	}
+
+	s.logger.Printf(
+		"pair request from %s client=%q code=%s expires=%s",
+		remoteAddr,
+		clientLabel,
+		info.Code,
+		info.ExpiresAt.Format(time.RFC3339),
+	)
+
+	return conn.WriteJSON(protocol.MsgPairCodeResponse, protocol.PairCodeResponse{
+		HostName:  info.HostName,
+		ExpiresAt: info.ExpiresAt,
+	})
 }
 
 func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest) error {

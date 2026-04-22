@@ -9,7 +9,7 @@
 
 - `rmtx host`: run the host service.
 - `rmtx <command> ...` or `rmtx exec -- <command> ...`: run a command remotely in the current context.
-- `rmtx pair --code ...`: pair a client with a host.
+- `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
 - `rmtx context ...`: list/delete/prune host contexts.
 
@@ -32,7 +32,6 @@ Start host:
 
 ```bash
 ./rmtx host --listen :33221
-./rmtx host pair-code
 ```
 
 In your project on the client, create `.rmtx.json`:
@@ -49,9 +48,11 @@ In your project on the client, create `.rmtx.json`:
 Then pair and run:
 
 ```bash
-./rmtx pair --code 123456
+./rmtx pair
 ./rmtx go test ./...
 ```
+
+`rmtx pair` asks host to generate a one-time code, prints that code in host terminal, then prompts client to enter it. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.
 
 ## Config file
 

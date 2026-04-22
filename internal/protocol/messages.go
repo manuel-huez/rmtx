@@ -8,6 +8,8 @@ import (
 
 const (
 	MsgError                  = "error"
+	MsgPairCodeRequest        = "pair_code_request"
+	MsgPairCodeResponse       = "pair_code_response"
 	MsgPairRequest            = "pair_request"
 	MsgPairResponse           = "pair_response"
 	MsgRunRequest             = "run_request"
@@ -30,6 +32,15 @@ const (
 	MsgDeleteContextsRequest  = "delete_contexts_request"
 	MsgDeleteContextsResponse = "delete_contexts_response"
 )
+
+type PairCodeRequest struct {
+	ClientLabel string `json:"client_label,omitempty"`
+}
+
+type PairCodeResponse struct {
+	HostName  string    `json:"host_name,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
 
 type PairRequest struct {
 	Code                string `json:"code"`

@@ -87,6 +87,29 @@ type PairParams struct {
 	Stdout           io.Writer
 }
 
+func loadPairConfig(cwd, configPath string) (config.Config, error) {
+	cfg := config.WithDefaults(config.Default())
+
+	if strings.TrimSpace(configPath) != "" {
+		loaded, err := config.Load(configPath)
+		if err != nil {
+			return config.Config{}, err
+		}
+
+		return config.WithDefaults(loaded.Config), nil
+	}
+
+	loaded, err := config.Search(cwd)
+	switch {
+	case err == nil:
+		return config.WithDefaults(loaded.Config), nil
+	case errors.Is(err, config.ErrConfigNotFound):
+		return cfg, nil
+	default:
+		return config.Config{}, err
+	}
+}
+
 //nolint:cyclop // Command bootstrap mixes config, pairing, tty, and mount checks in one orchestration path.
 func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 	loaded, err := config.ResolveRequired(cwd, params.ConfigPath)
@@ -285,22 +308,14 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 
 //nolint:cyclop // Pairing flow coordinates config lookup, identity reuse, CSR generation, and state persistence.
 func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.HostRecord, error) {
-	cfg := config.WithDefaults(config.Default())
+	preparePairIO(&params)
 
-	if strings.TrimSpace(params.ConfigPath) != "" {
-		loaded, err := config.Load(params.ConfigPath)
-		if err != nil {
-			return clientstate.HostRecord{}, err
-		}
-
-		cfg = config.WithDefaults(loaded.Config)
-	} else if loaded, err := config.Search(cwd); err == nil {
-		cfg = config.WithDefaults(loaded.Config)
-	} else if !errors.Is(err, config.ErrConfigNotFound) {
+	cfg, err := loadPairConfig(cwd, params.ConfigPath)
+	if err != nil {
 		return clientstate.HostRecord{}, err
 	}
 
-	result, err := resolvePairTarget(ctx, cfg, params)
+	result, err := resolvePairTarget(ctx, cfg, &params)
 	if err != nil {
 		return clientstate.HostRecord{}, err
 	}
@@ -319,59 +334,26 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 		label = state.Data.ClientLabel
 	}
 
-	existing := state.FindHostByFingerprint(result.HostFingerprint)
-	if existing == nil {
-		existing = state.FindHostByAddress(result.Address)
+	existing := existingPairRecord(state, result)
+	clientKeyPEM := pairClientKey(state, result, existing)
+	previousFingerprint := previousPairFingerprint(existing)
+
+	csrPEM, clientKeyPEM, err := ensurePairCSR(clientKeyPEM, label)
+	if err != nil {
+		return clientstate.HostRecord{}, err
 	}
 
-	clientKeyPEM := []byte("")
-
-	if existing != nil {
-		clientKeyPEM = []byte(existing.ClientKeyPEM)
+	code, err := resolvePairCode(ctx, &params, result, label)
+	if err != nil {
+		return clientstate.HostRecord{}, err
 	}
 
-	if len(clientKeyPEM) == 0 {
-		_, key := state.HostCredentials(result.Address, result.HostFingerprint)
-		clientKeyPEM = []byte(key)
-	}
-
-	previousFingerprint := ""
-	if existing != nil {
-		previousFingerprint = strings.TrimSpace(existing.LastPairedCert)
-		if previousFingerprint == "" && strings.TrimSpace(existing.ClientCertPEM) != "" {
-			if fp, err := security.FingerprintPEM([]byte(existing.ClientCertPEM)); err == nil {
-				previousFingerprint = fp
-			}
-		}
-	}
-
-	var csrPEM []byte
-
-	if len(clientKeyPEM) == 0 {
-		var err error
-
-		_, clientKeyPEM, csrPEM, err = client.GenerateClientIdentity(label)
-		if err != nil {
-			return clientstate.HostRecord{}, err
-		}
-	} else {
-		csr, err := client.GenerateCSR(clientKeyPEM, label)
-		if err != nil {
-			return clientstate.HostRecord{}, err
-		}
-
-		csrPEM = csr
-	}
+	remoteHost := pairRemoteHost(result)
 
 	pairResp, err := client.PairHost(ctx, client.PairOptions{
-		Address: result.Address,
-		Host: clientstate.HostRecord{
-			Address:     result.Address,
-			Name:        result.Instance,
-			OS:          result.OS,
-			Fingerprint: result.HostFingerprint,
-		},
-		Code:                params.Code,
+		Address:             result.Address,
+		Host:                remoteHost,
+		Code:                code,
 		ClientLabel:         label,
 		PreviousFingerprint: previousFingerprint,
 		CSRPEM:              csrPEM,
@@ -381,7 +363,116 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 	}
 
 	state.Data.ClientLabel = label
-	record := clientstate.HostRecord{
+	record := pairedHostRecord(result, pairResp, clientKeyPEM)
+	state.UpsertHost(record)
+
+	if err := state.Save(); err != nil {
+		return clientstate.HostRecord{}, err
+	}
+
+	return record, nil
+}
+
+func existingPairRecord(
+	state *clientstate.Loaded,
+	result discovery.Result,
+) *clientstate.HostRecord {
+	existing := state.FindHostByFingerprint(result.HostFingerprint)
+	if existing != nil {
+		return existing
+	}
+
+	return state.FindHostByAddress(result.Address)
+}
+
+func pairClientKey(
+	state *clientstate.Loaded,
+	result discovery.Result,
+	existing *clientstate.HostRecord,
+) []byte {
+	if existing != nil && strings.TrimSpace(existing.ClientKeyPEM) != "" {
+		return []byte(existing.ClientKeyPEM)
+	}
+
+	_, key := state.HostCredentials(result.Address, result.HostFingerprint)
+
+	return []byte(key)
+}
+
+func previousPairFingerprint(existing *clientstate.HostRecord) string {
+	if existing == nil {
+		return ""
+	}
+
+	fingerprint := strings.TrimSpace(existing.LastPairedCert)
+	if fingerprint != "" || strings.TrimSpace(existing.ClientCertPEM) == "" {
+		return fingerprint
+	}
+
+	fingerprint, err := security.FingerprintPEM([]byte(existing.ClientCertPEM))
+	if err != nil {
+		return ""
+	}
+
+	return fingerprint
+}
+
+func ensurePairCSR(clientKeyPEM []byte, label string) ([]byte, []byte, error) {
+	if len(clientKeyPEM) == 0 {
+		_, keyPEM, csrPEM, err := client.GenerateClientIdentity(label)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return csrPEM, keyPEM, nil
+	}
+
+	csrPEM, err := client.GenerateCSR(clientKeyPEM, label)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return csrPEM, clientKeyPEM, nil
+}
+
+func pairRemoteHost(result discovery.Result) clientstate.HostRecord {
+	return clientstate.HostRecord{
+		Address:     result.Address,
+		Name:        result.Instance,
+		OS:          result.OS,
+		Fingerprint: result.HostFingerprint,
+	}
+}
+
+func resolvePairCode(
+	ctx context.Context,
+	params *PairParams,
+	result discovery.Result,
+	label string,
+) (string, error) {
+	code := strings.TrimSpace(params.Code)
+	if code != "" {
+		return code, nil
+	}
+
+	pairCodeResp, err := client.RequestPairCode(ctx, client.PairOptions{
+		Address:     result.Address,
+		Host:        pairRemoteHost(result),
+		ClientLabel: label,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return promptForPairCode(params, pairCodeResp)
+}
+
+func pairedHostRecord(
+	result discovery.Result,
+	pairResp client.PairResult,
+	clientKeyPEM []byte,
+) clientstate.HostRecord {
+	return clientstate.HostRecord{
 		Address:        result.Address,
 		Name:           result.Instance,
 		OS:             result.OS,
@@ -391,13 +482,67 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 		ClientCertPEM:  pairResp.ClientCertPEM,
 		ClientKeyPEM:   string(clientKeyPEM),
 	}
-	state.UpsertHost(record)
+}
 
-	if err := state.Save(); err != nil {
-		return clientstate.HostRecord{}, err
+func promptForPairCode(params *PairParams, response client.PairCodeResult) (string, error) {
+	preparePairIO(params)
+
+	hostName := empty(response.HostName, "host")
+
+	_, _ = fmt.Fprintf(
+		params.Stdout,
+		"pair code shown on %s; expires %s\nEnter code: ",
+		hostName,
+		response.ExpiresAt.Format(time.RFC3339),
+	)
+
+	code, err := readPairLine(params, "read pairing code")
+	if err != nil {
+		return "", err
 	}
 
-	return record, nil
+	if code == "" {
+		return "", errors.New("pairing code is required")
+	}
+
+	return code, nil
+}
+
+func preparePairIO(params *PairParams) {
+	if params == nil {
+		return
+	}
+
+	if params.Stdout == nil {
+		params.Stdout = os.Stdout
+	}
+
+	if params.Stdin == nil {
+		params.Stdin = os.Stdin
+	}
+
+	if _, ok := params.Stdin.(*bufio.Reader); ok {
+		return
+	}
+
+	params.Stdin = bufio.NewReader(params.Stdin)
+}
+
+func readPairLine(params *PairParams, errContext string) (string, error) {
+	preparePairIO(params)
+
+	reader, ok := params.Stdin.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(params.Stdin)
+		params.Stdin = reader
+	}
+
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("%s: %w", errContext, err)
+	}
+
+	return strings.TrimSpace(line), nil
 }
 
 func ShouldForwardStdin(f *os.File) bool {
@@ -690,8 +835,10 @@ func resolveClientHost(
 func resolvePairTarget(
 	ctx context.Context,
 	cfg config.Config,
-	params PairParams,
+	params *PairParams,
 ) (discovery.Result, error) {
+	preparePairIO(params)
+
 	fingerprint := strings.TrimSpace(params.Fingerprint)
 	if fingerprint == "" {
 		fingerprint = strings.TrimSpace(cfg.TLS.HostFingerprint)
@@ -758,37 +905,11 @@ func resolvePairTarget(
 
 	index := params.SelectionIndex
 	if index <= 0 {
-		if params.Stdout == nil {
-			params.Stdout = os.Stdout
-		}
+		var err error
 
-		if params.Stdin == nil {
-			params.Stdin = os.Stdin
-		}
-
-		for i, result := range results {
-			_, _ = fmt.Fprintf(
-				params.Stdout,
-				"[%d] %s %s %s %s\n",
-				i+1,
-				empty(result.Instance, "rmtx-host"),
-				result.OS,
-				result.Address,
-				result.HostFingerprint,
-			)
-		}
-
-		_, _ = fmt.Fprint(params.Stdout, "Select host: ")
-		reader := bufio.NewReader(params.Stdin)
-
-		line, err := reader.ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return discovery.Result{}, fmt.Errorf("read host selection: %w", err)
-		}
-
-		_, err = fmt.Sscanf(strings.TrimSpace(line), "%d", &index)
+		index, err = promptForPairSelection(params, results)
 		if err != nil {
-			return discovery.Result{}, errors.New("invalid host selection")
+			return discovery.Result{}, err
 		}
 	}
 
@@ -797,6 +918,36 @@ func resolvePairTarget(
 	}
 
 	return results[index-1], nil
+}
+
+func promptForPairSelection(params *PairParams, results []discovery.Result) (int, error) {
+	preparePairIO(params)
+
+	for i, result := range results {
+		_, _ = fmt.Fprintf(
+			params.Stdout,
+			"[%d] %s %s %s %s\n",
+			i+1,
+			empty(result.Instance, "rmtx-host"),
+			result.OS,
+			result.Address,
+			result.HostFingerprint,
+		)
+	}
+
+	_, _ = fmt.Fprint(params.Stdout, "Select host: ")
+
+	line, err := readPairLine(params, "read host selection")
+	if err != nil {
+		return 0, err
+	}
+
+	index := 0
+	if _, err := fmt.Sscanf(line, "%d", &index); err != nil {
+		return 0, errors.New("invalid host selection")
+	}
+
+	return index, nil
 }
 
 func empty(value, fallback string) string {

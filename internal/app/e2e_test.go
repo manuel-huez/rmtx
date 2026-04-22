@@ -3,6 +3,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/discovery"
@@ -500,11 +504,221 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 	}
 }
 
+func TestRunPairRequestsCodeWhenCodeOmitted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+	codeCh := make(chan string, 1)
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(&pairCodeLogCapture{codes: codeCh}, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	configContent := `{
+  "version": 1,
+  "host": "` + addr + `",
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "discovery": {"enabled": false}
+}`
+	writeTestFile(t, configPath, configContent)
+
+	reader, writer := io.Pipe()
+	inputErrCh := startPairCodeInput(codeCh, writer)
+
+	var stdout bytes.Buffer
+
+	record, err := RunPair(ctx, project, PairParams{
+		ConfigPath:     configPath,
+		ClientLabel:    "interactive-client",
+		SelectionIndex: 1,
+		Stdin:          reader,
+		Stdout:         &stdout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-inputErrCh; err != nil {
+		t.Fatal(err)
+	}
+
+	if record.Address != addr {
+		t.Fatalf("unexpected paired address: got %s want %s", record.Address, addr)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "pair code shown on") {
+		t.Fatalf("expected pair prompt in stdout, got %q", output)
+	}
+
+	if !strings.Contains(output, "Enter code: ") {
+		t.Fatalf("expected code entry prompt, got %q", output)
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestPairPromptsReuseBufferedInput(t *testing.T) {
+	var stdout bytes.Buffer
+
+	params := PairParams{
+		Stdin:  strings.NewReader("2\n123456\n"),
+		Stdout: &stdout,
+	}
+
+	index, err := promptForPairSelection(&params, []discovery.Result{
+		{Instance: "host-a", Address: "10.0.0.1:33221", HostFingerprint: "sha256:host-a"},
+		{Instance: "host-b", Address: "10.0.0.2:33221", HostFingerprint: "sha256:host-b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if index != 2 {
+		t.Fatalf("unexpected selected host index: got %d want 2", index)
+	}
+
+	code, err := promptForPairCode(&params, client.PairCodeResult{
+		HostName:  "host-b",
+		ExpiresAt: time.Unix(123, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if code != "123456" {
+		t.Fatalf("unexpected pairing code: got %q want %q", code, "123456")
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Select host: ") {
+		t.Fatalf("expected host selection prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Enter code: ") {
+		t.Fatalf("expected pairing code prompt, got %q", output)
+	}
+}
+
+func TestRequestPairCodeQuotesClientLabelInLogs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stateDir := t.TempDir()
+
+	var logs bytes.Buffer
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(&logs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+
+	_, err = client.RequestPairCode(ctx, client.PairOptions{
+		Address: addr,
+		Host: clientstate.HostRecord{
+			Address:     addr,
+			Fingerprint: server.Fingerprint(),
+		},
+		ClientLabel: "evil\nforged\x1b[31m",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "client=\"evil\\nforged\\x1b[31m\"") {
+		t.Fatalf("expected quoted client label in logs, got %q", logOutput)
+	}
+
+	if strings.Contains(logOutput, "evil\nforged") {
+		t.Fatalf("expected log to escape embedded newline, got %q", logOutput)
+	}
+
+	if strings.Contains(logOutput, "\x1b[31m") {
+		t.Fatalf("expected log to escape terminal control sequence, got %q", logOutput)
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startPairCodeInput(codeCh <-chan string, writer *io.PipeWriter) <-chan error {
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = writer.Close() }()
+
+		select {
+		case code := <-codeCh:
+			_, err := io.WriteString(writer, code+"\n")
+			errCh <- err
+		case <-time.After(2 * time.Second):
+			errCh <- errors.New("timed out waiting for host pair code")
+		}
+	}()
+
+	return errCh
+}
+
 func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
 	result, err := resolvePairTarget(
 		context.Background(),
 		config.WithDefaults(config.Default()),
-		PairParams{
+		&PairParams{
 			AddressOverride: "192.168.1.42",
 			Fingerprint:     "sha256:expected",
 		},
@@ -522,11 +736,32 @@ func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
 	}
 }
 
+type pairCodeLogCapture struct {
+	codes chan<- string
+}
+
+func (w *pairCodeLogCapture) Write(p []byte) (int, error) {
+	for _, field := range strings.Fields(string(p)) {
+		if !strings.HasPrefix(field, "code=") {
+			continue
+		}
+
+		select {
+		case w.codes <- strings.TrimPrefix(field, "code="):
+		default:
+		}
+
+		break
+	}
+
+	return len(p), nil
+}
+
 func TestResolvePairTargetRequiresPinnedFingerprint(t *testing.T) {
 	_, err := resolvePairTarget(
 		context.Background(),
 		config.WithDefaults(config.Default()),
-		PairParams{
+		&PairParams{
 			AddressOverride: "192.168.1.42",
 		},
 	)
