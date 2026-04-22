@@ -7,10 +7,9 @@ import (
 )
 
 const (
-	MsgAuthHello              = "auth_hello"
-	MsgAuthResponse           = "auth_response"
-	MsgAuthOK                 = "auth_ok"
 	MsgError                  = "error"
+	MsgPairRequest            = "pair_request"
+	MsgPairResponse           = "pair_response"
 	MsgRunRequest             = "run_request"
 	MsgNeedBlobs              = "need_blobs"
 	MsgBlob                   = "blob"
@@ -32,13 +31,16 @@ const (
 	MsgDeleteContextsResponse = "delete_contexts_response"
 )
 
-type AuthHello struct {
-	Nonce   string `json:"nonce"`
-	Version string `json:"version"`
+type PairRequest struct {
+	Code                string `json:"code"`
+	ClientLabel         string `json:"client_label,omitempty"`
+	PreviousFingerprint string `json:"previous_fingerprint,omitempty"`
+	CSRPEM              string `json:"csr_pem"`
 }
 
-type AuthResponse struct {
-	MAC string `json:"mac"`
+type PairResponse struct {
+	ClientCertPEM string `json:"client_cert_pem"`
+	Fingerprint   string `json:"fingerprint"`
 }
 
 type ErrorMessage struct {
@@ -104,6 +106,7 @@ type PingResponse struct {
 	Version      string    `json:"version"`
 	Name         string    `json:"name,omitempty"`
 	Address      string    `json:"address,omitempty"`
+	Fingerprint  string    `json:"fingerprint,omitempty"`
 	Now          time.Time `json:"now"`
 	ContextCount int       `json:"context_count,omitempty"`
 }

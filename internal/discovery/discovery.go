@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,25 +22,37 @@ const (
 )
 
 type Result struct {
-	Instance string
-	Address  string
-	Port     int
+	Instance        string
+	OS              string
+	Address         string
+	Port            int
+	HostFingerprint string
+	PairingEnabled  bool
 }
 
 type packet struct {
-	Type    string `json:"type"`
-	Service string `json:"service"`
-	Name    string `json:"name,omitempty"`
-	Port    int    `json:"port,omitempty"`
+	Type            string `json:"type"`
+	Service         string `json:"service"`
+	Name            string `json:"name,omitempty"`
+	OS              string `json:"os,omitempty"`
+	Port            int    `json:"port,omitempty"`
+	HostFingerprint string `json:"host_cert_fingerprint,omitempty"`
+	PairingEnabled  bool   `json:"pairing_enabled,omitempty"`
 }
 
 type Responder struct{ conn *net.UDPConn }
+
+type AdvertiseOptions struct {
+	OS              string
+	HostFingerprint string
+	PairingEnabled  bool
+}
 
 func Advertise(
 	ctx context.Context,
 	service, instance string,
 	port int,
-	_ []string,
+	opts AdvertiseOptions,
 ) (*Responder, error) {
 	if strings.TrimSpace(service) == "" {
 		return nil, errors.New("service is required")
@@ -54,13 +67,17 @@ func Advertise(
 		}
 	}
 
+	if strings.TrimSpace(opts.OS) == "" {
+		opts.OS = runtime.GOOS
+	}
+
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: DefaultDiscoveryPort})
 	if err != nil {
 		return nil, fmt.Errorf("listen for discovery: %w", err)
 	}
 
 	r := &Responder{conn: conn}
-	go r.serve(ctx, service, instance, port)
+	go r.serve(ctx, service, instance, port, opts)
 
 	return r, nil
 }
@@ -73,7 +90,7 @@ func (r *Responder) Close() error {
 	return r.conn.Close()
 }
 
-func (r *Responder) serve(ctx context.Context, service, instance string, port int) {
+func (r *Responder) serve(ctx context.Context, service, instance string, port int, opts AdvertiseOptions) {
 	defer func() { _ = r.conn.Close() }()
 
 	go func() { <-ctx.Done(); _ = r.conn.Close() }()
@@ -95,7 +112,15 @@ func (r *Responder) serve(ctx context.Context, service, instance string, port in
 		}
 
 		response, err := json.Marshal(
-			packet{Type: "response", Service: service, Name: instance, Port: port},
+			packet{
+				Type:            "response",
+				Service:         service,
+				Name:            instance,
+				OS:              opts.OS,
+				Port:            port,
+				HostFingerprint: opts.HostFingerprint,
+				PairingEnabled:  opts.PairingEnabled,
+			},
 		)
 		if err != nil {
 			continue
@@ -136,6 +161,39 @@ func DiscoverOne(ctx context.Context, service string, timeout time.Duration) (Re
 	}
 
 	return selectSingleResult(results)
+}
+
+func DiscoverAll(ctx context.Context, service string, timeout time.Duration) ([]Result, error) {
+	if timeout <= 0 {
+		timeout = discoveryTimeoutDefault
+	}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("listen for discovery responses: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	query, err := json.Marshal(packet{Type: "query", Service: service})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, target := range broadcastTargets() {
+		_, _ = conn.WriteToUDP(query, target)
+	}
+
+	results, err := collectResponses(ctx, conn, service, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	ordered := make([]Result, 0, len(results))
+	for _, r := range results {
+		ordered = append(ordered, r)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Address < ordered[j].Address })
+	return ordered, nil
 }
 
 func collectResponses(
@@ -196,7 +254,14 @@ func recordResponse(results map[string]Result, service string, raw []byte, addr 
 	}
 
 	address := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.Port))
-	results[address] = Result{Instance: pkt.Name, Address: address, Port: pkt.Port}
+	results[address] = Result{
+		Instance:        pkt.Name,
+		OS:              pkt.OS,
+		Address:         address,
+		Port:            pkt.Port,
+		HostFingerprint: pkt.HostFingerprint,
+		PairingEnabled:  pkt.PairingEnabled,
+	}
 }
 
 func selectSingleResult(results map[string]Result) (Result, error) {

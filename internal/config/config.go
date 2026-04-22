@@ -35,12 +35,15 @@ type Config struct {
 	Version   int             `json:"version,omitempty"`
 	Context   ContextConfig   `json:"context,omitempty"`
 	Host      string          `json:"host,omitempty"`
-	Token     string          `json:"token,omitempty"`
-	TokenEnv  string          `json:"token_env,omitempty"`
+	TLS       TLSConfig       `json:"tls,omitempty"`
 	WorkDir   string          `json:"workdir,omitempty"`
 	Discovery DiscoveryConfig `json:"discovery,omitempty"`
 	Mounts    []Mount         `json:"mounts,omitempty"`
 	Env       EnvConfig       `json:"env,omitempty"`
+}
+
+type TLSConfig struct {
+	HostFingerprint string `json:"host_fingerprint,omitempty"`
 }
 
 type Mount struct {
@@ -119,6 +122,16 @@ func Load(path string) (*Loaded, error) {
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(content, &raw); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	for _, field := range []string{"token", "token_env"} {
+		if _, ok := raw[field]; ok {
+			return nil, fmt.Errorf("config field %q is unsupported; use `rmtx pair` and tls.host_fingerprint", field)
+		}
 	}
 
 	cfg := Default()
@@ -202,19 +215,6 @@ func (c Config) DiscoveryTimeout() time.Duration {
 	return d
 }
 
-func (c Config) TokenValue() string {
-	if strings.TrimSpace(c.Token) != "" {
-		return c.Token
-	}
-
-	envName := c.TokenEnv
-	if strings.TrimSpace(envName) == "" {
-		envName = "RMTX_TOKEN"
-	}
-
-	return os.Getenv(envName)
-}
-
 func (l Loaded) ContextName() string {
 	if strings.TrimSpace(l.Config.Context.Name) != "" {
 		return strings.TrimSpace(l.Config.Context.Name)
@@ -255,10 +255,6 @@ func (l Loaded) ContextID() string {
 func normalize(cfg Config) Config {
 	if cfg.Version == 0 {
 		cfg.Version = 1
-	}
-
-	if strings.TrimSpace(cfg.TokenEnv) == "" {
-		cfg.TokenEnv = "RMTX_TOKEN"
 	}
 
 	if strings.TrimSpace(cfg.WorkDir) == "" {

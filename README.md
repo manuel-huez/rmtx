@@ -54,14 +54,14 @@ rmtx version
 On the host machine:
 
 ```bash
-export RMTX_TOKEN='replace-me'
 ./rmtx host --listen :33221
+./rmtx host pair-code
 ```
 
 On the client machine, inside a project directory with a config file:
 
 ```bash
-export RMTX_TOKEN='replace-me'
+./rmtx pair --code 123456
 ./rmtx go test ./...
 ```
 
@@ -96,7 +96,9 @@ Example:
     "name": "my-api"
   },
   "host": "192.168.1.42:33221",
-  "token_env": "RMTX_TOKEN",
+  "tls": {
+    "host_fingerprint": "sha256:..."
+  },
   "mounts": [
     {
       "path": ".",
@@ -118,7 +120,7 @@ Example:
 
 - `context.name`: optional stable logical name for the host-side context. When omitted, the context is derived from the local project root path.
 - `host`: optional explicit `host:port`. If omitted, discovery is used unless disabled.
-- `token_env`: environment variable used to read the shared token. Defaults to `RMTX_TOKEN`.
+- `tls.host_fingerprint`: optional pinned host identity fingerprint. Useful when pairing or targeting a fixed host.
 - `mounts`: files/directories to include in the remote context workspace.
 - `mounts[].exclude`: glob-like ignore patterns. `**` is supported.
 - `env.forward`: environment variable names to copy from the client into the remote command environment.
@@ -179,17 +181,26 @@ The command returns the host identity, version, address, current context count, 
 
 Discovery uses UDP broadcast on port `33222`.
 
-The host listens for discovery queries and replies with its TCP execution port. The client sends broadcast queries and expects exactly one matching host; if multiple hosts respond, discovery fails with a list of candidates so the caller can pin a specific host.
+The host listens for discovery queries and replies with its TCP execution port, host name, OS, and host identity fingerprint. Discovery helps the user choose a host; trust is still enforced by TLS fingerprint verification.
 
 ## Authentication
 
-Host and client share a token. The token itself is not sent directly during the handshake; the client replies to a server nonce with an HMAC.
+`rmtx` uses TLS for transport encryption and host identity, plus client certificates for machine/user identity.
 
-Typical setup:
+- Host startup creates a local CA and server certificate in the host state directory.
+- `rmtx host pair-code` creates a short-lived single-use pairing code.
+- `rmtx pair --code ...` requires the host identity fingerprint from `tls.host_fingerprint` or `--fingerprint`, discovers or targets the host, verifies that fingerprint, sends a CSR, and stores the issued client cert/key in `~/.rmtx/state.json`.
+- Subsequent `exec`, `ping`, and `context` commands use mutual TLS automatically.
+
+## Client state
+
+Global client identity and known hosts are stored in:
 
 ```bash
-export RMTX_TOKEN='replace-me'
+~/.rmtx/state.json
 ```
+
+The directory is created with restrictive permissions.
 
 ## Stdin / TTY behavior
 
@@ -225,8 +236,8 @@ The repository includes:
 
 ```bash
 # host machine
-export RMTX_TOKEN='replace-me'
 ./rmtx host
+./rmtx host pair-code
 
 # client machine, inside a Go project
 cat > .rmtx.json <<'JSON'
@@ -234,6 +245,9 @@ cat > .rmtx.json <<'JSON'
   "version": 1,
   "context": {
     "name": "go-project"
+  },
+  "tls": {
+    "host_fingerprint": "sha256:..."
   },
   "mounts": [
     {"path": ".", "exclude": [".git/**", "cache/**"]}
@@ -244,7 +258,7 @@ cat > .rmtx.json <<'JSON'
 }
 JSON
 
-export RMTX_TOKEN='replace-me'
+./rmtx pair --code 123456
 ./rmtx go test ./...
 ./rmtx context list
 ```

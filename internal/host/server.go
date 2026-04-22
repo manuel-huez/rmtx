@@ -2,6 +2,8 @@ package host
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
@@ -33,7 +37,6 @@ const (
 
 type Options struct {
 	ListenAddr       string
-	Token            string
 	StateDir         string
 	AdvertiseName    string
 	DiscoveryService string
@@ -42,11 +45,15 @@ type Options struct {
 }
 
 type Server struct {
-	opts       Options
-	listener   net.Listener
-	blobStore  *syncfs.BlobStore
-	logger     *log.Logger
-	advertiser *discovery.Responder
+	opts        Options
+	listener    net.Listener
+	blobStore   *syncfs.BlobStore
+	logger      *log.Logger
+	advertiser  *discovery.Responder
+	tlsConfig   *tls.Config
+	hostPKI     security.HostPKI
+	fingerprint string
+	listenerMu  sync.RWMutex
 
 	contextLocksMu sync.Mutex
 	contextLocks   map[string]*sync.Mutex
@@ -55,10 +62,6 @@ type Server struct {
 }
 
 func New(opts Options) (*Server, error) {
-	if strings.TrimSpace(opts.Token) == "" {
-		return nil, errors.New("host token is required")
-	}
-
 	if strings.TrimSpace(opts.ListenAddr) == "" {
 		opts.ListenAddr = ":33221"
 	}
@@ -96,16 +99,41 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("prepare blob store: %w", err)
 	}
 
+	serverName := strings.TrimSpace(opts.AdvertiseName)
+	if serverName == "" {
+		if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
+			serverName = hostName
+		} else {
+			serverName = "rmtx-host"
+		}
+	}
+
+	hostPKI, err := security.EnsureHostPKI(opts.StateDir, serverName)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig, fingerprint, err := security.ServerTLSConfig(hostPKI)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Server{
 		opts:           opts,
 		blobStore:      store,
 		logger:         opts.Logger,
+		tlsConfig:      tlsConfig,
+		hostPKI:        hostPKI,
+		fingerprint:    fingerprint,
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
 	}, nil
 }
 
 func (s *Server) Addr() string {
+	s.listenerMu.RLock()
+	defer s.listenerMu.RUnlock()
+
 	if s.listener == nil {
 		return ""
 	}
@@ -113,15 +141,29 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
+func (s *Server) Fingerprint() string {
+	return s.fingerprint
+}
+
 func (s *Server) Serve(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.opts.ListenAddr)
+	base, err := net.Listen("tcp", s.opts.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.opts.ListenAddr, err)
 	}
+	ln := tls.NewListener(base, s.tlsConfig)
 
 	defer func() { _ = ln.Close() }()
 
+	s.listenerMu.Lock()
 	s.listener = ln
+	s.listenerMu.Unlock()
+	defer func() {
+		s.listenerMu.Lock()
+		if s.listener == ln {
+			s.listener = nil
+		}
+		s.listenerMu.Unlock()
+	}()
 	s.logger.Printf("listening on %s", ln.Addr().String())
 
 	if !s.opts.DisableDiscovery {
@@ -131,7 +173,11 @@ func (s *Server) Serve(ctx context.Context) error {
 				s.opts.DiscoveryService,
 				s.opts.AdvertiseName,
 				tcpAddr.Port,
-				nil,
+				discovery.AdvertiseOptions{
+					OS:              runtime.GOOS,
+					HostFingerprint: s.fingerprint,
+					PairingEnabled:  true,
+				},
 			)
 			if err != nil {
 				s.logger.Printf("discovery advertise failed: %v", err)
@@ -174,10 +220,6 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 }
 
 func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
-	if err := s.authenticate(conn); err != nil {
-		return err
-	}
-
 	head, err := conn.ReadHeader()
 	if err != nil {
 		return err
@@ -239,6 +281,15 @@ func (s *Server) dispatchSessionRequest(
 	head protocol.Header,
 ) error {
 	switch head.Type {
+	case protocol.MsgPairRequest:
+		return s.dispatchPairRequest(conn, head)
+	}
+
+	if _, err := s.requireTrustedClient(conn); err != nil {
+		return err
+	}
+
+	switch head.Type {
 	case protocol.MsgRunRequest:
 		return s.dispatchRunRequest(parent, conn, head)
 	case protocol.MsgPingRequest:
@@ -254,6 +305,15 @@ func (s *Server) dispatchSessionRequest(
 
 		return fmt.Errorf("unexpected request %s", head.Type)
 	}
+}
+
+func (s *Server) dispatchPairRequest(conn *protocol.Conn, head protocol.Header) error {
+	req, err := protocol.DecodeData[protocol.PairRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handlePairRequest(conn, req)
 }
 
 func (s *Server) dispatchRunRequest(
@@ -370,6 +430,7 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		Version:      Version,
 		Name:         name,
 		Address:      s.Addr(),
+		Fingerprint:  s.fingerprint,
 		Now:          time.Now().UTC(),
 		ContextCount: len(contexts),
 	})
@@ -470,38 +531,54 @@ func sendChangedFileBlob(conn *protocol.Conn, workspace string, entry syncfs.Ent
 	)
 }
 
-func (s *Server) authenticate(conn *protocol.Conn) error {
-	nonce, err := protocol.RandomNonce()
+func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, error) {
+	tlsConn, ok := conn.Raw().(*tls.Conn)
+	if !ok {
+		return nil, errors.New("connection is not tls")
+	}
+
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return nil, errors.New("client certificate required; run `rmtx pair`")
+	}
+
+	clientCert := state.PeerCertificates[0]
+	fingerprint := security.FingerprintCert(clientCert)
+	trusted, err := s.clientTrusted(fingerprint)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if !trusted {
+		return nil, errors.New("client certificate not trusted; run `rmtx pair`")
 	}
 
-	if err := conn.WriteJSON(
-		protocol.MsgAuthHello,
-		protocol.AuthHello{Nonce: nonce, Version: Version},
-	); err != nil {
-		return err
-	}
+	return clientCert, nil
+}
 
-	head, err := conn.ReadHeader()
-	if err != nil {
-		return fmt.Errorf("read auth response: %w", err)
-	}
+func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest) error {
+	return withPairCode(s.opts.StateDir, req.Code, func() error {
+		if strings.TrimSpace(req.CSRPEM) == "" {
+			return errors.New("csr is required")
+		}
 
-	if head.Type != protocol.MsgAuthResponse {
-		return fmt.Errorf("expected %s, got %s", protocol.MsgAuthResponse, head.Type)
-	}
+		clientCertPEM, fingerprint, err := security.SignClientCSR(
+			s.hostPKI.CACertPEM,
+			s.hostPKI.CAKeyPEM,
+			[]byte(req.CSRPEM),
+			req.ClientLabel,
+		)
+		if err != nil {
+			return err
+		}
+		if err := s.trustClient(fingerprint, req.PreviousFingerprint, req.ClientLabel); err != nil {
+			return err
+		}
 
-	resp, err := protocol.DecodeData[protocol.AuthResponse](head)
-	if err != nil {
-		return err
-	}
-
-	if !protocol.VerifyToken(s.opts.Token, nonce, resp.MAC) {
-		return errors.New("authentication failed")
-	}
-
-	return conn.WriteJSON(protocol.MsgAuthOK, nil)
+		return conn.WriteJSON(protocol.MsgPairResponse, protocol.PairResponse{
+			ClientCertPEM: string(clientCertPEM),
+			Fingerprint:   fingerprint,
+		})
+	})
 }
 
 func (s *Server) receiveBlobs(conn *protocol.Conn) error {

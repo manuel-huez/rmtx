@@ -101,3 +101,20 @@ func TestLoadedContextIDUsesStableExplicitName(t *testing.T) {
 		t.Fatalf("expected stable context id, got %q and %q", id1, id2)
 	}
 }
+
+func TestLoadRejectsLegacyTokenFields(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".rmtx.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"token_env":"RMTX_TOKEN"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected legacy token field error")
+	}
+
+	if !strings.Contains(err.Error(), `"token_env" is unsupported`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

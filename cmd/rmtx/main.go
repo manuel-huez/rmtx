@@ -26,7 +26,6 @@ const tabWriterPadding = 2
 type remoteFlags struct {
 	hostAddr         *string
 	cfgPath          *string
-	token            *string
 	discoveryTimeout *time.Duration
 }
 
@@ -54,6 +53,8 @@ func run(ctx context.Context, args []string) int {
 		return runExecWithFlags(ctx, args[1:])
 	case "ping":
 		return runPing(ctx, args[1:])
+	case "pair":
+		return runPair(ctx, args[1:])
 	case "context", "contexts":
 		return runContext(ctx, args[1:])
 	case "help", "--help", "-h":
@@ -77,10 +78,13 @@ func run(ctx context.Context, args []string) int {
 }
 
 func runHost(ctx context.Context, args []string) int {
+	if len(args) > 0 && args[0] == "pair-code" {
+		return runHostPairCode(args[1:])
+	}
+
 	fs := flag.NewFlagSet("rmtx host", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	listen := fs.String("listen", fmt.Sprintf(":%d", config.DefaultPort), "listen address")
-	token := fs.String("token", "", "shared token; defaults to RMTX_TOKEN")
 	stateDir := fs.String("state-dir", "", "state directory for blobs and contexts")
 	name := fs.String("name", "", "discovery instance name")
 	service := fs.String("service", config.DefaultService, "discovery service name")
@@ -96,7 +100,6 @@ func runHost(ctx context.Context, args []string) int {
 		app.HostParams{
 			ListenAddr:       *listen,
 			StateDir:         *stateDir,
-			Token:            *token,
 			AdvertiseName:    *name,
 			DiscoveryService: *service,
 			DisableDiscovery: *noDiscovery,
@@ -110,12 +113,37 @@ func runHost(ctx context.Context, args []string) int {
 	return 0
 }
 
+func runHostPairCode(args []string) int {
+	fs := flag.NewFlagSet("rmtx host pair-code", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	stateDir := fs.String("state-dir", "", "state directory for host data")
+	ttl := fs.Duration("ttl", 5*time.Minute, "pairing code ttl")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	info, err := app.RunHostPairCode(app.HostPairCodeParams{StateDir: *stateDir, TTL: *ttl})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintf(
+		os.Stdout,
+		"code=%s host=%s fingerprint=%s expires=%s\n",
+		info.Code,
+		info.HostName,
+		info.HostFingerprint,
+		info.ExpiresAt.Format(time.RFC3339),
+	)
+	return 0
+}
+
 func runExecWithFlags(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("rmtx exec", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	hostAddr := fs.String("host", "", "host address, e.g. 192.168.1.20:33221")
 	cfgPath := fs.String("config", "", "path to .rmtx.json")
-	token := fs.String("token", "", "shared token; defaults to RMTX_TOKEN or config token_env")
 	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
 	ttyFlag := fs.Bool("tty", false, "force interactive TTY")
 
@@ -140,7 +168,6 @@ func runExecWithFlags(ctx context.Context, args []string) int {
 		app.ExecParams{
 			AddressOverride:  *hostAddr,
 			ConfigPath:       *cfgPath,
-			TokenOverride:    *token,
 			DiscoveryTimeout: *discoveryTimeout,
 			Command:          fs.Args(),
 			Stdout:           os.Stdout,
@@ -177,14 +204,64 @@ func runPing(ctx context.Context, args []string) int {
 
 	_, _ = fmt.Fprintf(
 		os.Stdout,
-		"online\t%s\t%s\tversion=%s\tcontexts=%d\tat=%s\n",
+		"online\t%s\t%s\tversion=%s\tcontexts=%d\tfingerprint=%s\tat=%s\n",
 		emptyFallback(info.Name, "rmtx-host"),
 		info.Address,
 		info.Version,
 		info.ContextCount,
+		info.Fingerprint,
 		info.Now.Format(time.RFC3339),
 	)
 
+	return 0
+}
+
+func runPair(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("rmtx pair", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	hostAddr := fs.String("host", "", "host address, e.g. 192.168.1.20:33221")
+	fingerprint := fs.String(
+		"fingerprint",
+		"",
+		"expected host TLS fingerprint; required unless config tls.host_fingerprint is set",
+	)
+	cfgPath := fs.String("config", "", "path to .rmtx.json")
+	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
+	code := fs.String("code", "", "pairing code")
+	label := fs.String("label", "", "client label")
+	selectIndex := fs.Int("select", 0, "discovered host index")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	if strings.TrimSpace(*code) == "" {
+		fmt.Fprintln(os.Stderr, "error: pairing code is required")
+		return exitUsage
+	}
+
+	cwd, err := mustGetwd()
+	if err != nil {
+		printErr(err)
+		return 1
+	}
+
+	record, err := app.RunPair(ctx, cwd, app.PairParams{
+		AddressOverride:  *hostAddr,
+		Fingerprint:      *fingerprint,
+		ConfigPath:       *cfgPath,
+		DiscoveryTimeout: *discoveryTimeout,
+		Code:             *code,
+		ClientLabel:      *label,
+		SelectionIndex:   *selectIndex,
+		Stdin:            os.Stdin,
+		Stdout:           os.Stdout,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintf(os.Stdout, "paired\t%s\t%s\t%s\n", record.Name, record.Address, record.Fingerprint)
 	return 0
 }
 
@@ -381,7 +458,9 @@ func printUsage(f *os.File) {
 
 Usage:
   rmtx host [flags]
+  rmtx host pair-code [flags]
   rmtx exec [flags] -- <command> [args...]
+  rmtx pair [flags]
   rmtx ping [flags]
   rmtx context [list|delete|prune] [flags]
   rmtx version
@@ -389,7 +468,9 @@ Usage:
 
 Examples:
   rmtx host --listen :33221
+  rmtx host pair-code
   rmtx go test ./...
+  rmtx pair --code 123456
   rmtx exec --tty -- bash
   rmtx ping
   rmtx version
@@ -402,13 +483,8 @@ Examples:
 
 func bindRemoteFlags(fs *flag.FlagSet) remoteFlags {
 	return remoteFlags{
-		hostAddr: fs.String("host", "", "host address, e.g. 192.168.1.20:33221"),
-		cfgPath:  fs.String("config", "", "optional path to .rmtx.json"),
-		token: fs.String(
-			"token",
-			"",
-			"shared token; defaults to RMTX_TOKEN or config token_env",
-		),
+		hostAddr:         fs.String("host", "", "host address, e.g. 192.168.1.20:33221"),
+		cfgPath:          fs.String("config", "", "optional path to .rmtx.json"),
 		discoveryTimeout: fs.Duration("discovery-timeout", 0, "override discovery timeout"),
 	}
 }
@@ -417,7 +493,6 @@ func (r remoteFlags) params() app.RemoteParams {
 	return app.RemoteParams{
 		AddressOverride:  *r.hostAddr,
 		ConfigPath:       *r.cfgPath,
-		TokenOverride:    *r.token,
 		DiscoveryTimeout: *r.discoveryTimeout,
 	}
 }
@@ -426,7 +501,6 @@ func (r remoteFlags) deleteParams() app.ContextDeleteParams {
 	return app.ContextDeleteParams{
 		AddressOverride:  *r.hostAddr,
 		ConfigPath:       *r.cfgPath,
-		TokenOverride:    *r.token,
 		DiscoveryTimeout: *r.discoveryTimeout,
 	}
 }

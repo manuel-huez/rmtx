@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -12,37 +13,44 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/manuel-huez/rmtx/internal/clientstate"
+
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 	"github.com/manuel-huez/rmtx/internal/terminal"
 )
 
 type ExecOptions struct {
-	Address      string
-	Token        string
-	Root         string
-	CWD          string
-	Command      []string
-	Mounts       []syncfs.MountSpec
-	ForwardEnv   []string
-	ExtraEnv     map[string]string
-	Stdout       io.Writer
-	Stderr       io.Writer
-	Stdin        io.Reader
-	StdinFile    *os.File
-	StdoutFile   *os.File
-	StderrFile   *os.File
-	ForwardStdin bool
-	Session      string
-	Project      string
-	ContextID    string
-	ContextName  string
-	TTY          bool
+	Address       string
+	Host          clientstate.HostRecord
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	Root          string
+	CWD           string
+	Command       []string
+	Mounts        []syncfs.MountSpec
+	ForwardEnv    []string
+	ExtraEnv      map[string]string
+	Stdout        io.Writer
+	Stderr        io.Writer
+	Stdin         io.Reader
+	StdinFile     *os.File
+	StdoutFile    *os.File
+	StderrFile    *os.File
+	ForwardStdin  bool
+	Session       string
+	Project       string
+	ContextID     string
+	ContextName   string
+	TTY           bool
 }
 
 type RemoteOptions struct {
-	Address string
-	Token   string
+	Address       string
+	Host          clientstate.HostRecord
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
 }
 
 type PingInfo = protocol.PingResponse
@@ -75,7 +83,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 
-	conn, err := dialAndAuthenticate(ctx, opts.Address, opts.Token)
+	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
 	if err != nil {
 		return 1, err
 	}
@@ -118,8 +126,8 @@ func validateExecOptions(opts *ExecOptions) error {
 		return errors.New("host address is required")
 	}
 
-	if strings.TrimSpace(opts.Token) == "" {
-		return errors.New("client token is required")
+	if strings.TrimSpace(opts.Host.Fingerprint) == "" {
+		return errors.New("host fingerprint is required")
 	}
 
 	if len(opts.Command) == 0 {
@@ -249,21 +257,19 @@ func buildRunRequest(
 	return manifest, request, nil
 }
 
-func dialAndAuthenticate(ctx context.Context, address, token string) (*protocol.Conn, error) {
+func dialTLS(ctx context.Context, address, fingerprint string, clientCertPEM, clientKeyPEM []byte) (*protocol.Conn, error) {
 	dialer := net.Dialer{}
+	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
+	if err != nil {
+		return nil, err
+	}
 
-	raw, err := dialer.DialContext(ctx, "tcp", address)
+	raw, err := tls.DialWithDialer(&dialer, "tcp", address, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial host %s: %w", address, err)
 	}
 
-	conn := protocol.NewConn(raw)
-	if err := authenticate(conn, token); err != nil {
-		closeQuietly(raw)
-		return nil, err
-	}
-
-	return conn, nil
+	return protocol.NewConn(raw), nil
 }
 
 func runHandshake(
@@ -505,44 +511,43 @@ func expectDataFrame[T any](conn *protocol.Conn, wantType string) (T, error) {
 	return protocol.DecodeData[T](head)
 }
 
-func authenticate(conn *protocol.Conn, token string) error {
-	head, err := conn.ReadHeader()
+type PairOptions struct {
+	Address             string
+	Host                clientstate.HostRecord
+	Code                string
+	ClientLabel         string
+	PreviousFingerprint string
+	CSRPEM              []byte
+}
+
+type PairResult = protocol.PairResponse
+
+func PairHost(ctx context.Context, opts PairOptions) (PairResult, error) {
+	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, nil, nil)
 	if err != nil {
-		return err
+		return PairResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	req := protocol.PairRequest{
+		Code:                opts.Code,
+		ClientLabel:         opts.ClientLabel,
+		PreviousFingerprint: opts.PreviousFingerprint,
+		CSRPEM:              string(opts.CSRPEM),
+	}
+	if err := conn.WriteJSON(protocol.MsgPairRequest, req); err != nil {
+		return PairResult{}, err
 	}
 
-	if head.Type == protocol.MsgError {
-		return decodeServerError(head)
-	}
+	return expectDataFrame[protocol.PairResponse](conn, protocol.MsgPairResponse)
+}
 
-	if head.Type != protocol.MsgAuthHello {
-		return fmt.Errorf("expected %s, got %s", protocol.MsgAuthHello, head.Type)
-	}
+func GenerateClientIdentity(label string) ([]byte, []byte, []byte, error) {
+	return security.GenerateClientIdentity(label)
+}
 
-	hello, err := protocol.DecodeData[protocol.AuthHello](head)
-	if err != nil {
-		return err
-	}
-
-	resp := protocol.AuthResponse{MAC: protocol.SignToken(token, hello.Nonce)}
-	if err := conn.WriteJSON(protocol.MsgAuthResponse, resp); err != nil {
-		return err
-	}
-
-	head, err = conn.ReadHeader()
-	if err != nil {
-		return err
-	}
-
-	if head.Type == protocol.MsgError {
-		return decodeServerError(head)
-	}
-
-	if head.Type != protocol.MsgAuthOK {
-		return fmt.Errorf("expected %s, got %s", protocol.MsgAuthOK, head.Type)
-	}
-
-	return nil
+func GenerateCSR(keyPEM []byte, label string) ([]byte, error) {
+	return security.GenerateCSRFromKey(keyPEM, label)
 }
 
 func sendMissingBlobs(conn *protocol.Conn, hashes []string, blobSources map[string]string) error {

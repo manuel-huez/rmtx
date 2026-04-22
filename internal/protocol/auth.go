@@ -1,26 +1,12 @@
 package protocol
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 )
 
 const nonceSize = 32
-
-func SignToken(token, nonce string) string {
-	mac := hmac.New(sha256.New, []byte(token))
-	_, _ = mac.Write([]byte(nonce))
-
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func VerifyToken(token, nonce, signature string) bool {
-	expected := SignToken(token, nonce)
-	return hmac.Equal([]byte(expected), []byte(signature))
-}
 
 func RandomNonce() (string, error) {
 	buf := make([]byte, nonceSize)

@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/config"
+	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/host"
 )
 
@@ -19,7 +21,6 @@ func TestRunExecRequiresLocalConfig(t *testing.T) {
 
 	_, err := RunExec(context.Background(), project, ExecParams{
 		AddressOverride: "127.0.0.1:33221",
-		TokenOverride:   "secret-token",
 		Command:         []string{"true"},
 	})
 	if err == nil {
@@ -40,11 +41,13 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
 	stateDir := t.TempDir()
 
 	server, err := host.New(host.Options{
 		ListenAddr:       "127.0.0.1:0",
-		Token:            "secret-token",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 	})
@@ -63,6 +66,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	configContent := `{
   "version": 1,
   "context": {"name": "integration-context"},
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
   "mounts": [{"path": ".", "exclude": [".git/**", "cache/**"]}],
   "env": {"forward": ["FORWARD_ME"]},
   "discovery": {"enabled": false}
@@ -94,11 +98,24 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	contextID := loaded.ContextID()
 
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(ctx, project, PairParams{
+		AddressOverride: addr,
+		ConfigPath:      configPath,
+		Code:            pairCode.Code,
+		ClientLabel:     "integration-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	var stdout1, stderr1 bytes.Buffer
 
 	code, err := RunExec(ctx, project, ExecParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 		Command: []string{
 			"sh",
 			"-c",
@@ -141,7 +158,6 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	code, err = RunExec(ctx, project, ExecParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 		Command:         []string{"sh", "-c", `cat cache/marker`},
 		Stdout:          &stdout2,
 		Stderr:          &stderr2,
@@ -160,7 +176,6 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	contexts, err := RunListContexts(ctx, project, RemoteParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +199,6 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	ping, err := RunPing(ctx, project, RemoteParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +214,6 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	deleteResult, err := RunDeleteContexts(ctx, project, ContextDeleteParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 		Current:         true,
 	})
 	if err != nil {
@@ -218,7 +231,6 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	contexts, err = RunListContexts(ctx, project, RemoteParams{
 		AddressOverride: addr,
-		TokenOverride:   "secret-token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -237,6 +249,387 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestRunPairSupportsMultipleHosts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	type hostFixture struct {
+		server     *host.Server
+		stateDir   string
+		addr       string
+		configPath string
+		errCh      chan error
+	}
+
+	startHost := func(t *testing.T, label string) hostFixture {
+		t.Helper()
+
+		stateDir := t.TempDir()
+		server, err := host.New(host.Options{
+			ListenAddr:       "127.0.0.1:0",
+			StateDir:         stateDir,
+			AdvertiseName:    label,
+			DisableDiscovery: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- server.Serve(ctx) }()
+
+		project := t.TempDir()
+		configPath := filepath.Join(project, ".rmtx.json")
+		configContent := `{
+  "version": 1,
+  "host": "` + waitForAddr(t, server) + `",
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "discovery": {"enabled": false}
+}`
+		if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		return hostFixture{
+			server:     server,
+			stateDir:   stateDir,
+			addr:       server.Addr(),
+			configPath: configPath,
+			errCh:      errCh,
+		}
+	}
+
+	hostA := startHost(t, "host-a")
+	hostB := startHost(t, "host-b")
+
+	for _, tc := range []struct {
+		name string
+		host hostFixture
+	}{
+		{name: "host-a", host: hostA},
+		{name: "host-b", host: hostB},
+	} {
+		pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: tc.host.stateDir})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := RunPair(ctx, filepath.Dir(tc.host.configPath), PairParams{
+			AddressOverride: tc.host.addr,
+			ConfigPath:      tc.host.configPath,
+			Code:            pairCode.Code,
+			ClientLabel:     "multi-host-client",
+		}); err != nil {
+			t.Fatalf("%s pair failed: %v", tc.name, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		host hostFixture
+	}{
+		{name: "host-a", host: hostA},
+		{name: "host-b", host: hostB},
+	} {
+		ping, err := RunPing(ctx, filepath.Dir(tc.host.configPath), RemoteParams{
+			AddressOverride: tc.host.addr,
+			ConfigPath:      tc.host.configPath,
+		})
+		if err != nil {
+			t.Fatalf("%s ping failed after pairing both hosts: %v", tc.name, err)
+		}
+		if !ping.Online {
+			t.Fatalf("%s expected online ping", tc.name)
+		}
+	}
+
+	cancel()
+
+	for _, tc := range []struct {
+		name  string
+		errCh chan error
+	}{
+		{name: "host-a", errCh: hostA.errCh},
+		{name: "host-b", errCh: hostB.errCh},
+	} {
+		select {
+		case err := <-tc.errCh:
+			if err != nil {
+				t.Fatalf("%s server exited with error: %v", tc.name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s shutdown", tc.name)
+		}
+	}
+}
+
+func TestRunPairUsesConfiguredHostWhenDiscoveryDisabled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+	configContent := `{
+  "version": 1,
+  "host": "` + addr + `",
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "discovery": {"enabled": false}
+}`
+	if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := RunPair(ctx, project, PairParams{
+		ConfigPath:     configPath,
+		Code:           pairCode.Code,
+		ClientLabel:    "cfg-host-client",
+		SelectionIndex: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Address != addr {
+		t.Fatalf("unexpected paired address: got %s want %s", record.Address, addr)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := RunPair(ctx, t.TempDir(), PairParams{
+		AddressOverride: addr,
+		Fingerprint:     server.Fingerprint(),
+		Code:            pairCode.Code,
+		ClientLabel:     "manual-host-client",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Fingerprint != server.Fingerprint() {
+		t.Fatalf("unexpected paired fingerprint: got %s want %s", record.Fingerprint, server.Fingerprint())
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
+	result, err := resolvePairTarget(context.Background(), config.WithDefaults(config.Default()), PairParams{
+		AddressOverride: "192.168.1.42",
+		Fingerprint:     "sha256:expected",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Address != "192.168.1.42:33221" {
+		t.Fatalf("unexpected address: got %s", result.Address)
+	}
+	if result.HostFingerprint != "sha256:expected" {
+		t.Fatalf("unexpected fingerprint: got %s", result.HostFingerprint)
+	}
+}
+
+func TestResolvePairTargetRequiresPinnedFingerprint(t *testing.T) {
+	_, err := resolvePairTarget(context.Background(), config.WithDefaults(config.Default()), PairParams{
+		AddressOverride: "192.168.1.42",
+	})
+	if err == nil {
+		t.Fatal("expected missing fingerprint error")
+	}
+	if !strings.Contains(err.Error(), "host fingerprint is required for pairing") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSelectDiscoveredHostFiltersPinnedFingerprintBeforeMultipleHostError(t *testing.T) {
+	result, err := selectDiscoveredHost([]discovery.Result{
+		{Address: "10.0.0.1:33221", HostFingerprint: "sha256:host-a"},
+		{Address: "10.0.0.2:33221", HostFingerprint: "sha256:host-b"},
+	}, "sha256:host-b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Address != "10.0.0.2:33221" {
+		t.Fatalf("unexpected selected host: got %s", result.Address)
+	}
+}
+
+func TestSelectDiscoveredHostPrefersKnownAddressForPinnedFingerprint(t *testing.T) {
+	result, err := selectDiscoveredHost([]discovery.Result{
+		{Address: "10.0.0.1:33221", HostFingerprint: "sha256:host"},
+		{Address: "10.0.0.2:33221", HostFingerprint: "sha256:host"},
+	}, "sha256:host", "10.0.0.2:33221")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Address != "10.0.0.2:33221" {
+		t.Fatalf("unexpected preferred host: got %s", result.Address)
+	}
+}
+
+func TestResolveClientHostUsesFingerprintWhenAddressChanges(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	state, err := clientstate.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.UpsertHost(clientstate.HostRecord{
+		Address:       "10.0.0.1:33221",
+		Name:          "test-host",
+		Fingerprint:   "sha256:host",
+		Paired:        true,
+		ClientCertPEM: "cert",
+		ClientKeyPEM:  "key",
+	})
+	if err := state.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, record, err := resolveClientHost("10.0.0.2:33221", "sha256:host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || record == nil {
+		t.Fatal("expected paired host to resolve by fingerprint")
+	}
+	if record.Address != "10.0.0.2:33221" {
+		t.Fatalf("unexpected updated address: got %s", record.Address)
+	}
+
+	reloaded, err := clientstate.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.FindHostByAddress("10.0.0.2:33221") == nil {
+		t.Fatal("expected state to persist updated address")
+	}
+}
+
+func TestResolveClientHostSkipsOccupiedAddressToAvoidDuplicates(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	state, err := clientstate.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.UpsertHost(clientstate.HostRecord{
+		Address:       "10.0.0.1:33221",
+		Name:          "moving-host",
+		Fingerprint:   "sha256:host-a",
+		Paired:        true,
+		ClientCertPEM: "cert-a",
+		ClientKeyPEM:  "key-a",
+	})
+	state.UpsertHost(clientstate.HostRecord{
+		Address:       "10.0.0.2:33221",
+		Name:          "occupied-host",
+		Fingerprint:   "sha256:host-b",
+		Paired:        true,
+		ClientCertPEM: "cert-b",
+		ClientKeyPEM:  "key-b",
+	})
+	if err := state.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, record, err := resolveClientHost("10.0.0.2:33221", "sha256:host-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record == nil {
+		t.Fatal("expected host record to resolve by fingerprint")
+	}
+	if record.Address != "10.0.0.1:33221" {
+		t.Fatalf("expected existing address to remain when target is occupied, got %s", record.Address)
+	}
+
+	reloaded, err := clientstate.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	occupiedCount := 0
+	for _, host := range reloaded.Data.Hosts {
+		if host.Address == "10.0.0.2:33221" {
+			occupiedCount++
+		}
+	}
+	if occupiedCount != 1 {
+		t.Fatalf("expected one host to keep occupied address, got %d", occupiedCount)
 	}
 }
 

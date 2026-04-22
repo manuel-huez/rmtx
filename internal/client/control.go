@@ -7,7 +7,7 @@ import (
 )
 
 func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
-	conn, err := dialAndAuthenticate(ctx, opts.Address, opts.Token)
+	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
 	if err != nil {
 		return PingInfo{}, err
 	}
@@ -21,7 +21,7 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 }
 
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
-	conn, err := dialAndAuthenticate(ctx, opts.Address, opts.Token)
+	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,13 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 }
 
 func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteContextsResult, error) {
-	conn, err := dialAndAuthenticate(ctx, opts.Remote.Address, opts.Remote.Token)
+	conn, err := dialTLS(
+		ctx,
+		opts.Remote.Address,
+		opts.Remote.Host.Fingerprint,
+		opts.Remote.ClientCertPEM,
+		opts.Remote.ClientKeyPEM,
+	)
 	if err != nil {
 		return DeleteContextsResult{}, err
 	}
