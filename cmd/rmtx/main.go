@@ -30,6 +30,15 @@ type remoteFlags struct {
 	discoveryTimeout *time.Duration
 }
 
+type pairLikeFlags struct {
+	hostAddr         *string
+	cfgPath          *string
+	discoveryTimeout *time.Duration
+	code             *string
+	label            *string
+	selectIndex      *int
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:])
@@ -52,6 +61,8 @@ func run(ctx context.Context, args []string) int {
 		return runHost(ctx, args[1:])
 	case "exec":
 		return runExecWithFlags(ctx, args[1:])
+	case "init":
+		return runInit(ctx, args[1:])
 	case "ping":
 		return runPing(ctx, args[1:])
 	case "pair":
@@ -222,53 +233,156 @@ func runPing(ctx context.Context, args []string) int {
 func runPair(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("rmtx pair", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	hostAddr := fs.String("host", "", "host address, e.g. 192.168.1.20:33221")
+	common := bindPairLikeFlags(
+		fs,
+		"host address, e.g. 192.168.1.20:33221",
+		"pairing code; omit to request one from host",
+		"path to .rmtx.json",
+	)
+
 	fingerprint := fs.String(
 		"fingerprint",
 		"",
 		"expected host TLS fingerprint; required unless config tls.host_fingerprint is set",
 	)
-	cfgPath := fs.String("config", "", "path to .rmtx.json")
-	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
-	code := fs.String("code", "", "pairing code; omit to request one from host")
-	label := fs.String("label", "", "client label")
-
-	selectIndex := fs.Int("select", 0, "discovered host index")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 
-	cwd, err := mustGetwd()
-	if err != nil {
-		printErr(err)
-		return 1
+	cwd, code := mustGetwdOrExit()
+	if code != 0 {
+		return code
 	}
 
-	record, err := app.RunPair(ctx, cwd, app.PairParams{
-		AddressOverride:  *hostAddr,
-		Fingerprint:      *fingerprint,
-		ConfigPath:       *cfgPath,
-		DiscoveryTimeout: *discoveryTimeout,
-		Code:             *code,
-		ClientLabel:      *label,
-		SelectionIndex:   *selectIndex,
-		Stdin:            os.Stdin,
-		Stdout:           os.Stdout,
-	})
+	params := pairLikeParams(common)
+	params.Fingerprint = *fingerprint
+	params.Stdin = os.Stdin
+	params.Stdout = os.Stdout
+
+	return executePairLike(
+		ctx,
+		cwd,
+		params,
+		func(ctx context.Context, cwd string, params app.PairParams) (string, error) {
+			record, err := app.RunPair(ctx, cwd, params)
+			if err != nil {
+				return "", err
+			}
+
+			return fmt.Sprintf(
+				"paired\t%s\t%s\t%s",
+				record.Name,
+				record.Address,
+				record.Fingerprint,
+			), nil
+		},
+	)
+}
+
+func runInit(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("rmtx init", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	common := bindPairLikeFlags(
+		fs,
+		"preferred discovered host address, e.g. 192.168.1.20:33221",
+		"pairing code; omit to request one from selected host",
+		"path to create .rmtx.json",
+	)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	cwd, code := mustGetwdOrExit()
+	if code != 0 {
+		return code
+	}
+
+	params := pairLikeParams(common)
+	params.Stdin = os.Stdin
+	params.Stdout = os.Stdout
+
+	return executePairLike(
+		ctx,
+		cwd,
+		params,
+		func(ctx context.Context, cwd string, params app.PairParams) (string, error) {
+			result, err := app.RunInit(ctx, cwd, app.InitParams{
+				AddressOverride:  params.AddressOverride,
+				ConfigPath:       params.ConfigPath,
+				DiscoveryTimeout: params.DiscoveryTimeout,
+				Code:             params.Code,
+				ClientLabel:      params.ClientLabel,
+				SelectionIndex:   params.SelectionIndex,
+				Stdin:            params.Stdin,
+				Stdout:           params.Stdout,
+			})
+			if err != nil {
+				return "", err
+			}
+
+			return fmt.Sprintf(
+				"initialized\t%s\t%s\t%s",
+				result.ConfigPath,
+				result.Host.Address,
+				result.Host.Fingerprint,
+			), nil
+		},
+	)
+}
+
+func bindPairLikeFlags(
+	fs *flag.FlagSet,
+	hostHelp string,
+	codeHelp string,
+	configHelp string,
+) pairLikeFlags {
+	return pairLikeFlags{
+		hostAddr:         fs.String("host", "", hostHelp),
+		cfgPath:          fs.String("config", "", configHelp),
+		discoveryTimeout: fs.Duration("discovery-timeout", 0, "override discovery timeout"),
+		code:             fs.String("code", "", codeHelp),
+		label:            fs.String("label", "", "client label"),
+		selectIndex:      fs.Int("select", 0, "discovered host index"),
+	}
+}
+
+func pairLikeParams(flags pairLikeFlags) app.PairParams {
+	return app.PairParams{
+		AddressOverride:  *flags.hostAddr,
+		ConfigPath:       *flags.cfgPath,
+		DiscoveryTimeout: *flags.discoveryTimeout,
+		Code:             *flags.code,
+		ClientLabel:      *flags.label,
+		SelectionIndex:   *flags.selectIndex,
+	}
+}
+
+func executePairLike(
+	ctx context.Context,
+	cwd string,
+	params app.PairParams,
+	run func(context.Context, string, app.PairParams) (string, error),
+) int {
+	output, err := run(ctx, cwd, params)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(
-		os.Stdout,
-		"paired\t%s\t%s\t%s\n",
-		record.Name,
-		record.Address,
-		record.Fingerprint,
-	)
+	_, _ = fmt.Fprintln(os.Stdout, output)
 
 	return 0
+}
+
+func mustGetwdOrExit() (string, int) {
+	cwd, err := mustGetwd()
+	if err != nil {
+		printErr(err)
+		return "", 1
+	}
+
+	return cwd, 0
 }
 
 func runContext(ctx context.Context, args []string) int {
@@ -466,6 +580,7 @@ Usage:
   rmtx host [flags]
   rmtx host pair-code [flags]
   rmtx exec [flags] -- <command> [args...]
+  rmtx init [flags]
   rmtx pair [flags]
   rmtx ping [flags]
   rmtx context [list|delete|prune] [flags]
@@ -474,6 +589,7 @@ Usage:
 
 Examples:
   rmtx host --listen :33221
+  rmtx init
   rmtx pair
   rmtx host pair-code
   rmtx go test ./...

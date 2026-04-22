@@ -8,6 +8,7 @@
 ## Quick overview
 
 - `rmtx host`: run the host service.
+- `rmtx init`: discover host, create local config, pair client.
 - `rmtx <command> ...` or `rmtx exec -- <command> ...`: run a command remotely in the current context.
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
@@ -34,25 +35,25 @@ Start host:
 ./rmtx host --listen :33221
 ```
 
-In your project on the client, create `.rmtx.json`:
+In your project on the client, initialize once:
+
+```bash
+./rmtx init
+./rmtx go test ./...
+```
+
+`rmtx init` discovers available hosts, asks you to trust selected host fingerprint, writes `.rmtx.json`, then requests a one-time pairing code from that host and prompts you to enter it. After init, `rmtx pair` re-pairs an existing config. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.
+
+Generated `.rmtx.json` looks like:
 
 ```json
 {
   "version": 1,
   "context": { "name": "my-project" },
   "tls": { "host_fingerprint": "sha256:..." },
-  "mounts": [{ "path": ".", "exclude": [".git/**", "node_modules/**"] }]
+  "mounts": [{ "path": "." }]
 }
 ```
-
-Then pair and run:
-
-```bash
-./rmtx pair
-./rmtx go test ./...
-```
-
-`rmtx pair` asks host to generate a one-time code, prints that code in host terminal, then prompts client to enter it. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.
 
 ## Config file
 

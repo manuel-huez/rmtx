@@ -179,7 +179,7 @@ func ResolveRequired(startDir, explicitConfig string) (*Loaded, error) {
 	if err != nil {
 		if errors.Is(err, ErrConfigNotFound) {
 			return nil, fmt.Errorf(
-				"local config file is required; create one of %s",
+				"local config file is required; run `rmtx init` or create one of %s",
 				strings.Join(fileNames[:2], ", "),
 			)
 		}

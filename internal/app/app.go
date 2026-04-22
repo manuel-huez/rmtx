@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,16 @@ const (
 	TTYAuto TTYMode = iota
 	TTYForce
 	TTYDisable
+)
+
+var (
+	discoverAllHosts = discovery.DiscoverAll
+	discoverOneHost  = discovery.DiscoverOne
+)
+
+const (
+	initConfigDirMode  = 0o755
+	initConfigFileMode = 0o644
 )
 
 type ExecParams struct {
@@ -85,6 +96,22 @@ type PairParams struct {
 	SelectionIndex   int
 	Stdin            io.Reader
 	Stdout           io.Writer
+}
+
+type InitParams struct {
+	AddressOverride  string
+	ConfigPath       string
+	DiscoveryTimeout time.Duration
+	Code             string
+	ClientLabel      string
+	SelectionIndex   int
+	Stdin            io.Reader
+	Stdout           io.Writer
+}
+
+type InitResult struct {
+	ConfigPath string
+	Host       clientstate.HostRecord
 }
 
 func loadPairConfig(cwd, configPath string) (config.Config, error) {
@@ -306,6 +333,48 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 	return host.CreatePairCodeInfo(params.StateDir, params.TTL)
 }
 
+//nolint:cyclop // Init flow discovers pairable hosts, writes config, then completes pairing.
+func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, error) {
+	pairParams := PairParams{
+		AddressOverride:  params.AddressOverride,
+		ConfigPath:       params.ConfigPath,
+		DiscoveryTimeout: params.DiscoveryTimeout,
+		Code:             params.Code,
+		ClientLabel:      params.ClientLabel,
+		SelectionIndex:   params.SelectionIndex,
+		Stdin:            params.Stdin,
+		Stdout:           params.Stdout,
+	}
+	preparePairIO(&pairParams)
+
+	configPath, err := resolveInitConfigPath(cwd, params.ConfigPath)
+	if err != nil {
+		return InitResult{}, err
+	}
+
+	cfg := config.WithDefaults(config.Default())
+
+	result, err := resolveInitTarget(ctx, cfg, &pairParams)
+	if err != nil {
+		return InitResult{}, err
+	}
+
+	if err := promptForTrust(&pairParams, result); err != nil {
+		return InitResult{}, err
+	}
+
+	if err := writeInitConfig(configPath, cwd, result.HostFingerprint); err != nil {
+		return InitResult{}, err
+	}
+
+	record, err := completePair(ctx, result, &pairParams)
+	if err != nil {
+		return InitResult{}, err
+	}
+
+	return InitResult{ConfigPath: configPath, Host: record}, nil
+}
+
 //nolint:cyclop // Pairing flow coordinates config lookup, identity reuse, CSR generation, and state persistence.
 func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.HostRecord, error) {
 	preparePairIO(&params)
@@ -320,6 +389,14 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 		return clientstate.HostRecord{}, err
 	}
 
+	return completePair(ctx, result, &params)
+}
+
+func completePair(
+	ctx context.Context,
+	result discovery.Result,
+	params *PairParams,
+) (clientstate.HostRecord, error) {
 	state, err := clientstate.Load()
 	if err != nil {
 		return clientstate.HostRecord{}, err
@@ -343,7 +420,7 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 		return clientstate.HostRecord{}, err
 	}
 
-	code, err := resolvePairCode(ctx, &params, result, label)
+	code, err := resolvePairCode(ctx, params, result, label)
 	if err != nil {
 		return clientstate.HostRecord{}, err
 	}
@@ -696,7 +773,7 @@ func resolveRemoteHost(
 		return discoverPinnedRemoteHost(ctx, cfg, d, pinnedFingerprint)
 	}
 
-	result, err := discovery.DiscoverOne(ctx, cfg.Discovery.Service, d)
+	result, err := discoverOneHost(ctx, cfg.Discovery.Service, d)
 	if err != nil {
 		return resolvedRemoteHost{}, err
 	}
@@ -713,7 +790,7 @@ func discoverPinnedRemoteHost(
 	timeout time.Duration,
 	pinnedFingerprint string,
 ) (resolvedRemoteHost, error) {
-	results, err := discovery.DiscoverAll(ctx, cfg.Discovery.Service, timeout)
+	results, err := discoverAllHosts(ctx, cfg.Discovery.Service, timeout)
 	if err != nil {
 		return resolvedRemoteHost{}, err
 	}
@@ -831,6 +908,76 @@ func resolveClientHost(
 	return state, record, nil
 }
 
+//nolint:cyclop // Init target resolution mixes discovery, optional filtering, and interactive selection.
+func resolveInitTarget(
+	ctx context.Context,
+	cfg config.Config,
+	params *PairParams,
+) (discovery.Result, error) {
+	preparePairIO(params)
+
+	timeout := params.DiscoveryTimeout
+	if timeout <= 0 {
+		timeout = cfg.DiscoveryTimeout()
+	}
+
+	results, err := discoverAllHosts(ctx, cfg.Discovery.Service, timeout)
+	if err != nil {
+		return discovery.Result{}, err
+	}
+
+	results = filterPairableResults(results)
+	if len(results) == 0 {
+		return discovery.Result{}, errors.New("no pairable host discovered")
+	}
+
+	if out := strings.TrimSpace(params.AddressOverride); out != "" {
+		address := discovery.NormalizeAddress(out, config.DefaultPort)
+
+		filtered := make([]discovery.Result, 0, len(results))
+		for _, result := range results {
+			if strings.TrimSpace(result.Address) == address {
+				filtered = append(filtered, result)
+			}
+		}
+
+		if len(filtered) == 0 {
+			return discovery.Result{}, fmt.Errorf("no discovered host matched address %s", address)
+		}
+
+		results = filtered
+	}
+
+	if len(results) == 1 {
+		return results[0], nil
+	}
+
+	index := params.SelectionIndex
+	if index <= 0 {
+		index, err = promptForPairSelection(params, results)
+		if err != nil {
+			return discovery.Result{}, err
+		}
+	}
+
+	if index < 1 || index > len(results) {
+		return discovery.Result{}, fmt.Errorf("host selection %d out of range", index)
+	}
+
+	return results[index-1], nil
+}
+
+func filterPairableResults(results []discovery.Result) []discovery.Result {
+	filtered := make([]discovery.Result, 0, len(results))
+	for _, result := range results {
+		if result.PairingEnabled {
+			filtered = append(filtered, result)
+		}
+	}
+
+	return filtered
+}
+
 //nolint:cyclop // Pair target resolution supports manual, configured, discovery, and interactive selection flows.
 func resolvePairTarget(
 	ctx context.Context,
@@ -846,7 +993,7 @@ func resolvePairTarget(
 
 	if fingerprint == "" {
 		return discovery.Result{}, errors.New(
-			"host fingerprint is required for pairing; use config tls.host_fingerprint or --fingerprint",
+			"host fingerprint is required for pairing; run `rmtx init`, use config tls.host_fingerprint, or pass --fingerprint",
 		)
 	}
 
@@ -875,7 +1022,7 @@ func resolvePairTarget(
 		timeout = cfg.DiscoveryTimeout()
 	}
 
-	results, err := discovery.DiscoverAll(ctx, cfg.Discovery.Service, timeout)
+	results, err := discoverAllHosts(ctx, cfg.Discovery.Service, timeout)
 	if err != nil {
 		return discovery.Result{}, err
 	}
@@ -920,6 +1067,30 @@ func resolvePairTarget(
 	return results[index-1], nil
 }
 
+func promptForTrust(params *PairParams, result discovery.Result) error {
+	preparePairIO(params)
+
+	_, _ = fmt.Fprintf(
+		params.Stdout,
+		"Trust host %s %s %s? [y/N]: ",
+		empty(result.Instance, "rmtx-host"),
+		result.Address,
+		result.HostFingerprint,
+	)
+
+	line, err := readPairLine(params, "read trust confirmation")
+	if err != nil {
+		return err
+	}
+
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return nil
+	default:
+		return errors.New("pairing cancelled")
+	}
+}
+
 func promptForPairSelection(params *PairParams, results []discovery.Result) (int, error) {
 	preparePairIO(params)
 
@@ -948,6 +1119,80 @@ func promptForPairSelection(params *PairParams, results []discovery.Result) (int
 	}
 
 	return index, nil
+}
+
+func resolveInitConfigPath(cwd, explicitPath string) (string, error) {
+	if strings.TrimSpace(explicitPath) != "" {
+		path, err := filepath.Abs(explicitPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve config path: %w", err)
+		}
+
+		if _, err := os.Stat(path); err == nil {
+			return "", fmt.Errorf("config already exists at %s; run `rmtx pair`", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat config path: %w", err)
+		}
+
+		return path, nil
+	}
+
+	loaded, err := config.Search(cwd)
+	switch {
+	case err == nil:
+		return "", fmt.Errorf("config already exists at %s; run `rmtx pair`", loaded.Path)
+	case errors.Is(err, config.ErrConfigNotFound):
+	default:
+		return "", err
+	}
+
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve init root: %w", err)
+	}
+
+	return filepath.Join(root, ".rmtx.json"), nil
+}
+
+func writeInitConfig(path, cwd, fingerprint string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("config path is required")
+	}
+
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return fmt.Errorf("resolve init root: %w", err)
+	}
+
+	name := config.Loaded{Root: root}.ContextName()
+	payload := struct {
+		Version int                   `json:"version"`
+		Context *config.ContextConfig `json:"context,omitempty"`
+		TLS     *config.TLSConfig     `json:"tls,omitempty"`
+		Mounts  []config.Mount        `json:"mounts,omitempty"`
+	}{
+		Version: config.Default().Version,
+		Context: &config.ContextConfig{Name: name},
+		TLS:     &config.TLSConfig{HostFingerprint: strings.TrimSpace(fingerprint)},
+		Mounts:  []config.Mount{{Path: "."}},
+	}
+
+	content, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal init config: %w", err)
+	}
+
+	content = append(content, '\n')
+
+	if err := os.MkdirAll(filepath.Dir(path), initConfigDirMode); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+
+	if err := os.WriteFile(path, content, initConfigFileMode); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	return nil
 }
 
 func empty(value, fallback string) string {

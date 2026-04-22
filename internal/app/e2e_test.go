@@ -585,6 +585,190 @@ func TestRunPairRequestsCodeWhenCodeOmitted(t *testing.T) {
 	}
 }
 
+//nolint:cyclop // End-to-end init test covers discovery, trust, config write, pairing, and shutdown.
+func TestRunInitCreatesConfigAndRequestsCodeFromSelectedHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	type hostFixture struct {
+		server *host.Server
+		addr   string
+		codeCh chan string
+		errCh  chan error
+	}
+
+	startHost := func(t *testing.T, label string) hostFixture {
+		t.Helper()
+
+		stateDir := t.TempDir()
+		codeCh := make(chan string, 1)
+
+		server, err := host.New(host.Options{
+			ListenAddr:       "127.0.0.1:0",
+			StateDir:         stateDir,
+			AdvertiseName:    label,
+			DisableDiscovery: true,
+			Logger:           log.New(&pairCodeLogCapture{codes: codeCh}, "", 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		errCh := make(chan error, 1)
+
+		go func() { errCh <- server.Serve(ctx) }()
+
+		return hostFixture{
+			server: server,
+			addr:   waitForAddr(t, server),
+			codeCh: codeCh,
+			errCh:  errCh,
+		}
+	}
+
+	hostA := startHost(t, "host-a")
+	hostB := startHost(t, "host-b")
+
+	setDiscoverAllHostsForTest(
+		t,
+		func(context.Context, string, time.Duration) ([]discovery.Result, error) {
+			return []discovery.Result{
+				{
+					Instance:        "host-a",
+					OS:              runtime.GOOS,
+					Address:         hostA.addr,
+					HostFingerprint: hostA.server.Fingerprint(),
+					PairingEnabled:  true,
+				},
+				{
+					Instance:        "host-b",
+					OS:              runtime.GOOS,
+					Address:         hostB.addr,
+					HostFingerprint: hostB.server.Fingerprint(),
+					PairingEnabled:  true,
+				},
+			}, nil
+		},
+	)
+
+	project := t.TempDir()
+	reader, writer := io.Pipe()
+	inputErrCh := startScriptedPairInput("2\ny\n", hostB.codeCh, writer)
+
+	var stdout bytes.Buffer
+
+	result, err := RunInit(ctx, project, InitParams{
+		ClientLabel: "init-client",
+		Stdin:       reader,
+		Stdout:      &stdout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-inputErrCh; err != nil {
+		t.Fatal(err)
+	}
+
+	expectedConfigPath := filepath.Join(project, ".rmtx.json")
+	if result.ConfigPath != expectedConfigPath {
+		t.Fatalf("unexpected config path: got %s want %s", result.ConfigPath, expectedConfigPath)
+	}
+
+	if result.Host.Address != hostB.addr {
+		t.Fatalf("unexpected paired address: got %s want %s", result.Host.Address, hostB.addr)
+	}
+
+	if result.Host.Fingerprint != hostB.server.Fingerprint() {
+		t.Fatalf(
+			"unexpected paired fingerprint: got %s want %s",
+			result.Host.Fingerprint,
+			hostB.server.Fingerprint(),
+		)
+	}
+
+	loaded, err := config.ResolveRequired(project, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if loaded.Config.TLS.HostFingerprint != hostB.server.Fingerprint() {
+		t.Fatalf(
+			"unexpected config fingerprint: got %s want %s",
+			loaded.Config.TLS.HostFingerprint,
+			hostB.server.Fingerprint(),
+		)
+	}
+
+	if len(loaded.Config.Mounts) != 1 || loaded.Config.Mounts[0].Path != "." {
+		t.Fatalf("unexpected mounts: %#v", loaded.Config.Mounts)
+	}
+
+	select {
+	case code := <-hostA.codeCh:
+		t.Fatalf("expected unselected host to stay idle, got code %q", code)
+	default:
+	}
+
+	ping, err := RunPing(ctx, project, RemoteParams{AddressOverride: hostB.addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !ping.Online {
+		t.Fatal("expected ping to report selected host online")
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Select host: ") {
+		t.Fatalf("expected host selection prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Trust host") {
+		t.Fatalf("expected trust prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Enter code: ") {
+		t.Fatalf("expected code prompt, got %q", output)
+	}
+
+	cancel()
+
+	for _, tc := range []struct {
+		name  string
+		errCh chan error
+	}{
+		{name: "host-a", errCh: hostA.errCh},
+		{name: "host-b", errCh: hostB.errCh},
+	} {
+		select {
+		case err := <-tc.errCh:
+			if err != nil {
+				t.Fatalf("%s server exited with error: %v", tc.name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s shutdown", tc.name)
+		}
+	}
+}
+
+func TestRunInitFailsWhenConfigAlreadyExists(t *testing.T) {
+	project := t.TempDir()
+	writeTestFile(t, filepath.Join(project, ".rmtx.json"), `{"version":1}`)
+
+	_, err := RunInit(context.Background(), project, InitParams{})
+	if err == nil {
+		t.Fatal("expected existing config error")
+	}
+
+	if !strings.Contains(err.Error(), "config already exists") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestPairPromptsReuseBufferedInput(t *testing.T) {
 	var stdout bytes.Buffer
 
@@ -697,10 +881,30 @@ func writeTestFile(t *testing.T, path, content string) {
 }
 
 func startPairCodeInput(codeCh <-chan string, writer *io.PipeWriter) <-chan error {
+	return startScriptedPairInput("", codeCh, writer)
+}
+
+func startScriptedPairInput(
+	prefix string,
+	codeCh <-chan string,
+	writer *io.PipeWriter,
+) <-chan error {
 	errCh := make(chan error, 1)
 
 	go func() {
 		defer func() { _ = writer.Close() }()
+
+		if prefix != "" {
+			if _, err := io.WriteString(writer, prefix); err != nil {
+				errCh <- err
+				return
+			}
+		}
+
+		if codeCh == nil {
+			errCh <- nil
+			return
+		}
 
 		select {
 		case code := <-codeCh:
@@ -712,6 +916,18 @@ func startPairCodeInput(codeCh <-chan string, writer *io.PipeWriter) <-chan erro
 	}()
 
 	return errCh
+}
+
+func setDiscoverAllHostsForTest(
+	t *testing.T,
+	fn func(context.Context, string, time.Duration) ([]discovery.Result, error),
+) {
+	t.Helper()
+
+	prev := discoverAllHosts
+	discoverAllHosts = fn
+
+	t.Cleanup(func() { discoverAllHosts = prev })
 }
 
 func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
