@@ -100,6 +100,7 @@ type PairParams struct {
 
 type InitParams struct {
 	AddressOverride  string
+	Fingerprint      string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
 	Code             string
@@ -337,6 +338,7 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, error) {
 	pairParams := PairParams{
 		AddressOverride:  params.AddressOverride,
+		Fingerprint:      params.Fingerprint,
 		ConfigPath:       params.ConfigPath,
 		DiscoveryTimeout: params.DiscoveryTimeout,
 		Code:             params.Code,
@@ -915,6 +917,17 @@ func resolveInitTarget(
 	params *PairParams,
 ) (discovery.Result, error) {
 	preparePairIO(params)
+
+	if out := strings.TrimSpace(params.AddressOverride); out != "" &&
+		strings.TrimSpace(params.Fingerprint) != "" {
+		return discovery.Result{
+			Address:         discovery.NormalizeAddress(out, config.DefaultPort),
+			Instance:        "manual-host",
+			OS:              "",
+			HostFingerprint: strings.TrimSpace(params.Fingerprint),
+			PairingEnabled:  true,
+		}, nil
+	}
 
 	timeout := params.DiscoveryTimeout
 	if timeout <= 0 {

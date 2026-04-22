@@ -755,6 +755,104 @@ func TestRunInitCreatesConfigAndRequestsCodeFromSelectedHost(t *testing.T) {
 	}
 }
 
+func TestRunInitManualHostBypassesDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+	codeCh := make(chan string, 1)
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		AdvertiseName:    "manual-host",
+		DisableDiscovery: true,
+		Logger:           log.New(&pairCodeLogCapture{codes: codeCh}, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+
+	reader, writer := io.Pipe()
+	inputErrCh := startScriptedPairInput("y\n", codeCh, writer)
+
+	var stdout bytes.Buffer
+
+	result, err := RunInit(ctx, project, InitParams{
+		AddressOverride: addr,
+		Fingerprint:     server.Fingerprint(),
+		ClientLabel:     "manual-init-client",
+		Stdin:           reader,
+		Stdout:          &stdout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-inputErrCh; err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Host.Address != addr {
+		t.Fatalf("unexpected paired address: got %s want %s", result.Host.Address, addr)
+	}
+
+	if result.Host.Fingerprint != server.Fingerprint() {
+		t.Fatalf(
+			"unexpected paired fingerprint: got %s want %s",
+			result.Host.Fingerprint,
+			server.Fingerprint(),
+		)
+	}
+
+	loaded, err := config.ResolveRequired(project, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if loaded.Config.TLS.HostFingerprint != server.Fingerprint() {
+		t.Fatalf(
+			"unexpected config fingerprint: got %s want %s",
+			loaded.Config.TLS.HostFingerprint,
+			server.Fingerprint(),
+		)
+	}
+
+	output := stdout.String()
+	if strings.Contains(output, "Select host: ") {
+		t.Fatalf("did not expect discovery selection prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Trust host") {
+		t.Fatalf("expected trust prompt, got %q", output)
+	}
+
+	if !strings.Contains(output, "Enter code: ") {
+		t.Fatalf("expected code prompt, got %q", output)
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
 func TestRunInitFailsWhenConfigAlreadyExists(t *testing.T) {
 	project := t.TempDir()
 	writeTestFile(t, filepath.Join(project, ".rmtx.json"), `{"version":1}`)

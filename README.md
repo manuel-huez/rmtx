@@ -42,7 +42,7 @@ In your project on the client, initialize once:
 ./rmtx go test ./...
 ```
 
-`rmtx init` discovers available hosts, asks you to trust selected host fingerprint, writes `.rmtx.json`, then requests a one-time pairing code from that host and prompts you to enter it. After init, `rmtx pair` re-pairs an existing config. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.
+`rmtx init` discovers available hosts, asks you to trust selected host fingerprint, writes `.rmtx.json`, then requests a one-time pairing code from that host and prompts you to enter it. After init, `rmtx pair` re-pairs an existing config. If LAN discovery is blocked, run `rmtx host pair-code` on host to get fingerprint, then use `rmtx init --host 192.168.1.42:33221 --fingerprint sha256:...`. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.
 
 Generated `.rmtx.json` looks like:
 
@@ -79,6 +79,7 @@ rmtx context prune --older-than 168h
 
 - Context workspaces are persistent on the host, so repeated runs are faster.
 - Discovery uses UDP broadcast on port `33222`.
+- Windows host discovery may need firewall rule for inbound UDP `33222`.
 - Client state is stored in `~/.rmtx/state.json`.
 - Interactive TTY mode is supported on Linux hosts/clients.
 

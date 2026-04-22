@@ -289,6 +289,11 @@ func runInit(ctx context.Context, args []string) int {
 		"pairing code; omit to request one from selected host",
 		"path to create .rmtx.json",
 	)
+	fingerprint := fs.String(
+		"fingerprint",
+		"",
+		"expected host TLS fingerprint; required for manual init when discovery is unavailable",
+	)
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -299,6 +304,7 @@ func runInit(ctx context.Context, args []string) int {
 	}
 
 	params := pairLikeParams(common)
+	params.Fingerprint = *fingerprint
 	params.Stdin = os.Stdin
 	params.Stdout = os.Stdout
 
@@ -309,6 +315,7 @@ func runInit(ctx context.Context, args []string) int {
 		func(ctx context.Context, cwd string, params app.PairParams) (string, error) {
 			result, err := app.RunInit(ctx, cwd, app.InitParams{
 				AddressOverride:  params.AddressOverride,
+				Fingerprint:      params.Fingerprint,
 				ConfigPath:       params.ConfigPath,
 				DiscoveryTimeout: params.DiscoveryTimeout,
 				Code:             params.Code,
@@ -590,6 +597,7 @@ Usage:
 Examples:
   rmtx host --listen :33221
   rmtx init
+  rmtx init --host 192.168.1.42:33221 --fingerprint sha256:...
   rmtx pair
   rmtx host pair-code
   rmtx go test ./...
