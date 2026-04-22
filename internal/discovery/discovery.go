@@ -90,7 +90,12 @@ func (r *Responder) Close() error {
 	return r.conn.Close()
 }
 
-func (r *Responder) serve(ctx context.Context, service, instance string, port int, opts AdvertiseOptions) {
+func (r *Responder) serve(
+	ctx context.Context,
+	service, instance string,
+	port int,
+	opts AdvertiseOptions,
+) {
 	defer func() { _ = r.conn.Close() }()
 
 	go func() { <-ctx.Done(); _ = r.conn.Close() }()
@@ -131,27 +136,7 @@ func (r *Responder) serve(ctx context.Context, service, instance string, port in
 }
 
 func DiscoverOne(ctx context.Context, service string, timeout time.Duration) (Result, error) {
-	if timeout <= 0 {
-		timeout = discoveryTimeoutDefault
-	}
-
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return Result{}, fmt.Errorf("listen for discovery responses: %w", err)
-	}
-
-	defer func() { _ = conn.Close() }()
-
-	query, err := json.Marshal(packet{Type: "query", Service: service})
-	if err != nil {
-		return Result{}, err
-	}
-
-	for _, target := range broadcastTargets() {
-		_, _ = conn.WriteToUDP(query, target)
-	}
-
-	results, err := collectResponses(ctx, conn, service, timeout)
+	results, err := discoverResults(ctx, service, timeout)
 	if err != nil {
 		return Result{}, err
 	}
@@ -168,10 +153,28 @@ func DiscoverAll(ctx context.Context, service string, timeout time.Duration) ([]
 		timeout = discoveryTimeoutDefault
 	}
 
+	results, err := discoverResults(ctx, service, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return orderedResults(results), nil
+}
+
+func discoverResults(
+	ctx context.Context,
+	service string,
+	timeout time.Duration,
+) (map[string]Result, error) {
+	if timeout <= 0 {
+		timeout = discoveryTimeoutDefault
+	}
+
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("listen for discovery responses: %w", err)
 	}
+
 	defer func() { _ = conn.Close() }()
 
 	query, err := json.Marshal(packet{Type: "query", Service: service})
@@ -183,17 +186,18 @@ func DiscoverAll(ctx context.Context, service string, timeout time.Duration) ([]
 		_, _ = conn.WriteToUDP(query, target)
 	}
 
-	results, err := collectResponses(ctx, conn, service, timeout)
-	if err != nil {
-		return nil, err
-	}
+	return collectResponses(ctx, conn, service, timeout)
+}
 
+func orderedResults(results map[string]Result) []Result {
 	ordered := make([]Result, 0, len(results))
 	for _, r := range results {
 		ordered = append(ordered, r)
 	}
+
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Address < ordered[j].Address })
-	return ordered, nil
+
+	return ordered
 }
 
 func collectResponses(
@@ -265,12 +269,7 @@ func recordResponse(results map[string]Result, service string, raw []byte, addr 
 }
 
 func selectSingleResult(results map[string]Result) (Result, error) {
-	ordered := make([]Result, 0, len(results))
-	for _, r := range results {
-		ordered = append(ordered, r)
-	}
-
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Address < ordered[j].Address })
+	ordered := orderedResults(results)
 
 	if len(ordered) > 1 {
 		candidates := make([]string, 0, len(ordered))

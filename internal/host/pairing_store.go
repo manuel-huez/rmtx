@@ -19,6 +19,7 @@ const pairCodeDirMode = 0o755
 const pairCodeLockWait = 5 * time.Second
 const pairCodeLockPoll = 10 * time.Millisecond
 const pairCodeLockStaleAfter = 30 * time.Second
+const pairCodeSpace = 1_000_000
 
 var pairCodeStoreMu sync.Mutex
 
@@ -100,13 +101,16 @@ func CreatePairCode(stateDir string, ttl time.Duration) (pairCodeRecord, error) 
 	}
 
 	now := time.Now()
+
 	filtered := make([]pairCodeRecord, 0, len(store.Codes)+1)
 	for _, code := range store.Codes {
 		if code.Used || !code.ExpiresAt.After(now) {
 			continue
 		}
+
 		filtered = append(filtered, code)
 	}
+
 	store.Codes = filtered
 
 	code, err := randomPairCode()
@@ -156,6 +160,7 @@ func withPairCode(stateDir, code string, use func() error) error {
 	}
 
 	store.Codes[index].Used = true
+
 	return savePairCodeStore(stateDir, store)
 }
 
@@ -165,9 +170,11 @@ func validPairCodeIndex(store pairCodeStore, code string, now time.Time) (int, e
 		if store.Codes[i].Code != code {
 			continue
 		}
+
 		if store.Codes[i].Used {
 			return -1, errors.New("pairing code already used")
 		}
+
 		if !store.Codes[i].ExpiresAt.After(now) {
 			return -1, errors.New("pairing code expired")
 		}
@@ -184,6 +191,7 @@ func loadPairCodeStore(stateDir string) (pairCodeStore, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return pairCodeStore{}, nil
 		}
+
 		return pairCodeStore{}, fmt.Errorf("read pairing codes: %w", err)
 	}
 
@@ -205,7 +213,8 @@ func savePairCodeStore(stateDir string, store pairCodeStore) error {
 }
 
 func randomPairCode() (string, error) {
-	max := big.NewInt(1000000)
+	max := big.NewInt(pairCodeSpace)
+
 	n, err := rand.Int(rand.Reader, max)
 	if err != nil {
 		return "", fmt.Errorf("generate pairing code: %w", err)

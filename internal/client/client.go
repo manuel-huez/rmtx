@@ -83,7 +83,13 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 
-	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
+	conn, err := dialTLS(
+		ctx,
+		opts.Address,
+		opts.Host.Fingerprint,
+		opts.ClientCertPEM,
+		opts.ClientKeyPEM,
+	)
 	if err != nil {
 		return 1, err
 	}
@@ -257,8 +263,13 @@ func buildRunRequest(
 	return manifest, request, nil
 }
 
-func dialTLS(ctx context.Context, address, fingerprint string, clientCertPEM, clientKeyPEM []byte) (*protocol.Conn, error) {
+func dialTLS(
+	ctx context.Context,
+	address, fingerprint string,
+	clientCertPEM, clientKeyPEM []byte,
+) (*protocol.Conn, error) {
 	dialer := net.Dialer{}
+
 	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
 	if err != nil {
 		return nil, err

@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+//nolint:cyclop // Certificate rotation test builds custom PKI fixtures and validates post-rotation state.
 func TestEnsureHostPKIRotatesExpiredServerCertificate(t *testing.T) {
 	stateDir := t.TempDir()
 
@@ -22,10 +23,12 @@ func TestEnsureHostPKIRotatesExpiredServerCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	caKey, err := parsePrivateKeyPEM(pki.CAKeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	serverKey, err := parsePrivateKeyPEM(pki.ServerKeyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -35,6 +38,7 @@ func TestEnsureHostPKIRotatesExpiredServerCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	expiredDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -73,14 +77,17 @@ func TestEnsureHostPKIRotatesExpiredServerCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !cert.NotAfter.After(time.Now()) {
 		t.Fatalf("expected rotated server cert to be valid, got %s", cert.NotAfter)
 	}
+
 	if cert.NotAfter.Equal(time.Unix(0, 0)) {
 		t.Fatal("expected non-zero server cert expiry")
 	}
 }
 
+//nolint:cyclop // End-to-end PKI rotation check needs full certificate setup and verification chain.
 func TestHostIdentityFingerprintSurvivesServerCertificateRotation(t *testing.T) {
 	stateDir := t.TempDir()
 
@@ -98,10 +105,12 @@ func TestHostIdentityFingerprintSurvivesServerCertificateRotation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	caKey, err := parsePrivateKeyPEM(pki.CAKeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	serverKey, err := parsePrivateKeyPEM(pki.ServerKeyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -111,6 +120,7 @@ func TestHostIdentityFingerprintSurvivesServerCertificateRotation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	expiredDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -145,6 +155,7 @@ func TestHostIdentityFingerprintSurvivesServerCertificateRotation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if advertisedFingerprint != identityFingerprint {
 		t.Fatalf(
 			"expected stable host fingerprint, got %s want %s",
@@ -157,7 +168,11 @@ func TestHostIdentityFingerprintSurvivesServerCertificateRotation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clientTLS.VerifyPeerCertificate(serverTLS.Certificates[0].Certificate, nil); err != nil {
+
+	if err := clientTLS.VerifyPeerCertificate(
+		serverTLS.Certificates[0].Certificate,
+		nil,
+	); err != nil {
 		t.Fatalf("expected rotated server cert to verify with original host fingerprint: %v", err)
 	}
 }

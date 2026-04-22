@@ -31,9 +31,11 @@ func TestUpsertHostMatchesByFingerprint(t *testing.T) {
 	if record == nil {
 		t.Fatal("expected host record by fingerprint")
 	}
+
 	if record.Address != "10.0.0.2:33221" {
 		t.Fatalf("unexpected address: got %s", record.Address)
 	}
+
 	if record.Name != "new-name" {
 		t.Fatalf("unexpected name: got %s", record.Name)
 	}
@@ -61,9 +63,11 @@ func TestUpsertHostKeepsDistinctFingerprintAtSameAddress(t *testing.T) {
 	if len(loaded.Data.Hosts) != 2 {
 		t.Fatalf("expected 2 host records, got %d", len(loaded.Data.Hosts))
 	}
+
 	if loaded.FindHostByFingerprint("sha256:host-a") == nil {
 		t.Fatal("expected first host record to remain")
 	}
+
 	if loaded.FindHostByFingerprint("sha256:host-b") == nil {
 		t.Fatal("expected second host record to be added")
 	}

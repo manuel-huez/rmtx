@@ -10,6 +10,8 @@ import (
 	"github.com/manuel-huez/rmtx/internal/security"
 )
 
+const defaultHostName = "rmtx-host"
+
 type PairCodeInfo struct {
 	Code              string
 	ExpiresAt         time.Time
@@ -24,10 +26,11 @@ func CreatePairCodeInfo(stateDir string, ttl time.Duration) (PairCodeInfo, error
 		if home == "" {
 			home = "."
 		}
+
 		stateDir = filepath.Join(home, ".local", "state", "rmtx")
 	}
 
-	serverName := "rmtx-host"
+	serverName := defaultHostName
 	if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
 		serverName = hostName
 	}
@@ -36,6 +39,7 @@ func CreatePairCodeInfo(stateDir string, ttl time.Duration) (PairCodeInfo, error
 	if err != nil {
 		return PairCodeInfo{}, err
 	}
+
 	fingerprint, err := security.HostIdentityFingerprint(pki.CACertPEM)
 	if err != nil {
 		return PairCodeInfo{}, err

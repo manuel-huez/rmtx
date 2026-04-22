@@ -104,8 +104,13 @@ func TestLoadedContextIDUsesStableExplicitName(t *testing.T) {
 
 func TestLoadRejectsLegacyTokenFields(t *testing.T) {
 	root := t.TempDir()
+
 	path := filepath.Join(root, ".rmtx.json")
-	if err := os.WriteFile(path, []byte(`{"version":1,"token_env":"RMTX_TOKEN"}`), 0o644); err != nil {
+	if err := os.WriteFile(
+		path,
+		[]byte(`{"version":1,"token_env":"RMTX_TOKEN"}`),
+		0o644,
+	); err != nil {
 		t.Fatal(err)
 	}
 

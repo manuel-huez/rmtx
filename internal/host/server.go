@@ -62,26 +62,7 @@ type Server struct {
 }
 
 func New(opts Options) (*Server, error) {
-	if strings.TrimSpace(opts.ListenAddr) == "" {
-		opts.ListenAddr = ":33221"
-	}
-
-	if strings.TrimSpace(opts.StateDir) == "" {
-		home, _ := os.UserHomeDir()
-		if home == "" {
-			home = "."
-		}
-
-		opts.StateDir = filepath.Join(home, ".local", "state", "rmtx")
-	}
-
-	if strings.TrimSpace(opts.DiscoveryService) == "" {
-		opts.DiscoveryService = "rmtx"
-	}
-
-	if opts.Logger == nil {
-		opts.Logger = log.New(io.Discard, "", 0)
-	}
+	opts = withDefaultOptions(opts)
 
 	if err := os.MkdirAll(opts.StateDir, defaultDirMode); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
@@ -130,6 +111,35 @@ func New(opts Options) (*Server, error) {
 	}, nil
 }
 
+func withDefaultOptions(opts Options) Options {
+	if strings.TrimSpace(opts.ListenAddr) == "" {
+		opts.ListenAddr = ":33221"
+	}
+
+	if strings.TrimSpace(opts.StateDir) == "" {
+		opts.StateDir = defaultStateDir()
+	}
+
+	if strings.TrimSpace(opts.DiscoveryService) == "" {
+		opts.DiscoveryService = "rmtx"
+	}
+
+	if opts.Logger == nil {
+		opts.Logger = log.New(io.Discard, "", 0)
+	}
+
+	return opts
+}
+
+func defaultStateDir() string {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = "."
+	}
+
+	return filepath.Join(home, ".local", "state", "rmtx")
+}
+
 func (s *Server) Addr() string {
 	s.listenerMu.RLock()
 	defer s.listenerMu.RUnlock()
@@ -150,6 +160,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.opts.ListenAddr, err)
 	}
+
 	ln := tls.NewListener(base, s.tlsConfig)
 
 	defer func() { _ = ln.Close() }()
@@ -157,6 +168,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
+
 	defer func() {
 		s.listenerMu.Lock()
 		if s.listener == ln {
@@ -164,6 +176,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		s.listenerMu.Unlock()
 	}()
+
 	s.logger.Printf("listening on %s", ln.Addr().String())
 
 	if !s.opts.DisableDiscovery {
@@ -280,8 +293,7 @@ func (s *Server) dispatchSessionRequest(
 	conn *protocol.Conn,
 	head protocol.Header,
 ) error {
-	switch head.Type {
-	case protocol.MsgPairRequest:
+	if head.Type == protocol.MsgPairRequest {
 		return s.dispatchPairRequest(conn, head)
 	}
 
@@ -544,10 +556,12 @@ func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, e
 
 	clientCert := state.PeerCertificates[0]
 	fingerprint := security.FingerprintCert(clientCert)
+
 	trusted, err := s.clientTrusted(fingerprint)
 	if err != nil {
 		return nil, err
 	}
+
 	if !trusted {
 		return nil, errors.New("client certificate not trusted; run `rmtx pair`")
 	}
@@ -570,6 +584,7 @@ func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest
 		if err != nil {
 			return err
 		}
+
 		if err := s.trustClient(fingerprint, req.PreviousFingerprint, req.ClientLabel); err != nil {
 			return err
 		}

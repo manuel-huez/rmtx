@@ -252,6 +252,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	}
 }
 
+//nolint:cyclop // Integration test exercises multi-host setup, pairing, verification, and shutdown.
 func TestRunPairSupportsMultipleHosts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -271,6 +272,7 @@ func TestRunPairSupportsMultipleHosts(t *testing.T) {
 		t.Helper()
 
 		stateDir := t.TempDir()
+
 		server, err := host.New(host.Options{
 			ListenAddr:       "127.0.0.1:0",
 			StateDir:         stateDir,
@@ -282,10 +284,12 @@ func TestRunPairSupportsMultipleHosts(t *testing.T) {
 		}
 
 		errCh := make(chan error, 1)
+
 		go func() { errCh <- server.Serve(ctx) }()
 
 		project := t.TempDir()
 		configPath := filepath.Join(project, ".rmtx.json")
+
 		configContent := `{
   "version": 1,
   "host": "` + waitForAddr(t, server) + `",
@@ -344,6 +348,7 @@ func TestRunPairSupportsMultipleHosts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s ping failed after pairing both hosts: %v", tc.name, err)
 		}
+
 		if !ping.Online {
 			t.Fatalf("%s expected online ping", tc.name)
 		}
@@ -377,6 +382,7 @@ func TestRunPairUsesConfiguredHostWhenDiscoveryDisabled(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	stateDir := t.TempDir()
+
 	server, err := host.New(host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
@@ -387,11 +393,13 @@ func TestRunPairUsesConfiguredHostWhenDiscoveryDisabled(t *testing.T) {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() { errCh <- server.Serve(ctx) }()
 
 	addr := waitForAddr(t, server)
 	project := t.TempDir()
 	configPath := filepath.Join(project, ".rmtx.json")
+
 	configContent := `{
   "version": 1,
   "host": "` + addr + `",
@@ -416,11 +424,13 @@ func TestRunPairUsesConfiguredHostWhenDiscoveryDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if record.Address != addr {
 		t.Fatalf("unexpected paired address: got %s want %s", record.Address, addr)
 	}
 
 	cancel()
+
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -439,6 +449,7 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	stateDir := t.TempDir()
+
 	server, err := host.New(host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
@@ -449,9 +460,11 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() { errCh <- server.Serve(ctx) }()
 
 	addr := waitForAddr(t, server)
+
 	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
 	if err != nil {
 		t.Fatal(err)
@@ -466,11 +479,17 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if record.Fingerprint != server.Fingerprint() {
-		t.Fatalf("unexpected paired fingerprint: got %s want %s", record.Fingerprint, server.Fingerprint())
+		t.Fatalf(
+			"unexpected paired fingerprint: got %s want %s",
+			record.Fingerprint,
+			server.Fingerprint(),
+		)
 	}
 
 	cancel()
+
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -482,10 +501,14 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 }
 
 func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
-	result, err := resolvePairTarget(context.Background(), config.WithDefaults(config.Default()), PairParams{
-		AddressOverride: "192.168.1.42",
-		Fingerprint:     "sha256:expected",
-	})
+	result, err := resolvePairTarget(
+		context.Background(),
+		config.WithDefaults(config.Default()),
+		PairParams{
+			AddressOverride: "192.168.1.42",
+			Fingerprint:     "sha256:expected",
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,33 +516,41 @@ func TestResolvePairTargetManualHostKeepsExplicitFingerprint(t *testing.T) {
 	if result.Address != "192.168.1.42:33221" {
 		t.Fatalf("unexpected address: got %s", result.Address)
 	}
+
 	if result.HostFingerprint != "sha256:expected" {
 		t.Fatalf("unexpected fingerprint: got %s", result.HostFingerprint)
 	}
 }
 
 func TestResolvePairTargetRequiresPinnedFingerprint(t *testing.T) {
-	_, err := resolvePairTarget(context.Background(), config.WithDefaults(config.Default()), PairParams{
-		AddressOverride: "192.168.1.42",
-	})
+	_, err := resolvePairTarget(
+		context.Background(),
+		config.WithDefaults(config.Default()),
+		PairParams{
+			AddressOverride: "192.168.1.42",
+		},
+	)
 	if err == nil {
 		t.Fatal("expected missing fingerprint error")
 	}
+
 	if !strings.Contains(err.Error(), "host fingerprint is required for pairing") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
+const hostBAddress = "10.0.0.2:33221"
+
 func TestSelectDiscoveredHostFiltersPinnedFingerprintBeforeMultipleHostError(t *testing.T) {
 	result, err := selectDiscoveredHost([]discovery.Result{
 		{Address: "10.0.0.1:33221", HostFingerprint: "sha256:host-a"},
-		{Address: "10.0.0.2:33221", HostFingerprint: "sha256:host-b"},
+		{Address: hostBAddress, HostFingerprint: "sha256:host-b"},
 	}, "sha256:host-b", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if result.Address != "10.0.0.2:33221" {
+	if result.Address != hostBAddress {
 		t.Fatalf("unexpected selected host: got %s", result.Address)
 	}
 }
@@ -527,13 +558,13 @@ func TestSelectDiscoveredHostFiltersPinnedFingerprintBeforeMultipleHostError(t *
 func TestSelectDiscoveredHostPrefersKnownAddressForPinnedFingerprint(t *testing.T) {
 	result, err := selectDiscoveredHost([]discovery.Result{
 		{Address: "10.0.0.1:33221", HostFingerprint: "sha256:host"},
-		{Address: "10.0.0.2:33221", HostFingerprint: "sha256:host"},
-	}, "sha256:host", "10.0.0.2:33221")
+		{Address: hostBAddress, HostFingerprint: "sha256:host"},
+	}, "sha256:host", hostBAddress)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if result.Address != "10.0.0.2:33221" {
+	if result.Address != hostBAddress {
 		t.Fatalf("unexpected preferred host: got %s", result.Address)
 	}
 }
@@ -546,6 +577,7 @@ func TestResolveClientHostUsesFingerprintWhenAddressChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	state.UpsertHost(clientstate.HostRecord{
 		Address:       "10.0.0.1:33221",
 		Name:          "test-host",
@@ -554,6 +586,7 @@ func TestResolveClientHostUsesFingerprintWhenAddressChanges(t *testing.T) {
 		ClientCertPEM: "cert",
 		ClientKeyPEM:  "key",
 	})
+
 	if err := state.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -562,9 +595,11 @@ func TestResolveClientHostUsesFingerprintWhenAddressChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if loaded == nil || record == nil {
 		t.Fatal("expected paired host to resolve by fingerprint")
 	}
+
 	if record.Address != "10.0.0.2:33221" {
 		t.Fatalf("unexpected updated address: got %s", record.Address)
 	}
@@ -573,6 +608,7 @@ func TestResolveClientHostUsesFingerprintWhenAddressChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if reloaded.FindHostByAddress("10.0.0.2:33221") == nil {
 		t.Fatal("expected state to persist updated address")
 	}
@@ -586,6 +622,7 @@ func TestResolveClientHostSkipsOccupiedAddressToAvoidDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	state.UpsertHost(clientstate.HostRecord{
 		Address:       "10.0.0.1:33221",
 		Name:          "moving-host",
@@ -602,6 +639,7 @@ func TestResolveClientHostSkipsOccupiedAddressToAvoidDuplicates(t *testing.T) {
 		ClientCertPEM: "cert-b",
 		ClientKeyPEM:  "key-b",
 	})
+
 	if err := state.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -610,11 +648,16 @@ func TestResolveClientHostSkipsOccupiedAddressToAvoidDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if record == nil {
 		t.Fatal("expected host record to resolve by fingerprint")
 	}
+
 	if record.Address != "10.0.0.1:33221" {
-		t.Fatalf("expected existing address to remain when target is occupied, got %s", record.Address)
+		t.Fatalf(
+			"expected existing address to remain when target is occupied, got %s",
+			record.Address,
+		)
 	}
 
 	reloaded, err := clientstate.Load()
@@ -623,11 +666,13 @@ func TestResolveClientHostSkipsOccupiedAddressToAvoidDuplicates(t *testing.T) {
 	}
 
 	occupiedCount := 0
+
 	for _, host := range reloaded.Data.Hosts {
 		if host.Address == "10.0.0.2:33221" {
 			occupiedCount++
 		}
 	}
+
 	if occupiedCount != 1 {
 		t.Fatalf("expected one host to keep occupied address, got %d", occupiedCount)
 	}

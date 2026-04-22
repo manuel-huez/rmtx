@@ -22,6 +22,7 @@ import (
 const exitUsage = 2
 const tabWriterTabWidth = 8
 const tabWriterPadding = 2
+const defaultPairCodeTTL = 5 * time.Minute
 
 type remoteFlags struct {
 	hostAddr         *string
@@ -117,7 +118,8 @@ func runHostPairCode(args []string) int {
 	fs := flag.NewFlagSet("rmtx host pair-code", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	stateDir := fs.String("state-dir", "", "state directory for host data")
-	ttl := fs.Duration("ttl", 5*time.Minute, "pairing code ttl")
+
+	ttl := fs.Duration("ttl", defaultPairCodeTTL, "pairing code ttl")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -136,6 +138,7 @@ func runHostPairCode(args []string) int {
 		info.HostFingerprint,
 		info.ExpiresAt.Format(time.RFC3339),
 	)
+
 	return 0
 }
 
@@ -229,6 +232,7 @@ func runPair(ctx context.Context, args []string) int {
 	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
 	code := fs.String("code", "", "pairing code")
 	label := fs.String("label", "", "client label")
+
 	selectIndex := fs.Int("select", 0, "discovered host index")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -261,7 +265,14 @@ func runPair(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(os.Stdout, "paired\t%s\t%s\t%s\n", record.Name, record.Address, record.Fingerprint)
+	_, _ = fmt.Fprintf(
+		os.Stdout,
+		"paired\t%s\t%s\t%s\n",
+		record.Name,
+		record.Address,
+		record.Fingerprint,
+	)
+
 	return 0
 }
 

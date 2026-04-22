@@ -128,9 +128,13 @@ func Load(path string) (*Loaded, error) {
 	if err := json.Unmarshal(content, &raw); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+
 	for _, field := range []string{"token", "token_env"} {
 		if _, ok := raw[field]; ok {
-			return nil, fmt.Errorf("config field %q is unsupported; use `rmtx pair` and tls.host_fingerprint", field)
+			return nil, fmt.Errorf(
+				"config field %q is unsupported; use `rmtx pair` and tls.host_fingerprint",
+				field,
+			)
 		}
 	}
 

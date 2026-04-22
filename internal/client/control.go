@@ -7,7 +7,13 @@ import (
 )
 
 func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
-	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
+	conn, err := dialTLS(
+		ctx,
+		opts.Address,
+		opts.Host.Fingerprint,
+		opts.ClientCertPEM,
+		opts.ClientKeyPEM,
+	)
 	if err != nil {
 		return PingInfo{}, err
 	}
@@ -21,7 +27,13 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 }
 
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
-	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, opts.ClientCertPEM, opts.ClientKeyPEM)
+	conn, err := dialTLS(
+		ctx,
+		opts.Address,
+		opts.Host.Fingerprint,
+		opts.ClientCertPEM,
+		opts.ClientKeyPEM,
+	)
 	if err != nil {
 		return nil, err
 	}

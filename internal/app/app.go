@@ -87,6 +87,7 @@ type PairParams struct {
 	Stdout           io.Writer
 }
 
+//nolint:cyclop // Command bootstrap mixes config, pairing, tty, and mount checks in one orchestration path.
 func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 	loaded, err := config.ResolveRequired(cwd, params.ConfigPath)
 	if err != nil {
@@ -108,12 +109,21 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 	if hostRecord == nil || !hostRecord.Paired {
 		return 1, errors.New("host not paired; run `rmtx pair`")
 	}
+
 	clientCertPEM, clientKeyPEM := state.HostCredentials(target.Address, hostRecord.Fingerprint)
 	if strings.TrimSpace(clientCertPEM) == "" || strings.TrimSpace(clientKeyPEM) == "" {
 		return 1, errors.New("client identity missing; run `rmtx pair`")
 	}
-	if pinned := strings.TrimSpace(cfg.TLS.HostFingerprint); pinned != "" && pinned != hostRecord.Fingerprint {
-		return 1, fmt.Errorf("configured host fingerprint %s does not match paired host %s", pinned, hostRecord.Fingerprint)
+
+	if pinned := strings.TrimSpace(
+		cfg.TLS.HostFingerprint,
+	); pinned != "" &&
+		pinned != hostRecord.Fingerprint {
+		return 1, fmt.Errorf(
+			"configured host fingerprint %s does not match paired host %s",
+			pinned,
+			hostRecord.Fingerprint,
+		)
 	}
 
 	useTTY, err := resolveTTY(params)
@@ -165,6 +175,7 @@ func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingI
 	if err != nil {
 		return client.PingInfo{}, err
 	}
+
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 
 	return client.Ping(ctx, client.RemoteOptions{
@@ -189,6 +200,7 @@ func RunListContexts(
 	if err != nil {
 		return nil, err
 	}
+
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 
 	return client.ListContexts(ctx, client.RemoteOptions{
@@ -239,6 +251,7 @@ func RunDeleteContexts(
 	if err != nil {
 		return client.DeleteContextsResult{}, err
 	}
+
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 	req.Remote.ClientCertPEM = []byte(clientCertPEM)
 	req.Remote.ClientKeyPEM = []byte(clientKeyPEM)
@@ -270,13 +283,16 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 	return host.CreatePairCodeInfo(params.StateDir, params.TTL)
 }
 
+//nolint:cyclop // Pairing flow coordinates config lookup, identity reuse, CSR generation, and state persistence.
 func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.HostRecord, error) {
 	cfg := config.WithDefaults(config.Default())
+
 	if strings.TrimSpace(params.ConfigPath) != "" {
 		loaded, err := config.Load(params.ConfigPath)
 		if err != nil {
 			return clientstate.HostRecord{}, err
 		}
+
 		cfg = config.WithDefaults(loaded.Config)
 	} else if loaded, err := config.Search(cwd); err == nil {
 		cfg = config.WithDefaults(loaded.Config)
@@ -293,9 +309,11 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 	if err != nil {
 		return clientstate.HostRecord{}, err
 	}
+
 	if strings.TrimSpace(state.Data.ClientLabel) == "" {
 		state.Data.ClientLabel = clientstate.DefaultClientLabel()
 	}
+
 	label := strings.TrimSpace(params.ClientLabel)
 	if label == "" {
 		label = state.Data.ClientLabel
@@ -305,16 +323,18 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 	if existing == nil {
 		existing = state.FindHostByAddress(result.Address)
 	}
-	clientCertPEM := []byte("")
+
 	clientKeyPEM := []byte("")
+
 	if existing != nil {
-		clientCertPEM = []byte(existing.ClientCertPEM)
 		clientKeyPEM = []byte(existing.ClientKeyPEM)
 	}
+
 	if len(clientKeyPEM) == 0 {
 		_, key := state.HostCredentials(result.Address, result.HostFingerprint)
 		clientKeyPEM = []byte(key)
 	}
+
 	previousFingerprint := ""
 	if existing != nil {
 		previousFingerprint = strings.TrimSpace(existing.LastPairedCert)
@@ -324,19 +344,22 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 			}
 		}
 	}
+
 	var csrPEM []byte
+
 	if len(clientKeyPEM) == 0 {
 		var err error
-		clientCertPEM, clientKeyPEM, csrPEM, err = client.GenerateClientIdentity(label)
+
+		_, clientKeyPEM, csrPEM, err = client.GenerateClientIdentity(label)
 		if err != nil {
 			return clientstate.HostRecord{}, err
 		}
-		_ = clientCertPEM
 	} else {
 		csr, err := client.GenerateCSR(clientKeyPEM, label)
 		if err != nil {
 			return clientstate.HostRecord{}, err
 		}
+
 		csrPEM = csr
 	}
 
@@ -369,6 +392,7 @@ func RunPair(ctx context.Context, cwd string, params PairParams) (clientstate.Ho
 		ClientKeyPEM:   string(clientKeyPEM),
 	}
 	state.UpsertHost(record)
+
 	if err := state.Save(); err != nil {
 		return clientstate.HostRecord{}, err
 	}
@@ -412,6 +436,7 @@ func resolveTTY(params ExecParams) (bool, error) {
 	return false, fmt.Errorf("unsupported tty mode %q", params.TTYMode)
 }
 
+//nolint:cyclop // Remote resolution joins optional config lookup with paired-state validation.
 func resolveRemoteTarget(
 	ctx context.Context,
 	cwd string,
@@ -464,7 +489,10 @@ func resolveRemoteTarget(
 		return "", nil, loaded, errors.New("client identity missing; run `rmtx pair`")
 	}
 
-	if pinned := strings.TrimSpace(cfg.TLS.HostFingerprint); pinned != "" && pinned != hostRecord.Fingerprint {
+	if pinned := strings.TrimSpace(
+		cfg.TLS.HostFingerprint,
+	); pinned != "" &&
+		pinned != hostRecord.Fingerprint {
 		return "", nil, loaded, fmt.Errorf(
 			"configured host fingerprint %s does not match paired host %s",
 			pinned,
@@ -475,25 +503,12 @@ func resolveRemoteTarget(
 	return target.Address, hostRecord, loaded, nil
 }
 
-func resolveHost(
-	ctx context.Context,
-	cfg config.Config,
-	override string,
-	timeout time.Duration,
-) (string, error) {
-	target, err := resolveRemoteHost(ctx, cfg, override, timeout)
-	if err != nil {
-		return "", err
-	}
-
-	return target.Address, nil
-}
-
 type resolvedRemoteHost struct {
 	Address     string
 	Fingerprint string
 }
 
+//nolint:cyclop,nestif // Resolution order is policy-driven: override, env, config, then discovery variants.
 func resolveRemoteHost(
 	ctx context.Context,
 	cfg config.Config,
@@ -533,36 +548,7 @@ func resolveRemoteHost(
 	}
 
 	if pinnedFingerprint != "" {
-		results, err := discovery.DiscoverAll(ctx, cfg.Discovery.Service, d)
-		if err != nil {
-			return resolvedRemoteHost{}, err
-		}
-		if len(results) == 0 {
-			return resolvedRemoteHost{}, fmt.Errorf(
-				"no host discovered via %s within %s",
-				cfg.Discovery.Service,
-				d,
-			)
-		}
-
-		preferredAddress := ""
-		state, err := clientstate.Load()
-		if err != nil {
-			return resolvedRemoteHost{}, err
-		}
-		if record := state.FindHostByFingerprint(pinnedFingerprint); record != nil {
-			preferredAddress = strings.TrimSpace(record.Address)
-		}
-
-		result, err := selectDiscoveredHost(results, pinnedFingerprint, preferredAddress)
-		if err != nil {
-			return resolvedRemoteHost{}, err
-		}
-
-		return resolvedRemoteHost{
-			Address:     result.Address,
-			Fingerprint: strings.TrimSpace(result.HostFingerprint),
-		}, nil
+		return discoverPinnedRemoteHost(ctx, cfg, d, pinnedFingerprint)
 	}
 
 	result, err := discovery.DiscoverOne(ctx, cfg.Discovery.Service, d)
@@ -574,6 +560,55 @@ func resolveRemoteHost(
 		Address:     result.Address,
 		Fingerprint: strings.TrimSpace(result.HostFingerprint),
 	}, nil
+}
+
+func discoverPinnedRemoteHost(
+	ctx context.Context,
+	cfg config.Config,
+	timeout time.Duration,
+	pinnedFingerprint string,
+) (resolvedRemoteHost, error) {
+	results, err := discovery.DiscoverAll(ctx, cfg.Discovery.Service, timeout)
+	if err != nil {
+		return resolvedRemoteHost{}, err
+	}
+
+	if len(results) == 0 {
+		return resolvedRemoteHost{}, fmt.Errorf(
+			"no host discovered via %s within %s",
+			cfg.Discovery.Service,
+			timeout,
+		)
+	}
+
+	preferredAddress, err := preferredAddressForFingerprint(pinnedFingerprint)
+	if err != nil {
+		return resolvedRemoteHost{}, err
+	}
+
+	result, err := selectDiscoveredHost(results, pinnedFingerprint, preferredAddress)
+	if err != nil {
+		return resolvedRemoteHost{}, err
+	}
+
+	return resolvedRemoteHost{
+		Address:     result.Address,
+		Fingerprint: strings.TrimSpace(result.HostFingerprint),
+	}, nil
+}
+
+func preferredAddressForFingerprint(fingerprint string) (string, error) {
+	state, err := clientstate.Load()
+	if err != nil {
+		return "", err
+	}
+
+	record := state.FindHostByFingerprint(fingerprint)
+	if record == nil {
+		return "", nil
+	}
+
+	return strings.TrimSpace(record.Address), nil
 }
 
 func selectDiscoveredHost(
@@ -589,6 +624,7 @@ func selectDiscoveredHost(
 				filtered = append(filtered, result)
 			}
 		}
+
 		if len(filtered) == 0 {
 			return discovery.Result{}, fmt.Errorf(
 				"no discovered host matched fingerprint %s",
@@ -611,13 +647,19 @@ func selectDiscoveredHost(
 		for _, result := range filtered {
 			candidates = append(candidates, result.Address)
 		}
-		return discovery.Result{}, fmt.Errorf("multiple hosts discovered: %s", strings.Join(candidates, ", "))
+
+		return discovery.Result{}, fmt.Errorf(
+			"multiple hosts discovered: %s",
+			strings.Join(candidates, ", "),
+		)
 	}
 
 	return filtered[0], nil
 }
 
-func resolveClientHost(address, fingerprint string) (*clientstate.Loaded, *clientstate.HostRecord, error) {
+func resolveClientHost(
+	address, fingerprint string,
+) (*clientstate.Loaded, *clientstate.HostRecord, error) {
 	state, err := clientstate.Load()
 	if err != nil {
 		return nil, nil, err
@@ -629,8 +671,10 @@ func resolveClientHost(address, fingerprint string) (*clientstate.Loaded, *clien
 			if err := state.Save(); err != nil {
 				return nil, nil, err
 			}
+
 			record = state.FindHostByFingerprint(fingerprint)
 		}
+
 		return state, record, nil
 	}
 
@@ -642,6 +686,7 @@ func resolveClientHost(address, fingerprint string) (*clientstate.Loaded, *clien
 	return state, record, nil
 }
 
+//nolint:cyclop // Pair target resolution supports manual, configured, discovery, and interactive selection flows.
 func resolvePairTarget(
 	ctx context.Context,
 	cfg config.Config,
@@ -651,6 +696,7 @@ func resolvePairTarget(
 	if fingerprint == "" {
 		fingerprint = strings.TrimSpace(cfg.TLS.HostFingerprint)
 	}
+
 	if fingerprint == "" {
 		return discovery.Result{}, errors.New(
 			"host fingerprint is required for pairing; use config tls.host_fingerprint or --fingerprint",
@@ -686,6 +732,7 @@ func resolvePairTarget(
 	if err != nil {
 		return discovery.Result{}, err
 	}
+
 	if len(results) == 0 {
 		return discovery.Result{}, errors.New("no host discovered")
 	}
@@ -696,9 +743,14 @@ func resolvePairTarget(
 			filtered = append(filtered, result)
 		}
 	}
+
 	if len(filtered) == 0 {
-		return discovery.Result{}, fmt.Errorf("no discovered host matched fingerprint %s", fingerprint)
+		return discovery.Result{}, fmt.Errorf(
+			"no discovered host matched fingerprint %s",
+			fingerprint,
+		)
 	}
+
 	results = filtered
 	if len(results) == 1 {
 		return results[0], nil
@@ -709,9 +761,11 @@ func resolvePairTarget(
 		if params.Stdout == nil {
 			params.Stdout = os.Stdout
 		}
+
 		if params.Stdin == nil {
 			params.Stdin = os.Stdin
 		}
+
 		for i, result := range results {
 			_, _ = fmt.Fprintf(
 				params.Stdout,
@@ -723,17 +777,21 @@ func resolvePairTarget(
 				result.HostFingerprint,
 			)
 		}
+
 		_, _ = fmt.Fprint(params.Stdout, "Select host: ")
 		reader := bufio.NewReader(params.Stdin)
+
 		line, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return discovery.Result{}, fmt.Errorf("read host selection: %w", err)
 		}
+
 		_, err = fmt.Sscanf(strings.TrimSpace(line), "%d", &index)
 		if err != nil {
 			return discovery.Result{}, errors.New("invalid host selection")
 		}
 	}
+
 	if index < 1 || index > len(results) {
 		return discovery.Result{}, fmt.Errorf("host selection %d out of range", index)
 	}
@@ -745,5 +803,6 @@ func empty(value, fallback string) string {
 	if strings.TrimSpace(value) != "" {
 		return strings.TrimSpace(value)
 	}
+
 	return fallback
 }

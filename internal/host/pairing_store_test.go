@@ -25,13 +25,17 @@ func TestConsumePairCodeAllowsSingleWinner(t *testing.T) {
 
 	results := make(chan error, 2)
 	start := make(chan struct{})
+
 	var wg sync.WaitGroup
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			<-start
+
 			results <- ConsumePairCode(stateDir, record.Code)
 		}()
 	}
@@ -42,16 +46,22 @@ func TestConsumePairCodeAllowsSingleWinner(t *testing.T) {
 
 	successes := 0
 	failures := 0
+
 	for err := range results {
 		if err == nil {
 			successes++
 			continue
 		}
+
 		failures++
 	}
 
 	if successes != 1 || failures != 1 {
-		t.Fatalf("expected exactly one successful consume, got %d success and %d failure", successes, failures)
+		t.Fatalf(
+			"expected exactly one successful consume, got %d success and %d failure",
+			successes,
+			failures,
+		)
 	}
 }
 
@@ -59,6 +69,7 @@ func TestTrustClientPreservesConcurrentPairings(t *testing.T) {
 	server := &Server{opts: Options{StateDir: t.TempDir()}}
 
 	start := make(chan struct{})
+
 	var wg sync.WaitGroup
 	for _, tc := range []struct {
 		fingerprint string
@@ -68,9 +79,12 @@ func TestTrustClientPreservesConcurrentPairings(t *testing.T) {
 		{fingerprint: "sha256:222", label: "client-b"},
 	} {
 		wg.Add(1)
+
 		go func(fingerprint, label string) {
 			defer wg.Done()
+
 			<-start
+
 			if err := server.trustClient(fingerprint, "", label); err != nil {
 				t.Errorf("trustClient(%s): %v", fingerprint, err)
 			}
@@ -84,6 +98,7 @@ func TestTrustClientPreservesConcurrentPairings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(store.Clients) != 2 {
 		t.Fatalf("expected 2 trusted clients, got %#v", store.Clients)
 	}
@@ -95,6 +110,7 @@ func TestTrustClientReplacesPreviousFingerprint(t *testing.T) {
 	if err := server.trustClient("sha256:old", "", "client-a"); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := server.trustClient("sha256:new", "sha256:old", "client-a"); err != nil {
 		t.Fatal(err)
 	}
@@ -103,9 +119,11 @@ func TestTrustClientReplacesPreviousFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(store.Clients) != 1 {
 		t.Fatalf("expected one trusted client after rotation, got %#v", store.Clients)
 	}
+
 	if store.Clients[0].Fingerprint != "sha256:new" {
 		t.Fatalf("unexpected trusted fingerprint: got %s", store.Clients[0].Fingerprint)
 	}
@@ -132,6 +150,7 @@ func TestHandlePairRequestKeepsCodeOnValidationFailure(t *testing.T) {
 
 func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 	stateDir := t.TempDir()
+
 	server, err := New(Options{StateDir: stateDir})
 	if err != nil {
 		t.Fatal(err)
@@ -149,6 +168,7 @@ func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 
 	serverConn, clientConn := net.Pipe()
 	_ = clientConn.Close()
+
 	defer func() { _ = serverConn.Close() }()
 
 	err = server.handlePairRequest(protocol.NewConn(serverConn), protocol.PairRequest{
@@ -179,6 +199,7 @@ func TestCreatePairCodeStoresCodesPrivately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := info.Mode().Perm(); got != pairCodeFileMode {
 		t.Fatalf("unexpected permissions: got %#o want %#o", got, pairCodeFileMode)
 	}
@@ -194,6 +215,7 @@ func TestPairCodeStoreLockBlocksOtherProcesses(t *testing.T) {
 	}
 
 	released := false
+
 	defer func() {
 		if !released {
 			release()
@@ -201,9 +223,12 @@ func TestPairCodeStoreLockBlocksOtherProcesses(t *testing.T) {
 	}()
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestPairCodeStoreLockHelperProcess")
+
 	var output bytes.Buffer
+
 	cmd.Stdout = &output
 	cmd.Stderr = &output
+
 	cmd.Env = append(
 		os.Environ(),
 		"RMTX_PAIRCODE_HELPER=1",
@@ -222,10 +247,12 @@ func TestPairCodeStoreLockBlocksOtherProcesses(t *testing.T) {
 		} else if !os.IsNotExist(err) {
 			t.Fatalf("stat signal file: %v", err)
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	release()
+
 	released = true
 
 	if err := cmd.Wait(); err != nil {
@@ -248,7 +275,11 @@ func TestPairCodeStoreLockHelperProcess(t *testing.T) {
 	}
 	defer release()
 
-	if err := os.WriteFile(os.Getenv("RMTX_PAIRCODE_SIGNAL"), []byte("acquired\n"), 0o644); err != nil {
+	if err := os.WriteFile(
+		os.Getenv("RMTX_PAIRCODE_SIGNAL"),
+		[]byte("acquired\n"),
+		0o644,
+	); err != nil {
 		t.Fatalf("write signal: %v", err)
 	}
 }
