@@ -5,6 +5,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
@@ -22,6 +23,20 @@ func TestIsDisconnectErrorRecognizesTypedNetworkCloseErrors(t *testing.T) {
 
 	if isDisconnectError(errors.New("apply non-file entries failed")) {
 		t.Fatal("non-disconnect error should not match")
+	}
+}
+
+func TestIsExpectedSessionDisconnectOnlyMatchesControlRequests(t *testing.T) {
+	if !isExpectedSessionDisconnect(protocol.MsgListContextsRequest, syscall.ECONNRESET) {
+		t.Fatal("context list disconnect should be expected")
+	}
+
+	if isExpectedSessionDisconnect(protocol.MsgRunRequest, syscall.ECONNRESET) {
+		t.Fatal("run disconnect should still be reported")
+	}
+
+	if isExpectedSessionDisconnect(protocol.MsgListContextsRequest, errors.New("handler failed")) {
+		t.Fatal("non-disconnect control error should still be reported")
 	}
 }
 

@@ -255,12 +255,6 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 
 	conn := protocol.NewConn(raw)
 	if err := s.handleConnSession(parent, conn); err != nil {
-		if isDisconnectError(err) {
-			s.logger.Printf("request disconnected: remote=%s error=%v", raw.RemoteAddr(), err)
-
-			return
-		}
-
 		s.logger.Printf("request failed: remote=%s error=%v", raw.RemoteAddr(), err)
 		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
@@ -285,7 +279,30 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 
 	s.logger.Printf("request received: remote=%s type=%s", conn.Raw().RemoteAddr(), head.Type)
 
-	return s.dispatchSessionRequest(parent, conn, head)
+	if err := s.dispatchSessionRequest(parent, conn, head); err != nil {
+		if isExpectedSessionDisconnect(head.Type, err) {
+			return nil
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func isExpectedSessionDisconnect(msgType string, err error) bool {
+	if !isDisconnectError(err) {
+		return false
+	}
+
+	switch msgType {
+	case protocol.MsgPingRequest,
+		protocol.MsgListContextsRequest,
+		protocol.MsgDeleteContextsRequest:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleRunRequest(
