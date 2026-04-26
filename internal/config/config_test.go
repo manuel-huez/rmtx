@@ -16,7 +16,7 @@ func TestSearchFindsParentConfig(t *testing.T) {
 	}
 
 	content := []byte(
-		`{"version":1,"host":"10.0.0.42:33221","mounts":[{"path":"."}],"env":{"forward":["GOENV"]}}`,
+		`{"version":1,"host":"10.0.0.42:33221","mounts":[{"path":"."}],"ignore":["node_modules/**"],"env":{"forward":["GOENV"]}}`,
 	)
 	if err := os.WriteFile(filepath.Join(root, ".rmtx.json"), content, 0o644); err != nil {
 		t.Fatal(err)
@@ -37,6 +37,10 @@ func TestSearchFindsParentConfig(t *testing.T) {
 
 	if got := loaded.Config.Host; got != "10.0.0.42:33221" {
 		t.Fatalf("host mismatch: %s", got)
+	}
+
+	if len(loaded.Config.Ignore) != 1 || loaded.Config.Ignore[0] != "node_modules/**" {
+		t.Fatalf("unexpected ignore patterns: %#v", loaded.Config.Ignore)
 	}
 }
 

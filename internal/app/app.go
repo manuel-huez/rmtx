@@ -184,9 +184,11 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 
 	mounts := make([]syncfs.MountSpec, 0, len(cfg.Mounts))
 	for _, mount := range cfg.Mounts {
+		exclude := append([]string(nil), cfg.Ignore...)
+		exclude = append(exclude, mount.Exclude...)
 		mounts = append(
 			mounts,
-			syncfs.MountSpec{Path: mount.Path, Exclude: append([]string(nil), mount.Exclude...)},
+			syncfs.MountSpec{Path: mount.Path, Exclude: exclude},
 		)
 	}
 
@@ -1197,12 +1199,14 @@ func writeInitConfig(path, cwd, fingerprint, hostAddress string) error {
 		Context *config.ContextConfig `json:"context,omitempty"`
 		TLS     *config.TLSConfig     `json:"tls,omitempty"`
 		Mounts  []config.Mount        `json:"mounts,omitempty"`
+		Ignore  []string              `json:"ignore,omitempty"`
 	}{
 		Version: config.Default().Version,
 		Host:    strings.TrimSpace(hostAddress),
 		Context: &config.ContextConfig{Name: name},
 		TLS:     &config.TLSConfig{HostFingerprint: strings.TrimSpace(fingerprint)},
 		Mounts:  []config.Mount{{Path: "."}},
+		Ignore:  []string{".git/**", "node_modules/**"},
 	}
 
 	content, err := json.MarshalIndent(payload, "", "  ")

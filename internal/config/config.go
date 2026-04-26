@@ -39,6 +39,7 @@ type Config struct {
 	WorkDir   string          `json:"workdir,omitempty"`
 	Discovery DiscoveryConfig `json:"discovery,omitempty"`
 	Mounts    []Mount         `json:"mounts,omitempty"`
+	Ignore    []string        `json:"ignore,omitempty"`
 	Env       EnvConfig       `json:"env,omitempty"`
 }
 

@@ -71,7 +71,8 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
   "version": 1,
   "context": {"name": "integration-context"},
   "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
-  "mounts": [{"path": ".", "exclude": [".git/**", "cache/**"]}],
+  "mounts": [{"path": ".", "exclude": [".git/**"]}],
+  "ignore": ["cache/**"],
   "env": {"forward": ["FORWARD_ME"]},
   "discovery": {"enabled": false}
 }`

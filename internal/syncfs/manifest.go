@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
@@ -31,6 +32,7 @@ const (
 	minWorkers      = 2
 	defaultDirMode  = 0o755
 	defaultFileMode = 0o644
+	progressEvery   = 3 * time.Second
 )
 
 type MountSpec struct {
@@ -50,6 +52,25 @@ type Entry struct {
 type BuildResult struct {
 	Entries     []Entry
 	BlobSources map[string]string
+}
+
+type BuildOptions struct {
+	Progress         func(BuildProgress)
+	ProgressInterval time.Duration
+}
+
+type BuildProgress struct {
+	Phase      string
+	Mount      string
+	Scanned    int
+	Skipped    int
+	Dirs       int
+	Files      int
+	Symlinks   int
+	Hashed     int
+	TotalFiles int
+	Bytes      int64
+	Done       bool
 }
 
 func NonFileEntries(entries []Entry) []Entry {
@@ -83,6 +104,15 @@ func BuildManifestContext(
 	root string,
 	mounts []MountSpec,
 ) (BuildResult, error) {
+	return BuildManifestContextOptions(ctx, root, mounts, BuildOptions{})
+}
+
+func BuildManifestContextOptions(
+	ctx context.Context,
+	root string,
+	mounts []MountSpec,
+	opts BuildOptions,
+) (BuildResult, error) {
 	root, mounts, err := normalizeBuildInputs(root, mounts)
 	if err != nil {
 		return BuildResult{}, err
@@ -90,13 +120,14 @@ func BuildManifestContext(
 
 	entries := map[string]Entry{}
 	blobSources := map[string]string{}
+	progress := newProgressReporter(opts)
 
-	jobs, err := enqueueMountJobs(ctx, root, mounts, entries)
+	jobs, err := enqueueMountJobs(ctx, root, mounts, entries, progress)
 	if err != nil {
 		return BuildResult{}, err
 	}
 
-	if err := hashManifestFiles(ctx, jobs, entries, blobSources); err != nil {
+	if err := hashManifestFiles(ctx, jobs, entries, blobSources, progress); err != nil {
 		return BuildResult{}, err
 	}
 
@@ -110,11 +141,45 @@ func BuildManifestContext(
 	return BuildResult{Entries: out, BlobSources: blobSources}, nil
 }
 
+type progressReporter struct {
+	fn       func(BuildProgress)
+	interval time.Duration
+	last     time.Time
+}
+
+func newProgressReporter(opts BuildOptions) *progressReporter {
+	if opts.Progress == nil {
+		return nil
+	}
+
+	interval := opts.ProgressInterval
+	if interval <= 0 {
+		interval = progressEvery
+	}
+
+	return &progressReporter{fn: opts.Progress, interval: interval}
+}
+
+func (p *progressReporter) Report(progress BuildProgress, force bool) {
+	if p == nil || p.fn == nil {
+		return
+	}
+
+	now := time.Now()
+	if !force && !p.last.IsZero() && now.Sub(p.last) < p.interval {
+		return
+	}
+
+	p.last = now
+	p.fn(progress)
+}
+
 func hashManifestFiles(
 	ctx context.Context,
 	jobs []hashJob,
 	entries map[string]Entry,
 	blobSources map[string]string,
+	progress *progressReporter,
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -125,6 +190,9 @@ func hashManifestFiles(
 
 	startHashWorkers(ctx, workers, jobCh, results)
 	sendHashJobs(ctx, jobs, jobCh)
+
+	stats := BuildProgress{Phase: "hash", TotalFiles: len(jobs)}
+	progress.Report(stats, true)
 
 	for res := range results {
 		if res.Err != nil {
@@ -140,11 +208,18 @@ func hashManifestFiles(
 		if _, exists := blobSources[res.Entry.Hash]; !exists {
 			blobSources[res.Entry.Hash] = res.AbsPath
 		}
+
+		stats.Hashed++
+		stats.Bytes += res.Entry.Size
+		progress.Report(stats, false)
 	}
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	stats.Done = true
+	progress.Report(stats, true)
 
 	return nil
 }
@@ -217,11 +292,12 @@ func enqueueMountJobs(
 	root string,
 	mounts []MountSpec,
 	entries map[string]Entry,
+	progress *progressReporter,
 ) ([]hashJob, error) {
 	jobs := []hashJob{}
 
 	for _, mount := range mounts {
-		addedJobs, walkErr := walkMount(ctx, root, mount, entries)
+		addedJobs, walkErr := walkMount(ctx, root, mount, entries, progress)
 		if walkErr != nil {
 			return nil, walkErr
 		}
@@ -238,6 +314,7 @@ func walkMount(
 	root string,
 	mount MountSpec,
 	entries map[string]Entry,
+	progress *progressReporter,
 ) ([]hashJob, error) {
 	mountPath, err := resolveAndStatMount(root, mount.Path)
 	if err != nil {
@@ -245,6 +322,16 @@ func walkMount(
 	}
 
 	jobs := []hashJob{}
+	matcher := newExcludeMatcher(mount.Exclude)
+
+	mountRelRoot, err := filepath.Rel(root, mountPath)
+	if err != nil {
+		return nil, err
+	}
+
+	mountRelRoot = normalizeRel(mountRelRoot)
+	stats := BuildProgress{Phase: "walk", Mount: mount.Path}
+	progress.Report(stats, true)
 
 	walkErr := filepath.WalkDir(
 		mountPath,
@@ -257,12 +344,18 @@ func walkMount(
 				return walkErr
 			}
 
-			relRoot, relMount, err := computeRelativePaths(root, mountPath, absPath)
+			relMount, err := relativeUnder(mountPath, absPath)
 			if err != nil {
 				return err
 			}
 
-			if excludedDir, skip := shouldSkipEntry(relRoot, relMount, mount.Exclude, d); skip {
+			relRoot := joinRel(mountRelRoot, relMount)
+			stats.Scanned++
+
+			if excludedDir, skip := shouldSkipEntry(relRoot, relMount, matcher, d); skip {
+				stats.Skipped++
+				progress.Report(stats, false)
+
 				if excludedDir {
 					return filepath.SkipDir
 				}
@@ -285,13 +378,24 @@ func walkMount(
 
 			if isFile {
 				jobs = append(jobs, hashJob{AbsPath: absPath, Entry: entry})
+				stats.Files++
+				progress.Report(stats, false)
 
 				return nil
 			}
 
 			if entry.Kind != "" {
 				entries[relRoot] = entry
+				switch entry.Kind {
+				case KindFile:
+				case KindDir:
+					stats.Dirs++
+				case KindSymlink:
+					stats.Symlinks++
+				}
 			}
+
+			progress.Report(stats, false)
 
 			return nil
 		},
@@ -299,6 +403,9 @@ func walkMount(
 	if walkErr != nil {
 		return nil, fmt.Errorf("walk mount %s: %w", mount.Path, walkErr)
 	}
+
+	stats.Done = true
+	progress.Report(stats, true)
 
 	return jobs, nil
 }
@@ -316,22 +423,8 @@ func resolveAndStatMount(root, mountPath string) (string, error) {
 	return resolved, nil
 }
 
-func computeRelativePaths(root, mountPath, absPath string) (string, string, error) {
-	relRoot, err := filepath.Rel(root, absPath)
-	if err != nil {
-		return "", "", err
-	}
-
-	relMount, err := filepath.Rel(mountPath, absPath)
-	if err != nil {
-		return "", "", err
-	}
-
-	return normalizeRel(relRoot), normalizeRel(relMount), nil
-}
-
-func shouldSkipEntry(relRoot, relMount string, exclude []string, d fs.DirEntry) (bool, bool) {
-	if !isExcluded(relRoot, relMount, exclude) {
+func shouldSkipEntry(relRoot, relMount string, matcher excludeMatcher, d fs.DirEntry) (bool, bool) {
+	if !matcher.Match(relRoot, relMount) {
 		return false, false
 	}
 
@@ -580,18 +673,68 @@ func normalizeRel(rel string) string {
 	return filepath.ToSlash(filepath.Clean(rel))
 }
 
-func isExcluded(relRoot, relMount string, patterns []string) bool {
+func joinRel(base, rel string) string {
+	if base == "." {
+		return rel
+	}
+
+	if rel == "." {
+		return base
+	}
+
+	return path.Join(base, rel)
+}
+
+func relativeUnder(base, abs string) (string, error) {
+	base = filepath.Clean(base)
+
+	abs = filepath.Clean(abs)
+	if abs == base {
+		return ".", nil
+	}
+
+	prefix := base
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+
+	if strings.HasPrefix(abs, prefix) {
+		return normalizeRel(abs[len(prefix):]), nil
+	}
+
+	rel, err := filepath.Rel(base, abs)
+	if err != nil {
+		return "", err
+	}
+
+	return normalizeRel(rel), nil
+}
+
+type excludeMatcher struct {
+	patterns [][]string
+}
+
+func newExcludeMatcher(patterns []string) excludeMatcher {
+	matcher := excludeMatcher{patterns: make([][]string, 0, len(patterns))}
 	for _, pattern := range patterns {
 		pattern = normalizePattern(pattern)
 		if pattern == "" {
 			continue
 		}
 
-		if relRoot != "." && matchPattern(pattern, relRoot) {
+		matcher.patterns = append(matcher.patterns, splitPath(pattern))
+	}
+
+	return matcher
+}
+
+func (m excludeMatcher) Match(relRoot, relMount string) bool {
+	for _, pattern := range m.patterns {
+		if relRoot != "." && matchSegments(pattern, splitPath(relRoot)) {
 			return true
 		}
 
-		if relMount != "." && matchPattern(pattern, relMount) {
+		if relMount != "." && matchSegments(pattern, splitPath(relMount)) {
 			return true
 		}
 	}
@@ -605,21 +748,13 @@ func normalizePattern(pattern string) string {
 		return ""
 	}
 
-	pattern = filepath.ToSlash(filepath.Clean(pattern))
 	if strings.HasSuffix(pattern, "/") {
-		pattern += "**"
+		pattern = strings.TrimRight(pattern, "/") + "/**"
 	}
 
+	pattern = filepath.ToSlash(filepath.Clean(pattern))
+
 	return pattern
-}
-
-func matchPattern(pattern, candidate string) bool {
-	pattern = strings.Trim(pattern, "/")
-	candidate = strings.Trim(candidate, "/")
-	pSegs := splitPath(pattern)
-	cSegs := splitPath(candidate)
-
-	return matchSegments(pSegs, cSegs)
 }
 
 func splitPath(v string) []string {

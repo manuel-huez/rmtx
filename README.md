@@ -51,7 +51,8 @@ Generated `.rmtx.json` looks like:
   "version": 1,
   "context": { "name": "my-project" },
   "tls": { "host_fingerprint": "sha256:..." },
-  "mounts": [{ "path": "." }]
+  "mounts": [{ "path": "." }],
+  "ignore": [".git/**", "node_modules/**"]
 }
 ```
 
@@ -63,6 +64,16 @@ Generated `.rmtx.json` looks like:
 - `rmtx.json`
 
 A config file is required for remote execution.
+
+Use top-level `ignore` patterns to skip files for every mount. Use per-mount `exclude`
+patterns for mount-specific ignores:
+
+```json
+{
+  "mounts": [{ "path": ".", "exclude": ["tmp/**"] }],
+  "ignore": [".git/**", "node_modules/**", "dist/**"]
+}
+```
 
 ## Common commands
 

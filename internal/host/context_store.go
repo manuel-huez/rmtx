@@ -469,6 +469,7 @@ func (s *Server) removeContextDir(id, path string) error {
 func (s *Server) syncContextFromClient(
 	conn *protocol.Conn,
 	contextID string,
+	session string,
 	workspace string,
 	current []syncfs.Entry,
 	target []syncfs.Entry,
@@ -476,6 +477,15 @@ func (s *Server) syncContextFromClient(
 	changed, deleted := syncfs.Diff(current, target)
 
 	missing := s.blobStore.MissingHashes(changed)
+	s.logger.Printf(
+		"sync from client started: context=%s session=%s changed=%d deleted=%d missing_blobs=%d",
+		contextID,
+		session,
+		len(changed),
+		len(deleted),
+		len(missing),
+	)
+
 	if err := conn.WriteJSON(
 		protocol.MsgNeedBlobs,
 		protocol.NeedBlobs{Hashes: missing},
@@ -483,9 +493,17 @@ func (s *Server) syncContextFromClient(
 		return err
 	}
 
-	if err := s.receiveBlobs(conn); err != nil {
+	if err := s.receiveBlobs(conn, contextID, session, len(missing)); err != nil {
 		return err
 	}
+
+	s.logger.Printf(
+		"applying client sync to workspace: context=%s session=%s deleted=%d changed=%d",
+		contextID,
+		session,
+		len(deleted),
+		len(changed),
+	)
 
 	if err := syncfs.DeletePaths(workspace, deleted); err != nil {
 		return fmt.Errorf("delete tracked paths in context %s: %w", contextID, err)
@@ -521,6 +539,8 @@ func (s *Server) syncContextFromClient(
 			return fmt.Errorf("materialize %s in context %s: %w", entry.Path, contextID, err)
 		}
 	}
+
+	s.logger.Printf("sync from client complete: context=%s session=%s", contextID, session)
 
 	return nil
 }

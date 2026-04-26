@@ -33,6 +33,7 @@ const (
 	exitCodeNotFound   = 127
 	defaultFileMode    = 0o644
 	reverseDialTimeout = 5 * time.Second
+	progressEvery      = 3 * time.Second
 )
 
 type Options struct {
@@ -271,6 +272,16 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
+	s.logger.Printf(
+		"run request received: context=%s session=%s workdir=%s command=%q mounts=%d entries=%d",
+		request.ContextID,
+		request.Session,
+		request.WorkDir,
+		strings.Join(request.Command, " "),
+		len(request.Mounts),
+		len(request.Manifest),
+	)
+
 	release := s.acquireContext(request.ContextID)
 	defer release()
 
@@ -287,6 +298,7 @@ func (s *Server) handleRunRequest(
 	if err := s.syncContextFromClient(
 		conn,
 		request.ContextID,
+		request.Session,
 		handle.workspace,
 		currentManifest,
 		request.Manifest,
@@ -430,7 +442,20 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
-	post, err := syncfs.BuildManifestContext(parent, handle.workspace, request.Mounts)
+	s.logger.Printf(
+		"scanning workspace changes after command: context=%s session=%s",
+		request.ContextID,
+		request.Session,
+	)
+
+	post, err := syncfs.BuildManifestContextOptions(
+		parent,
+		handle.workspace,
+		request.Mounts,
+		syncfs.BuildOptions{
+			Progress: s.logBuildProgress(request.ContextID, request.Session, "post-run"),
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}
@@ -526,6 +551,8 @@ func (s *Server) sendWorkspaceChanges(
 	after []syncfs.Entry,
 ) error {
 	changed, deleted := syncfs.Diff(before, after)
+	s.logger.Printf("sending workspace changes: changed=%d deleted=%d", len(changed), len(deleted))
+
 	if err := conn.WriteJSON(
 		protocol.MsgChangeSet,
 		protocol.ChangeSet{Entries: changed, Deleted: deleted},
@@ -533,24 +560,128 @@ func (s *Server) sendWorkspaceChanges(
 		return err
 	}
 
-	return sendChangedFileBlobs(conn, workspace, changed)
+	return s.sendChangedFileBlobs(conn, workspace, changed)
 }
 
-func sendChangedFileBlobs(conn *protocol.Conn, workspace string, changed []syncfs.Entry) error {
+func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.BuildProgress) {
+	return func(progress syncfs.BuildProgress) {
+		switch progress.Phase {
+		case "walk":
+			if progress.Done {
+				s.logger.Printf(
+					"%s scan done: context=%s session=%s mount=%s scanned=%d files=%d dirs=%d skipped=%d",
+					label,
+					contextID,
+					session,
+					progress.Mount,
+					progress.Scanned,
+					progress.Files,
+					progress.Dirs,
+					progress.Skipped,
+				)
+
+				return
+			}
+
+			s.logger.Printf(
+				"%s scan progress: context=%s session=%s mount=%s scanned=%d files=%d dirs=%d skipped=%d",
+				label,
+				contextID,
+				session,
+				progress.Mount,
+				progress.Scanned,
+				progress.Files,
+				progress.Dirs,
+				progress.Skipped,
+			)
+		case "hash":
+			if progress.Done {
+				s.logger.Printf(
+					"%s hash done: context=%s session=%s files=%d/%d bytes=%d",
+					label,
+					contextID,
+					session,
+					progress.Hashed,
+					progress.TotalFiles,
+					progress.Bytes,
+				)
+
+				return
+			}
+
+			s.logger.Printf(
+				"%s hash progress: context=%s session=%s files=%d/%d bytes=%d",
+				label,
+				contextID,
+				session,
+				progress.Hashed,
+				progress.TotalFiles,
+				progress.Bytes,
+			)
+		}
+	}
+}
+
+func (s *Server) sendChangedFileBlobs(
+	conn *protocol.Conn,
+	workspace string,
+	changed []syncfs.Entry,
+) error {
+	total := 0
+
+	for _, entry := range changed {
+		if entry.Kind == syncfs.KindFile {
+			total++
+		}
+	}
+
+	s.logger.Printf("sending changed file blobs to client: files=%d", total)
+
+	sent := 0
+
+	var bytesSent int64
+
+	lastProgress := time.Time{}
+
 	for _, entry := range changed {
 		if entry.Kind != syncfs.KindFile {
 			continue
 		}
 
-		if err := sendChangedFileBlob(conn, workspace, entry); err != nil {
+		onRead := func(n int) {
+			bytesSent += int64(n)
+
+			now := time.Now()
+			if lastProgress.IsZero() || now.Sub(lastProgress) >= progressEvery {
+				lastProgress = now
+
+				s.logger.Printf(
+					"send changed blob progress: files=%d/%d bytes=%d",
+					sent,
+					total,
+					bytesSent,
+				)
+			}
+		}
+
+		if err := sendChangedFileBlob(conn, workspace, entry, onRead); err != nil {
 			return err
 		}
+
+		sent++
 	}
+
+	s.logger.Printf("sending changed file blobs done: files=%d bytes=%d", sent, bytesSent)
 
 	return nil
 }
 
-func sendChangedFileBlob(conn *protocol.Conn, workspace string, entry syncfs.Entry) error {
+func sendChangedFileBlob(
+	conn *protocol.Conn,
+	workspace string,
+	entry syncfs.Entry,
+	onRead func(int),
+) error {
 	path := filepath.Join(workspace, filepath.FromSlash(entry.Path))
 
 	f, err := os.Open(path)
@@ -563,7 +694,7 @@ func sendChangedFileBlob(conn *protocol.Conn, workspace string, entry syncfs.Ent
 	return conn.WriteFrom(
 		protocol.MsgChangeBlob,
 		protocol.BlobInfo{Path: entry.Path, Hash: entry.Hash, Size: entry.Size, Mode: entry.Mode},
-		f,
+		&logReader{src: f, onRead: onRead},
 		entry.Size,
 	)
 }
@@ -651,7 +782,25 @@ func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest
 	})
 }
 
-func (s *Server) receiveBlobs(conn *protocol.Conn) error {
+func (s *Server) receiveBlobs(
+	conn *protocol.Conn,
+	contextID string,
+	session string,
+	total int,
+) error {
+	s.logger.Printf(
+		"receiving client blobs: context=%s session=%s files=%d",
+		contextID,
+		session,
+		total,
+	)
+
+	received := 0
+
+	var bytesReceived int64
+
+	lastProgress := time.Time{}
+
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {
@@ -669,14 +818,46 @@ func (s *Server) receiveBlobs(conn *protocol.Conn) error {
 				return errors.New("blob hash is required")
 			}
 
+			reader := &logReader{
+				src: conn.PayloadReader(head),
+				onRead: func(n int) {
+					bytesReceived += int64(n)
+
+					now := time.Now()
+					if lastProgress.IsZero() || now.Sub(lastProgress) >= progressEvery {
+						lastProgress = now
+
+						s.logger.Printf(
+							"receive blob progress: context=%s session=%s files=%d/%d bytes=%d",
+							contextID,
+							session,
+							received,
+							total,
+							bytesReceived,
+						)
+					}
+				},
+			}
+
 			if err := s.blobStore.Store(
 				info.Hash,
 				head.PayloadLen,
-				conn.PayloadReader(head),
+				reader,
 			); err != nil {
 				return err
 			}
+
+			received++
 		case protocol.MsgSyncComplete:
+			s.logger.Printf(
+				"receiving client blobs done: context=%s session=%s files=%d/%d bytes=%d",
+				contextID,
+				session,
+				received,
+				total,
+				bytesReceived,
+			)
+
 			return nil
 		default:
 			if err := conn.DiscardPayload(head); err != nil {
@@ -686,6 +867,20 @@ func (s *Server) receiveBlobs(conn *protocol.Conn) error {
 			return fmt.Errorf("unexpected sync frame: %s", head.Type)
 		}
 	}
+}
+
+type logReader struct {
+	src    io.Reader
+	onRead func(int)
+}
+
+func (r *logReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(n)
+	}
+
+	return n, err
 }
 
 func (s *Server) runCommand(
@@ -700,11 +895,35 @@ func (s *Server) runCommand(
 		return 1, err
 	}
 
+	s.logger.Printf(
+		"starting command: context=%s session=%s workdir=%s tty=%t command=%q",
+		request.ContextID,
+		request.Session,
+		request.WorkDir,
+		request.TTY,
+		strings.Join(request.Command, " "),
+	)
+
+	var (
+		code   int
+		runErr error
+	)
+
 	if request.TTY {
-		return s.runTTYCommand(ctx, cancel, conn, workspace, workdir, request)
+		code, runErr = s.runTTYCommand(ctx, cancel, conn, workspace, workdir, request)
+	} else {
+		code, runErr = s.runPipeCommand(ctx, cancel, conn, workspace, workdir, request)
 	}
 
-	return s.runPipeCommand(ctx, cancel, conn, workspace, workdir, request)
+	s.logger.Printf(
+		"command finished: context=%s session=%s exit_code=%d err=%v",
+		request.ContextID,
+		request.Session,
+		code,
+		runErr,
+	)
+
+	return code, runErr
 }
 
 func (s *Server) runPipeCommand(

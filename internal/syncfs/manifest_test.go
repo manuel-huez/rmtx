@@ -39,6 +39,30 @@ func TestBuildManifestRespectsExcludePatterns(t *testing.T) {
 	}
 }
 
+func TestBuildManifestTreatsTrailingSlashExcludeAsDirectory(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "cache", "out.txt"), "ignore")
+	mustWrite(t, filepath.Join(root, "src", "main.go"), "keep")
+
+	result, err := BuildManifest(root, []MountSpec{{Path: ".", Exclude: []string{"cache/"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paths := map[string]bool{}
+	for _, entry := range result.Entries {
+		paths[entry.Path] = true
+	}
+
+	if !paths["src/main.go"] {
+		t.Fatalf("expected kept file in manifest: %#v", paths)
+	}
+
+	if paths["cache/out.txt"] {
+		t.Fatalf("trailing-slash exclude leaked into manifest: %#v", paths)
+	}
+}
+
 func TestBuildManifestHandlesMoreFilesThanWorkers(t *testing.T) {
 	root := t.TempDir()
 
