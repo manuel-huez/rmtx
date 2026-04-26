@@ -52,7 +52,8 @@ Generated `.rmtx.json` looks like:
   "context": { "name": "my-project" },
   "tls": { "host_fingerprint": "sha256:..." },
   "mounts": [{ "path": "." }],
-  "ignore": [".git/**", "node_modules/**"]
+  "ignore": [".git/**", "node_modules/**"],
+  "ignore_gitignore": true
 }
 ```
 
@@ -71,9 +72,19 @@ patterns for mount-specific ignores:
 ```json
 {
   "mounts": [{ "path": ".", "exclude": ["tmp/**"] }],
-  "ignore": [".git/**", "node_modules/**", "dist/**"]
+  "ignore": [".git/**", "node_modules/**", "dist/**"],
+  "ignore_gitignore": true
 }
 ```
+
+To ignore everything under a specific directory, use `dir/**`. For example,
+`"ignore": ["data/cache/**"]` skips every file and subdirectory under
+`data/cache`. A trailing slash also works, so `"ignore": ["data/cache/"]`
+means the same directory tree.
+
+When `ignore_gitignore` is `true`, patterns from the project root `.gitignore`
+are added to every mount. Negated `.gitignore` patterns (`!path`) are ignored
+because `rmtx` ignore rules only exclude files.
 
 ## Common commands
 

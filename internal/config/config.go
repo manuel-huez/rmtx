@@ -32,15 +32,16 @@ type ContextConfig struct {
 }
 
 type Config struct {
-	Version   int             `json:"version,omitempty"`
-	Context   ContextConfig   `json:"context,omitempty"`
-	Host      string          `json:"host,omitempty"`
-	TLS       TLSConfig       `json:"tls,omitempty"`
-	WorkDir   string          `json:"workdir,omitempty"`
-	Discovery DiscoveryConfig `json:"discovery,omitempty"`
-	Mounts    []Mount         `json:"mounts,omitempty"`
-	Ignore    []string        `json:"ignore,omitempty"`
-	Env       EnvConfig       `json:"env,omitempty"`
+	Version         int             `json:"version,omitempty"`
+	Context         ContextConfig   `json:"context,omitempty"`
+	Host            string          `json:"host,omitempty"`
+	TLS             TLSConfig       `json:"tls,omitempty"`
+	WorkDir         string          `json:"workdir,omitempty"`
+	Discovery       DiscoveryConfig `json:"discovery,omitempty"`
+	Mounts          []Mount         `json:"mounts,omitempty"`
+	Ignore          []string        `json:"ignore,omitempty"`
+	IgnoreGitignore bool            `json:"ignore_gitignore,omitempty"`
+	Env             EnvConfig       `json:"env,omitempty"`
 }
 
 type TLSConfig struct {

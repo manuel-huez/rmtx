@@ -11,6 +11,7 @@
     }
   ],
   "ignore": [".git/**", "node_modules/**", "dist/**"],
+  "ignore_gitignore": true,
   "env": {
     "forward": ["GOPRIVATE", "CGO_ENABLED", "AWS_PROFILE"]
   },

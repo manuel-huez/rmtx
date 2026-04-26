@@ -36,6 +36,45 @@ func TestRunExecRequiresLocalConfig(t *testing.T) {
 	}
 }
 
+func TestBuildMountSpecsUsesGitignoreWhenEnabled(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, ".gitignore"),
+		[]byte("node_modules/\n*.log\n# comment\n!important.log\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts, err := buildMountSpecs(root, config.Config{
+		Mounts:          []config.Mount{{Path: ".", Exclude: []string{"tmp/**"}}},
+		Ignore:          []string{"dist/**"},
+		IgnoreGitignore: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mounts) != 1 {
+		t.Fatalf("unexpected mounts: %#v", mounts)
+	}
+
+	patterns := map[string]bool{}
+	for _, pattern := range mounts[0].Exclude {
+		patterns[pattern] = true
+	}
+
+	for _, want := range []string{"dist/**", "**/node_modules/**", "**/*.log", "tmp/**"} {
+		if !patterns[want] {
+			t.Fatalf("missing pattern %q in %#v", want, mounts[0].Exclude)
+		}
+	}
+
+	if patterns["**/important.log"] {
+		t.Fatalf("negated gitignore pattern should not become exclude: %#v", mounts[0].Exclude)
+	}
+}
+
 //nolint:cyclop,gocognit,maintidx // integration setup/verification naturally has many branch checks.
 func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	if runtime.GOOS == "windows" {

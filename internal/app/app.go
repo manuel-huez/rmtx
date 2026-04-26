@@ -182,14 +182,9 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		return 1, err
 	}
 
-	mounts := make([]syncfs.MountSpec, 0, len(cfg.Mounts))
-	for _, mount := range cfg.Mounts {
-		exclude := append([]string(nil), cfg.Ignore...)
-		exclude = append(exclude, mount.Exclude...)
-		mounts = append(
-			mounts,
-			syncfs.MountSpec{Path: mount.Path, Exclude: exclude},
-		)
+	mounts, err := buildMountSpecs(loaded.Root, cfg)
+	if err != nil {
+		return 1, err
 	}
 
 	forwardStdin := params.ForwardStdin || useTTY || ShouldForwardStdin(params.StdinFile)
@@ -217,6 +212,88 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		ContextName:      loaded.ContextName(),
 		TTY:              useTTY,
 	})
+}
+
+func buildMountSpecs(root string, cfg config.Config) ([]syncfs.MountSpec, error) {
+	globalIgnore := append([]string(nil), cfg.Ignore...)
+	if cfg.IgnoreGitignore {
+		patterns, err := loadGitignorePatterns(root)
+		if err != nil {
+			return nil, err
+		}
+
+		globalIgnore = append(globalIgnore, patterns...)
+	}
+
+	mounts := make([]syncfs.MountSpec, 0, len(cfg.Mounts))
+	for _, mount := range cfg.Mounts {
+		exclude := append([]string(nil), globalIgnore...)
+		exclude = append(exclude, mount.Exclude...)
+		mounts = append(
+			mounts,
+			syncfs.MountSpec{Path: mount.Path, Exclude: exclude},
+		)
+	}
+
+	return mounts, nil
+}
+
+func loadGitignorePatterns(root string) ([]string, error) {
+	content, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("read .gitignore: %w", err)
+	}
+
+	var patterns []string
+
+	for _, line := range strings.Split(string(content), "\n") {
+		pattern, ok := gitignoreLineToExclude(line)
+		if ok {
+			patterns = append(patterns, pattern)
+		}
+	}
+
+	return patterns, nil
+}
+
+func gitignoreLineToExclude(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", false
+	}
+
+	if strings.HasPrefix(line, `\#`) || strings.HasPrefix(line, `\!`) {
+		line = line[1:]
+	} else if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+		return "", false
+	}
+
+	line = strings.TrimPrefix(line, "/")
+	if line == "" {
+		return "", false
+	}
+
+	dirOnly := strings.HasSuffix(line, "/")
+
+	line = strings.TrimRight(line, "/")
+	if line == "" {
+		return "", false
+	}
+
+	hasSlash := strings.Contains(line, "/")
+	if dirOnly {
+		line += "/**"
+	}
+
+	if !hasSlash {
+		return "**/" + line, true
+	}
+
+	return line, true
 }
 
 func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingInfo, error) {
@@ -1194,19 +1271,21 @@ func writeInitConfig(path, cwd, fingerprint, hostAddress string) error {
 
 	name := config.Loaded{Root: root}.ContextName()
 	payload := struct {
-		Version int                   `json:"version"`
-		Host    string                `json:"host,omitempty"`
-		Context *config.ContextConfig `json:"context,omitempty"`
-		TLS     *config.TLSConfig     `json:"tls,omitempty"`
-		Mounts  []config.Mount        `json:"mounts,omitempty"`
-		Ignore  []string              `json:"ignore,omitempty"`
+		Version         int                   `json:"version"`
+		Host            string                `json:"host,omitempty"`
+		Context         *config.ContextConfig `json:"context,omitempty"`
+		TLS             *config.TLSConfig     `json:"tls,omitempty"`
+		Mounts          []config.Mount        `json:"mounts,omitempty"`
+		Ignore          []string              `json:"ignore,omitempty"`
+		IgnoreGitignore bool                  `json:"ignore_gitignore,omitempty"`
 	}{
-		Version: config.Default().Version,
-		Host:    strings.TrimSpace(hostAddress),
-		Context: &config.ContextConfig{Name: name},
-		TLS:     &config.TLSConfig{HostFingerprint: strings.TrimSpace(fingerprint)},
-		Mounts:  []config.Mount{{Path: "."}},
-		Ignore:  []string{".git/**", "node_modules/**"},
+		Version:         config.Default().Version,
+		Host:            strings.TrimSpace(hostAddress),
+		Context:         &config.ContextConfig{Name: name},
+		TLS:             &config.TLSConfig{HostFingerprint: strings.TrimSpace(fingerprint)},
+		Mounts:          []config.Mount{{Path: "."}},
+		Ignore:          []string{".git/**", "node_modules/**"},
+		IgnoreGitignore: true,
 	}
 
 	content, err := json.MarshalIndent(payload, "", "  ")
