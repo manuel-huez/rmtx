@@ -261,15 +261,25 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 }
 
 func isDisconnectError(err error) bool {
+	var errno syscall.Errno
+
 	return errors.Is(err, io.EOF) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, windowsConnectionReset)
+		errors.Is(err, windowsConnectionReset) ||
+		(errors.As(err, &errno) && isDisconnectErrno(errno))
 }
 
 const windowsConnectionReset syscall.Errno = 10054
+
+func isDisconnectErrno(errno syscall.Errno) bool {
+	return errno == syscall.ECONNABORTED ||
+		errno == syscall.ECONNRESET ||
+		errno == syscall.EPIPE ||
+		errno == windowsConnectionReset
+}
 
 func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
 	head, err := conn.ReadHeader()
@@ -280,7 +290,7 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	s.logger.Printf("request received: remote=%s type=%s", conn.Raw().RemoteAddr(), head.Type)
 
 	if err := s.dispatchSessionRequest(parent, conn, head); err != nil {
-		if isExpectedSessionDisconnect(head.Type, err) {
+		if isDisconnectError(err) {
 			return nil
 		}
 
@@ -288,21 +298,6 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	}
 
 	return nil
-}
-
-func isExpectedSessionDisconnect(msgType string, err error) bool {
-	if !isDisconnectError(err) {
-		return false
-	}
-
-	switch msgType {
-	case protocol.MsgPingRequest,
-		protocol.MsgListContextsRequest,
-		protocol.MsgDeleteContextsRequest:
-		return true
-	default:
-		return false
-	}
 }
 
 func (s *Server) handleRunRequest(
