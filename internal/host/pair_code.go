@@ -61,8 +61,9 @@ func createPairCodeInfo(stateDir, hostName string, ttl time.Duration) (PairCodeI
 }
 
 func effectiveHostName(hostName string) string {
-	if strings.TrimSpace(hostName) != "" {
-		return strings.TrimSpace(hostName)
+	hostName = strings.TrimSpace(hostName)
+	if hostName != "" {
+		return hostName
 	}
 
 	if localHostName, err := os.Hostname(); err == nil && strings.TrimSpace(localHostName) != "" {

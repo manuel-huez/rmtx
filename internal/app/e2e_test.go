@@ -77,7 +77,7 @@ func TestBuildMountSpecsUsesGitignoreWhenEnabled(t *testing.T) {
 
 //nolint:cyclop,gocognit,maintidx // integration setup/verification naturally has many branch checks.
 func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if testIsWindows() {
 		t.Skip("shell-based integration test")
 	}
 
@@ -294,6 +294,90 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
 	}
+}
+
+func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	configContent := `{
+  "version": 1,
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "mounts": [{"path": "."}],
+  "discovery": {"enabled": false}
+}`
+	writeTestFile(t, configPath, configContent)
+	writeTestFile(t, filepath.Join(project, "hello.txt"), "stable\n")
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(ctx, project, PairParams{
+		AddressOverride: addr,
+		ConfigPath:      configPath,
+		Code:            pairCode.Code,
+		ClientLabel:     "noop-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for run := range 2 {
+		var stdout, stderr bytes.Buffer
+
+		code, err := RunExec(ctx, project, ExecParams{
+			AddressOverride: addr,
+			Command:         []string{"sh", "-c", "echo test"},
+			Stdout:          &stdout,
+			Stderr:          &stderr,
+		})
+		if err != nil {
+			t.Fatalf("run %d failed: %v", run+1, err)
+		}
+
+		if code != 0 {
+			t.Fatalf("run %d exit code: %d stderr=%s", run+1, code, stderr.String())
+		}
+
+		if strings.TrimSpace(stdout.String()) != "test" {
+			t.Fatalf("run %d unexpected stdout: %q", run+1, stdout.String())
+		}
+
+		noChanges := "applying host changes locally: changed=0 deleted=0"
+		if run == 1 && !strings.Contains(stderr.String(), noChanges) {
+			t.Fatalf("second no-op run downloaded changes: stderr=%s", stderr.String())
+		}
+	}
+
+	cancel()
+	waitForServerShutdown(t, "noop-host", errCh)
 }
 
 //nolint:cyclop // Integration test exercises multi-host setup, pairing, verification, and shutdown.

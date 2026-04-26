@@ -580,7 +580,11 @@ func reportFileWalked(stats *BuildProgress, progress *progressReporter) {
 	progress.Report(*stats, false)
 }
 
-func Diff(before, after []Entry) (changed []Entry, deleted []string) {
+type DiffOptions struct {
+	IgnoreMode bool
+}
+
+func Diff(before, after []Entry, opts DiffOptions) (changed []Entry, deleted []string) {
 	beforeMap := map[string]Entry{}
 	afterMap := map[string]Entry{}
 
@@ -594,7 +598,7 @@ func Diff(before, after []Entry) (changed []Entry, deleted []string) {
 
 	for path, cur := range afterMap {
 		prev, ok := beforeMap[path]
-		if !ok || !sameEntry(prev, cur) {
+		if !ok || !sameEntry(prev, cur, opts.IgnoreMode) {
 			changed = append(changed, cur)
 		}
 	}
@@ -609,6 +613,34 @@ func Diff(before, after []Entry) (changed []Entry, deleted []string) {
 	sort.Slice(deleted, func(i, j int) bool { return depth(deleted[i]) > depth(deleted[j]) })
 
 	return changed, deleted
+}
+
+func NormalizeModes(entries, reference []Entry) []Entry {
+	out := append([]Entry(nil), entries...)
+	refByPath := map[string]Entry{}
+
+	for _, entry := range reference {
+		refByPath[entry.Path] = entry
+	}
+
+	for i, entry := range out {
+		if ref, ok := refByPath[entry.Path]; ok && sameEntryExceptMode(ref, entry) {
+			out[i].Mode = ref.Mode
+			continue
+		}
+
+		if out[i].Mode == 0 {
+			switch out[i].Kind {
+			case KindDir:
+				out[i].Mode = uint32(defaultDirMode)
+			case KindFile:
+				out[i].Mode = uint32(defaultFileMode)
+			case KindSymlink:
+			}
+		}
+	}
+
+	return out
 }
 
 func PreserveMissingEntries(entries, preserve []Entry, kind EntryKind) []Entry {
@@ -735,7 +767,6 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return fmt.Errorf("mkdir file parent %s: %w", entry.Path, err)
 	}
 
-	_ = os.RemoveAll(target)
 	tmp := target + ".rmtx-tmp"
 
 	f, err := os.OpenFile(
@@ -763,6 +794,11 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 	if err := os.Chmod(tmp, fileMode(entry.Mode, defaultFileMode)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("chmod file %s: %w", entry.Path, err)
+	}
+
+	if err := os.RemoveAll(target); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace file %s: %w", entry.Path, err)
 	}
 
 	if err := os.Rename(tmp, target); err != nil {
@@ -964,9 +1000,12 @@ func hashFileContext(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func sameEntry(a, b Entry) bool {
-	return a.Kind == b.Kind && a.Hash == b.Hash && a.Size == b.Size && a.Mode == b.Mode &&
-		a.Linkname == b.Linkname
+func sameEntry(a, b Entry, ignoreMode bool) bool {
+	return sameEntryExceptMode(a, b) && (ignoreMode || a.Mode == b.Mode)
+}
+
+func sameEntryExceptMode(a, b Entry) bool {
+	return a.Kind == b.Kind && a.Hash == b.Hash && a.Size == b.Size && a.Linkname == b.Linkname
 }
 
 func depth(path string) int {

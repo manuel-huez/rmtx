@@ -1007,14 +1007,16 @@ func resolveInitTarget(
 ) (discovery.Result, error) {
 	preparePairIO(params)
 
-	if out := strings.TrimSpace(params.AddressOverride); out != "" &&
-		strings.TrimSpace(params.Fingerprint) != "" {
+	addressOverride := strings.TrimSpace(params.AddressOverride)
+	fingerprint := strings.TrimSpace(params.Fingerprint)
+
+	if addressOverride != "" && fingerprint != "" {
 		return discovery.Result{
-			Address:         discovery.NormalizeAddress(out, config.DefaultPort),
+			Address:         discovery.NormalizeAddress(addressOverride, config.DefaultPort),
 			Service:         cfg.Discovery.Service,
 			Instance:        "manual-host",
 			OS:              "",
-			HostFingerprint: strings.TrimSpace(params.Fingerprint),
+			HostFingerprint: fingerprint,
 			PairingEnabled:  true,
 		}, nil
 	}
@@ -1034,8 +1036,8 @@ func resolveInitTarget(
 		return discovery.Result{}, errors.New("no pairable host discovered")
 	}
 
-	if out := strings.TrimSpace(params.AddressOverride); out != "" {
-		address := discovery.NormalizeAddress(out, config.DefaultPort)
+	if addressOverride != "" {
+		address := discovery.NormalizeAddress(addressOverride, config.DefaultPort)
 
 		filtered := make([]discovery.Result, 0, len(results))
 		for _, result := range results {
@@ -1307,8 +1309,9 @@ func writeInitConfig(path, cwd, fingerprint, hostAddress string) error {
 }
 
 func empty(value, fallback string) string {
-	if strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
+	value = strings.TrimSpace(value)
+	if value != "" {
+		return value
 	}
 
 	return fallback

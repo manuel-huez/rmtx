@@ -734,8 +734,9 @@ func generateServerCertificate(
 }
 
 func defaultCommonName(primary, fallback string) string {
-	if strings.TrimSpace(primary) != "" {
-		return strings.TrimSpace(primary)
+	primary = strings.TrimSpace(primary)
+	if primary != "" {
+		return primary
 	}
 
 	return fallback

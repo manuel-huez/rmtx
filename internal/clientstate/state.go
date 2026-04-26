@@ -41,14 +41,19 @@ type Loaded struct {
 
 func DefaultDir() (string, error) {
 	home, err := os.UserHomeDir()
-	if err != nil || strings.TrimSpace(home) == "" {
-		if current, userErr := user.Current(); userErr == nil &&
-			strings.TrimSpace(current.HomeDir) != "" {
-			home = current.HomeDir
+
+	trimmedHome := strings.TrimSpace(home)
+	if err != nil || trimmedHome == "" {
+		if current, userErr := user.Current(); userErr == nil {
+			currentHome := strings.TrimSpace(current.HomeDir)
+			if currentHome != "" {
+				home = current.HomeDir
+				trimmedHome = currentHome
+			}
 		}
 	}
 
-	if strings.TrimSpace(home) == "" {
+	if trimmedHome == "" {
 		return "", errors.New("resolve home directory")
 	}
 

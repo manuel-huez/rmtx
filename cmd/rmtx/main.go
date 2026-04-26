@@ -563,14 +563,11 @@ func resolveTTYMode(force, disable bool) (app.TTYMode, error) {
 		return app.TTYAuto, errors.New("--tty and --no-tty cannot be used together")
 	}
 
-	switch {
-	case force:
+	if force {
 		return app.TTYForce, nil
-	case disable:
-		return app.TTYDisable, nil
-	default:
-		return app.TTYDisable, nil
 	}
+
+	return app.TTYDisable, nil
 }
 
 func emptyFallback(value, fallback string) string {

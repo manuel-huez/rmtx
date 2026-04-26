@@ -198,12 +198,14 @@ func writeJSONAtomically(path string, value any) error {
 }
 
 func fallbackContextName(name, rootHint, id string) string {
-	if strings.TrimSpace(name) != "" {
-		return strings.TrimSpace(name)
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name
 	}
 
-	if strings.TrimSpace(rootHint) != "" {
-		return strings.TrimSpace(rootHint)
+	rootHint = strings.TrimSpace(rootHint)
+	if rootHint != "" {
+		return rootHint
 	}
 
 	return id
@@ -212,10 +214,10 @@ func fallbackContextName(name, rootHint, id string) string {
 func validContextID(id string) bool {
 	for _, r := range id {
 		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '-', r == '_', r == '.':
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
 		default:
 			return false
 		}
@@ -534,7 +536,7 @@ func (s *Server) syncContextFromClient(
 	current []syncfs.Entry,
 	target []syncfs.Entry,
 ) error {
-	changed, deleted := syncfs.Diff(current, target)
+	changed, deleted := syncfs.Diff(current, target, syncfs.DiffOptions{})
 
 	missing := s.blobStore.MissingHashes(changed)
 

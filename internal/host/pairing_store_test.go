@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -186,7 +185,7 @@ func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 }
 
 func TestCreatePairCodeStoresCodesPrivately(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if hostIsWindows() {
 		t.Skip("permission bits are not portable on windows")
 	}
 

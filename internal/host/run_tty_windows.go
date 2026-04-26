@@ -68,9 +68,11 @@ func (s *Server) runTTYCommand(
 		if err := s.consumeTTYInput(
 			conn,
 			&windowsTTY{pty: pty},
-		); err != nil &&
-			!errors.Is(err, io.EOF) {
-			s.logger.Printf("TTY input forwarding ended: %v", err)
+		); err != nil {
+			cancel()
+			if !errors.Is(err, io.EOF) {
+				s.logger.Printf("TTY input forwarding ended: %v", err)
+			}
 		}
 	}()
 

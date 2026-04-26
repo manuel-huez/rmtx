@@ -222,11 +222,12 @@ func (c Config) DiscoveryTimeout() time.Duration {
 }
 
 func (l Loaded) ContextName() string {
-	if strings.TrimSpace(l.Config.Context.Name) != "" {
-		return strings.TrimSpace(l.Config.Context.Name)
+	name := strings.TrimSpace(l.Config.Context.Name)
+	if name != "" {
+		return name
 	}
 
-	name := filepath.Base(l.Root)
+	name = filepath.Base(l.Root)
 	if name == "" || name == "." || name == string(filepath.Separator) {
 		return defaultContextName
 	}
@@ -235,8 +236,9 @@ func (l Loaded) ContextName() string {
 }
 
 func (l Loaded) ContextIdentity() string {
-	if strings.TrimSpace(l.Config.Context.Name) != "" {
-		return "name:" + strings.TrimSpace(l.Config.Context.Name)
+	name := strings.TrimSpace(l.Config.Context.Name)
+	if name != "" {
+		return "name:" + name
 	}
 
 	root := l.Root
@@ -294,11 +296,7 @@ func slug(value string) string {
 
 	for _, r := range value {
 		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-
-			lastDash = false
-		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
 
 			lastDash = false

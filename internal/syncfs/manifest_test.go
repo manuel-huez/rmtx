@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,58 @@ func TestPreserveMissingEntriesKeepsMissingKindOnly(t *testing.T) {
 	}
 }
 
+func TestDiffCanIgnoreModeOnlyChanges(t *testing.T) {
+	before := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o644}}
+	after := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o666}}
+
+	changed, deleted := Diff(before, after, DiffOptions{IgnoreMode: true})
+	if len(changed) != 0 || len(deleted) != 0 {
+		t.Fatalf("mode-only change should be ignored: changed=%#v deleted=%#v", changed, deleted)
+	}
+
+	changed, deleted = Diff(before, after, DiffOptions{})
+	if len(changed) != 1 || len(deleted) != 0 {
+		t.Fatalf(
+			"regular diff should report mode change: changed=%#v deleted=%#v",
+			changed,
+			deleted,
+		)
+	}
+}
+
+func TestNormalizeModesUsesReferenceModeForEquivalentEntries(t *testing.T) {
+	reference := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o644}}
+	entries := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o666}}
+
+	got := NormalizeModes(entries, reference)
+	if len(got) != 1 || got[0].Mode != 0o644 {
+		t.Fatalf("mode was not normalized from reference: %#v", got)
+	}
+}
+
+func TestWriteFileLeavesExistingTargetWhenReadFails(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, testFilePath), "original")
+
+	err := WriteFile(
+		root,
+		Entry{Path: testFilePath, Kind: KindFile, Mode: 0o644},
+		errReader{},
+	)
+	if err == nil {
+		t.Fatal("expected WriteFile read error")
+	}
+
+	got, readErr := os.ReadFile(filepath.Join(root, testFilePath))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+
+	if string(got) != "original" {
+		t.Fatalf("existing target was changed after failed write: %q", got)
+	}
+}
+
 func TestDiffAndBlobStoreMissingHashes(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, testFilePath), "one")
@@ -216,7 +269,7 @@ func TestDiffAndBlobStoreMissingHashes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, deleted := Diff(before.Entries, after.Entries)
+	changed, deleted := Diff(before.Entries, after.Entries, DiffOptions{})
 	if len(deleted) != 0 {
 		t.Fatalf("unexpected deletions: %v", deleted)
 	}
@@ -372,4 +425,10 @@ func mustSymlinkOrSkip(t *testing.T, oldname, newname string) {
 	if err := os.Symlink(oldname, newname); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
 }

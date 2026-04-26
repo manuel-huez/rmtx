@@ -50,8 +50,11 @@ func (s *Server) runTTYCommand(
 	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
 
 	go func() {
-		if err := s.consumeTTYInput(conn, master); err != nil && !errors.Is(err, io.EOF) {
-			s.logger.Printf("TTY input forwarding ended: %v", err)
+		if err := s.consumeTTYInput(conn, master); err != nil {
+			cancel()
+			if !errors.Is(err, io.EOF) {
+				s.logger.Printf("TTY input forwarding ended: %v", err)
+			}
 		}
 	}()
 

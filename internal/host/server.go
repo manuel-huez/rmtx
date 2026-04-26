@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
@@ -254,10 +255,27 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 
 	conn := protocol.NewConn(raw)
 	if err := s.handleConnSession(parent, conn); err != nil {
+		if isDisconnectError(err) {
+			s.logger.Printf("request disconnected: remote=%s error=%v", raw.RemoteAddr(), err)
+
+			return
+		}
+
 		s.logger.Printf("request failed: remote=%s error=%v", raw.RemoteAddr(), err)
 		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
 }
+
+func isDisconnectError(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, windowsConnectionReset)
+}
+
+const windowsConnectionReset syscall.Errno = 10054
 
 func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
 	head, err := conn.ReadHeader()
@@ -480,7 +498,11 @@ func (s *Server) executeAndSyncRun(
 	}
 
 	postEntries := post.Entries
-	if runtime.GOOS == "windows" {
+	ignoreMode := false
+
+	if hostIsWindows() {
+		ignoreMode = true
+		postEntries = syncfs.NormalizeModes(postEntries, request.Manifest)
 		postEntries = syncfs.PreserveMissingEntries(
 			postEntries,
 			request.Manifest,
@@ -493,6 +515,7 @@ func (s *Server) executeAndSyncRun(
 		handle.workspace,
 		request.Manifest,
 		postEntries,
+		ignoreMode,
 	); err != nil {
 		return err
 	}
@@ -605,8 +628,9 @@ func (s *Server) sendWorkspaceChanges(
 	workspace string,
 	before []syncfs.Entry,
 	after []syncfs.Entry,
+	ignoreMode bool,
 ) error {
-	changed, deleted := syncfs.Diff(before, after)
+	changed, deleted := diffWorkspaceChanges(before, after, ignoreMode)
 	s.logger.Printf("sending workspace changes: changed=%d deleted=%d", len(changed), len(deleted))
 
 	if err := conn.WriteJSON(
@@ -617,6 +641,14 @@ func (s *Server) sendWorkspaceChanges(
 	}
 
 	return s.sendChangedFileBlobs(conn, workspace, changed)
+}
+
+func diffWorkspaceChanges(
+	before,
+	after []syncfs.Entry,
+	ignoreMode bool,
+) ([]syncfs.Entry, []string) {
+	return syncfs.Diff(before, after, syncfs.DiffOptions{IgnoreMode: ignoreMode})
 }
 
 func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.BuildProgress) {
@@ -1089,7 +1121,14 @@ func (s *Server) runPipeCommand(
 
 	stdinDone := make(chan error, 1)
 
-	go func() { stdinDone <- s.consumePipeInput(conn, stdin) }()
+	go func() {
+		err := s.consumePipeInput(conn, stdin)
+		if err != nil {
+			cancel()
+		}
+
+		stdinDone <- err
+	}()
 
 	waitErr := cmd.Wait()
 	_ = stdin.Close()
@@ -1109,10 +1148,6 @@ func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) err
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-
 			return err
 		}
 
