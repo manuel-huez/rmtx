@@ -104,6 +104,8 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 	defer closeQuietly(conn.Raw())
+	stopContextClose := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
+	defer stopContextClose()
 
 	if err := runHandshake(conn, request, manifest.BlobSources); err != nil {
 		return 1, err

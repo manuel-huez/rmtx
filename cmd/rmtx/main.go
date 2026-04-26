@@ -569,7 +569,7 @@ func resolveTTYMode(force, disable bool) (app.TTYMode, error) {
 	case disable:
 		return app.TTYDisable, nil
 	default:
-		return app.TTYAuto, nil
+		return app.TTYDisable, nil
 	}
 }
 
