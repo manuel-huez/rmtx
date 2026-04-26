@@ -46,6 +46,7 @@ type Entry struct {
 	Hash     string    `json:"hash,omitempty"`
 	Size     int64     `json:"size,omitempty"`
 	Mode     uint32    `json:"mode,omitempty"`
+	ModTime  int64     `json:"mod_time,omitempty"`
 	Linkname string    `json:"linkname,omitempty"`
 }
 
@@ -57,6 +58,7 @@ type BuildResult struct {
 type BuildOptions struct {
 	Progress         func(BuildProgress)
 	ProgressInterval time.Duration
+	PreviousEntries  []Entry
 }
 
 type BuildProgress struct {
@@ -120,9 +122,10 @@ func BuildManifestContextOptions(
 
 	entries := map[string]Entry{}
 	blobSources := map[string]string{}
+	previous := previousFileEntries(opts.PreviousEntries)
 	progress := newProgressReporter(opts)
 
-	jobs, err := enqueueMountJobs(ctx, root, mounts, entries, progress)
+	jobs, err := enqueueMountJobs(ctx, root, mounts, entries, blobSources, previous, progress)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -292,12 +295,14 @@ func enqueueMountJobs(
 	root string,
 	mounts []MountSpec,
 	entries map[string]Entry,
+	blobSources map[string]string,
+	previous map[string]Entry,
 	progress *progressReporter,
 ) ([]hashJob, error) {
 	jobs := []hashJob{}
 
 	for _, mount := range mounts {
-		addedJobs, walkErr := walkMount(ctx, root, mount, entries, progress)
+		addedJobs, walkErr := walkMount(ctx, root, mount, entries, blobSources, previous, progress)
 		if walkErr != nil {
 			return nil, walkErr
 		}
@@ -314,6 +319,8 @@ func walkMount(
 	root string,
 	mount MountSpec,
 	entries map[string]Entry,
+	blobSources map[string]string,
+	previous map[string]Entry,
 	progress *progressReporter,
 ) ([]hashJob, error) {
 	mountPath, err := resolveAndStatMount(root, mount.Path)
@@ -377,9 +384,15 @@ func walkMount(
 			}
 
 			if isFile {
+				if reuseCachedFile(entry, absPath, entries, blobSources, previous) {
+					reportFileWalked(&stats, progress)
+
+					return nil
+				}
+
 				jobs = append(jobs, hashJob{AbsPath: absPath, Entry: entry})
-				stats.Files++
-				progress.Report(stats, false)
+
+				reportFileWalked(&stats, progress)
 
 				return nil
 			}
@@ -454,23 +467,74 @@ func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
 			Kind:     KindSymlink,
 			Linkname: target,
 			Mode:     uint32(mode.Perm()),
+			ModTime:  info.ModTime().UnixNano(),
 		}, false, nil
 	case d.IsDir():
 		return Entry{
-			Path: relRoot,
-			Kind: KindDir,
-			Mode: uint32(mode.Perm()),
+			Path:    relRoot,
+			Kind:    KindDir,
+			Mode:    uint32(mode.Perm()),
+			ModTime: info.ModTime().UnixNano(),
 		}, false, nil
 	case mode.IsRegular():
 		return Entry{
-			Path: relRoot,
-			Kind: KindFile,
-			Size: info.Size(),
-			Mode: uint32(mode.Perm()),
+			Path:    relRoot,
+			Kind:    KindFile,
+			Size:    info.Size(),
+			Mode:    uint32(mode.Perm()),
+			ModTime: info.ModTime().UnixNano(),
 		}, true, nil
 	default:
 		return Entry{}, false, nil
 	}
+}
+
+func previousFileEntries(entries []Entry) map[string]Entry {
+	previous := map[string]Entry{}
+
+	for _, entry := range entries {
+		if entry.Kind == KindFile && entry.Hash != "" {
+			previous[entry.Path] = entry
+		}
+	}
+
+	return previous
+}
+
+func reuseCachedFile(
+	entry Entry,
+	absPath string,
+	entries map[string]Entry,
+	blobSources map[string]string,
+	previous map[string]Entry,
+) bool {
+	prev := previous[entry.Path]
+	if !reuseFileHash(prev, entry) {
+		return false
+	}
+
+	entry.Hash = prev.Hash
+	entries[entry.Path] = entry
+
+	if _, exists := blobSources[entry.Hash]; !exists {
+		blobSources[entry.Hash] = absPath
+	}
+
+	return true
+}
+
+func reuseFileHash(previous Entry, current Entry) bool {
+	return previous.Kind == KindFile &&
+		previous.Hash != "" &&
+		previous.Size == current.Size &&
+		previous.Mode == current.Mode &&
+		previous.ModTime != 0 &&
+		previous.ModTime == current.ModTime
+}
+
+func reportFileWalked(stats *BuildProgress, progress *progressReporter) {
+	stats.Files++
+	progress.Report(*stats, false)
 }
 
 func Diff(before, after []Entry) (changed []Entry, deleted []string) {
@@ -635,7 +699,7 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return fmt.Errorf("rename file %s: %w", entry.Path, err)
 	}
 
-	return nil
+	return setFileModTime(target, entry.ModTime)
 }
 
 func resolveMount(root, mountPath string) (string, error) {

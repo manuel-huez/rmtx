@@ -163,7 +163,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 		Command: []string{
 			"sh",
 			"-c",
-			`printf "%s\n" "$FORWARD_ME"; cat hello.txt; mkdir -p cache; echo persisted > cache/marker; echo changed > hello.txt`,
+			`printf "%s\n" "$FORWARD_ME"; cat hello.txt; mkdir -p cache; echo persisted > cache/marker; cp -p hello.txt .hello-stamp; printf "changed\n" > hello.txt; touch -r .hello-stamp hello.txt; rm .hello-stamp`,
 		},
 		Stdout: &stdout1,
 		Stderr: &stderr1,

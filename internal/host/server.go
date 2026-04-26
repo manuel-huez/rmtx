@@ -34,6 +34,7 @@ const (
 	defaultFileMode    = 0o644
 	reverseDialTimeout = 5 * time.Second
 	progressEvery      = 3 * time.Second
+	blobUploadParallel = 4
 )
 
 type Options struct {
@@ -60,6 +61,8 @@ type Server struct {
 	contextLocks   map[string]*sync.Mutex
 	activeMu       sync.Mutex
 	activeContexts map[string]int
+	uploadsMu      sync.Mutex
+	uploads        map[string]*blobUploadSession
 }
 
 func New(opts Options) (*Server, error) {
@@ -109,6 +112,7 @@ func New(opts Options) (*Server, error) {
 		fingerprint:    fingerprint,
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
+		uploads:        map[string]*blobUploadSession{},
 	}, nil
 }
 
@@ -296,6 +300,7 @@ func (s *Server) handleRunRequest(
 	}
 
 	if err := s.syncContextFromClient(
+		parent,
 		conn,
 		request.ContextID,
 		request.Session,
@@ -341,6 +346,8 @@ func (s *Server) dispatchSessionRequest(
 	switch head.Type {
 	case protocol.MsgRunRequest:
 		return s.dispatchRunRequest(parent, conn, head)
+	case protocol.MsgBlobUploadRequest:
+		return s.dispatchBlobUploadRequest(conn, head)
 	case protocol.MsgPingRequest:
 		return s.discardAndHandle(head, conn, s.handlePing)
 	case protocol.MsgListContextsRequest:
@@ -385,6 +392,15 @@ func (s *Server) dispatchRunRequest(
 	}
 
 	return s.handleRunRequest(parent, conn, req)
+}
+
+func (s *Server) dispatchBlobUploadRequest(conn *protocol.Conn, head protocol.Header) error {
+	req, err := protocol.DecodeData[protocol.BlobUploadRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleBlobUploadRequest(conn, req)
 }
 
 func (s *Server) dispatchDeleteContexts(conn *protocol.Conn, head protocol.Header) error {
@@ -693,7 +709,13 @@ func sendChangedFileBlob(
 
 	return conn.WriteFrom(
 		protocol.MsgChangeBlob,
-		protocol.BlobInfo{Path: entry.Path, Hash: entry.Hash, Size: entry.Size, Mode: entry.Mode},
+		protocol.BlobInfo{
+			Path:    entry.Path,
+			Hash:    entry.Hash,
+			Size:    entry.Size,
+			Mode:    entry.Mode,
+			ModTime: entry.ModTime,
+		},
 		&logReader{src: f, onRead: onRead},
 		entry.Size,
 	)
@@ -783,10 +805,12 @@ func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest
 }
 
 func (s *Server) receiveBlobs(
+	ctx context.Context,
 	conn *protocol.Conn,
 	contextID string,
 	session string,
 	total int,
+	upload *blobUploadSession,
 ) error {
 	s.logger.Printf(
 		"receiving client blobs: context=%s session=%s files=%d",
@@ -809,46 +833,26 @@ func (s *Server) receiveBlobs(
 
 		switch head.Type {
 		case protocol.MsgBlob:
-			info, err := protocol.DecodeData[protocol.BlobInfo](head)
-			if err != nil {
-				return err
-			}
-
-			if info.Hash == "" {
-				return errors.New("blob hash is required")
-			}
-
-			reader := &logReader{
-				src: conn.PayloadReader(head),
-				onRead: func(n int) {
-					bytesReceived += int64(n)
-
-					now := time.Now()
-					if lastProgress.IsZero() || now.Sub(lastProgress) >= progressEvery {
-						lastProgress = now
-
-						s.logger.Printf(
-							"receive blob progress: context=%s session=%s files=%d/%d bytes=%d",
-							contextID,
-							session,
-							received,
-							total,
-							bytesReceived,
-						)
-					}
-				},
-			}
-
-			if err := s.blobStore.Store(
-				info.Hash,
-				head.PayloadLen,
-				reader,
+			if err := s.receiveControlBlob(
+				conn,
+				head,
+				contextID,
+				session,
+				total,
+				&received,
+				&bytesReceived,
+				&lastProgress,
+				upload,
 			); err != nil {
 				return err
 			}
-
-			received++
 		case protocol.MsgSyncComplete:
+			if upload != nil {
+				if err := waitForBlobUpload(ctx, upload); err != nil {
+					return err
+				}
+			}
+
 			s.logger.Printf(
 				"receiving client blobs done: context=%s session=%s files=%d/%d bytes=%d",
 				contextID,
@@ -866,6 +870,75 @@ func (s *Server) receiveBlobs(
 
 			return fmt.Errorf("unexpected sync frame: %s", head.Type)
 		}
+	}
+}
+
+func (s *Server) receiveControlBlob(
+	conn *protocol.Conn,
+	head protocol.Header,
+	contextID string,
+	session string,
+	total int,
+	received *int,
+	bytesReceived *int64,
+	lastProgress *time.Time,
+	upload *blobUploadSession,
+) error {
+	info, err := protocol.DecodeData[protocol.BlobInfo](head)
+	if err != nil {
+		return err
+	}
+
+	if info.Hash == "" {
+		return errors.New("blob hash is required")
+	}
+
+	reader := &logReader{
+		src: conn.PayloadReader(head),
+		onRead: func(n int) {
+			*bytesReceived += int64(n)
+
+			now := time.Now()
+			if lastProgress.IsZero() || now.Sub(*lastProgress) >= progressEvery {
+				*lastProgress = now
+
+				s.logger.Printf(
+					"receive blob progress: context=%s session=%s files=%d/%d bytes=%d",
+					contextID,
+					session,
+					*received,
+					total,
+					*bytesReceived,
+				)
+			}
+		},
+	}
+
+	if err := s.blobStore.Store(info.Hash, head.PayloadLen, reader); err != nil {
+		return err
+	}
+
+	if upload != nil {
+		if err := upload.complete(info.Hash); err != nil {
+			return err
+		}
+	}
+
+	(*received)++
+
+	return nil
+}
+
+func waitForBlobUpload(ctx context.Context, upload *blobUploadSession) error {
+	done := make(chan error, 1)
+
+	go func() { done <- upload.wait() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

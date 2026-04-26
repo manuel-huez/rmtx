@@ -6,8 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	testFilePath = "file.txt"
+	cachedHash   = "cached-hash"
 )
 
 func TestBuildManifestRespectsExcludePatterns(t *testing.T) {
@@ -99,7 +105,7 @@ func TestBuildManifestContextStopsCanceledWalk(t *testing.T) {
 
 func TestDiffAndBlobStoreMissingHashes(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "file.txt"), "one")
+	mustWrite(t, filepath.Join(root, testFilePath), "one")
 
 	before, err := BuildManifest(root, []MountSpec{{Path: "."}})
 	if err != nil {
@@ -138,7 +144,7 @@ func TestDiffAndBlobStoreMissingHashes(t *testing.T) {
 		t.Fatalf("expected cache hit on second pass, got %v", got)
 	}
 
-	mustWrite(t, filepath.Join(root, "file.txt"), "two")
+	mustWrite(t, filepath.Join(root, testFilePath), "two")
 
 	after, err := BuildManifest(root, []MountSpec{{Path: "."}})
 	if err != nil {
@@ -150,8 +156,127 @@ func TestDiffAndBlobStoreMissingHashes(t *testing.T) {
 		t.Fatalf("unexpected deletions: %v", deleted)
 	}
 
-	if len(changed) != 1 || changed[0].Path != "file.txt" {
+	if len(changed) != 1 || changed[0].Path != testFilePath {
 		t.Fatalf("unexpected changes: %#v", changed)
+	}
+}
+
+func TestBuildManifestReusesPreviousFileHashWhenMetadataMatches(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, testFilePath)
+	mustWrite(t, path, "unchanged")
+
+	initial, err := BuildManifest(root, []MountSpec{{Path: "."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := initial.Entries
+	for i := range previous {
+		if previous[i].Path == testFilePath {
+			previous[i].Hash = cachedHash
+		}
+	}
+
+	result, err := BuildManifestContextOptions(
+		context.Background(),
+		root,
+		[]MountSpec{{Path: "."}},
+		BuildOptions{PreviousEntries: previous},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var file Entry
+
+	for _, entry := range result.Entries {
+		if entry.Path == testFilePath {
+			file = entry
+		}
+	}
+
+	if file.Hash != cachedHash {
+		t.Fatalf("expected cached hash reuse, got %q", file.Hash)
+	}
+
+	if result.BlobSources[cachedHash] != path {
+		t.Fatalf("expected reused hash to keep blob source, got %#v", result.BlobSources)
+	}
+}
+
+func TestBuildManifestHashesFileWhenMetadataChanges(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, testFilePath), "content")
+
+	previous := []Entry{{
+		Path:    testFilePath,
+		Kind:    KindFile,
+		Hash:    cachedHash,
+		Size:    int64(len("content")),
+		Mode:    0o644,
+		ModTime: 1,
+	}}
+
+	result, err := BuildManifestContextOptions(
+		context.Background(),
+		root,
+		[]MountSpec{{Path: "."}},
+		BuildOptions{PreviousEntries: previous},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, entry := range result.Entries {
+		if entry.Path == testFilePath && entry.Hash == cachedHash {
+			t.Fatal("expected metadata mismatch to force hashing")
+		}
+	}
+}
+
+func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+	content := "same content"
+	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	first := filepath.Join(root, "first.txt")
+	second := filepath.Join(root, "second.txt")
+	firstMod := time.Unix(100, 0).UnixNano()
+	secondMod := time.Unix(200, 0).UnixNano()
+
+	if err := store.Materialize(hash, first, 0o644, firstMod); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Materialize(hash, second, 0o644, secondMod); err != nil {
+		t.Fatal(err)
+	}
+
+	firstInfo, err := os.Stat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondInfo, err := os.Stat(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if firstInfo.ModTime().UnixNano() != firstMod {
+		t.Fatalf("first mtime changed through duplicate-content materialize: got %d want %d", firstInfo.ModTime().UnixNano(), firstMod)
+	}
+
+	if secondInfo.ModTime().UnixNano() != secondMod {
+		t.Fatalf("second mtime mismatch: got %d want %d", secondInfo.ModTime().UnixNano(), secondMod)
 	}
 }
 

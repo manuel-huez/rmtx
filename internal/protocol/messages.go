@@ -14,6 +14,7 @@ const (
 	MsgPairResponse           = "pair_response"
 	MsgRunRequest             = "run_request"
 	MsgNeedBlobs              = "need_blobs"
+	MsgBlobUploadRequest      = "blob_upload_request"
 	MsgBlob                   = "blob"
 	MsgSyncComplete           = "sync_complete"
 	MsgWorkspaceReady         = "workspace_ready"
@@ -59,10 +60,11 @@ type ErrorMessage struct {
 }
 
 type BlobInfo struct {
-	Path string `json:"path,omitempty"`
-	Hash string `json:"hash"`
-	Size int64  `json:"size,omitempty"`
-	Mode uint32 `json:"mode,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Hash    string `json:"hash"`
+	Size    int64  `json:"size,omitempty"`
+	Mode    uint32 `json:"mode,omitempty"`
+	ModTime int64  `json:"mod_time,omitempty"`
 }
 
 type OutputInfo struct {
@@ -75,7 +77,15 @@ type ExitInfo struct {
 }
 
 type NeedBlobs struct {
-	Hashes []string `json:"hashes"`
+	Hashes      []string `json:"hashes"`
+	UploadToken string   `json:"upload_token,omitempty"`
+	Parallel    int      `json:"parallel,omitempty"`
+}
+
+type BlobUploadRequest struct {
+	ContextID string `json:"context_id"`
+	Session   string `json:"session"`
+	Token     string `json:"token"`
 }
 
 type ChangeSet struct {

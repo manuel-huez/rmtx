@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -467,6 +468,7 @@ func (s *Server) removeContextDir(id, path string) error {
 }
 
 func (s *Server) syncContextFromClient(
+	ctx context.Context,
 	conn *protocol.Conn,
 	contextID string,
 	session string,
@@ -477,6 +479,14 @@ func (s *Server) syncContextFromClient(
 	changed, deleted := syncfs.Diff(current, target)
 
 	missing := s.blobStore.MissingHashes(changed)
+
+	upload, err := s.prepareBlobUploadSession(contextID, session, missing)
+	if err != nil {
+		return err
+	}
+
+	defer s.unregisterBlobUploadSession(upload.token)
+
 	s.logger.Printf(
 		"sync from client started: context=%s session=%s changed=%d deleted=%d missing_blobs=%d",
 		contextID,
@@ -488,12 +498,12 @@ func (s *Server) syncContextFromClient(
 
 	if err := conn.WriteJSON(
 		protocol.MsgNeedBlobs,
-		protocol.NeedBlobs{Hashes: missing},
+		needBlobsMessage(missing, upload),
 	); err != nil {
 		return err
 	}
 
-	if err := s.receiveBlobs(conn, contextID, session, len(missing)); err != nil {
+	if err := s.receiveBlobs(ctx, conn, contextID, session, len(missing), upload); err != nil {
 		return err
 	}
 
@@ -535,6 +545,7 @@ func (s *Server) syncContextFromClient(
 			entry.Hash,
 			targetPath,
 			mode,
+			entry.ModTime,
 		); err != nil {
 			return fmt.Errorf("materialize %s in context %s: %w", entry.Path, contextID, err)
 		}
@@ -543,4 +554,30 @@ func (s *Server) syncContextFromClient(
 	s.logger.Printf("sync from client complete: context=%s session=%s", contextID, session)
 
 	return nil
+}
+
+func (s *Server) prepareBlobUploadSession(
+	contextID string,
+	session string,
+	missing []string,
+) (*blobUploadSession, error) {
+	token, err := protocol.RandomNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	upload := newBlobUploadSession(contextID, session, token, missing)
+	s.registerBlobUploadSession(upload)
+
+	return upload, nil
+}
+
+func needBlobsMessage(missing []string, upload *blobUploadSession) protocol.NeedBlobs {
+	msg := protocol.NeedBlobs{Hashes: missing}
+	if upload != nil {
+		msg.UploadToken = upload.token
+		msg.Parallel = blobUploadParallel
+	}
+
+	return msg
 }

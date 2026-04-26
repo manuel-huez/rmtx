@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type BlobStore struct{ root string }
@@ -96,37 +97,68 @@ func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
 	return nil
 }
 
-func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode) error {
+func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode, modTime int64) error {
 	src := s.Path(hash)
 
 	if err := os.MkdirAll(filepath.Dir(dest), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create destination dir: %w", err)
 	}
 
-	if err := os.Link(src, dest); err == nil {
-		return os.Chmod(dest, mode)
+	if modTime == 0 {
+		if err := os.Link(src, dest); err == nil {
+			return os.Chmod(dest, mode)
+		}
 	}
 
+	return copyBlobToFile(src, dest, mode, modTime)
+}
+
+func copyBlobToFile(src, dest string, mode fs.FileMode, modTime int64) error {
 	in, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("open blob %s: %w", hash, err)
+		return fmt.Errorf("open blob %s: %w", filepath.Base(src), err)
 	}
 
 	defer func() { _ = in.Close() }()
 
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	tmp := dest + ".rmtx-tmp"
+
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("create destination file: %w", err)
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("copy blob: %w", err)
 	}
 
 	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("close destination file: %w", err)
 	}
 
-	return os.Chmod(dest, mode)
+	if err := os.Chmod(tmp, mode); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	_ = os.RemoveAll(dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename destination file: %w", err)
+	}
+
+	return setFileModTime(dest, modTime)
+}
+
+func setFileModTime(path string, modTime int64) error {
+	if modTime == 0 {
+		return nil
+	}
+
+	t := time.Unix(0, modTime)
+
+	return os.Chtimes(path, t, t)
 }
