@@ -254,6 +254,7 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 
 	conn := protocol.NewConn(raw)
 	if err := s.handleConnSession(parent, conn); err != nil {
+		s.logger.Printf("request failed: remote=%s error=%v", raw.RemoteAddr(), err)
 		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
 }
@@ -263,6 +264,8 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	if err != nil {
 		return err
 	}
+
+	s.logger.Printf("request received: remote=%s type=%s", conn.Raw().RemoteAddr(), head.Type)
 
 	return s.dispatchSessionRequest(parent, conn, head)
 }
@@ -503,6 +506,12 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		return err
 	}
 
+	s.logger.Printf(
+		"ping request handled: remote=%s contexts=%d",
+		conn.Raw().RemoteAddr(),
+		len(contexts),
+	)
+
 	return conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
 		Online:       true,
 		Version:      version.String(),
@@ -520,6 +529,13 @@ func (s *Server) handleListContexts(conn *protocol.Conn) error {
 		return err
 	}
 
+	s.logger.Printf(
+		"context list handled: remote=%s contexts=%d ids=%s",
+		conn.Raw().RemoteAddr(),
+		len(contexts),
+		formatContextSummaryIDs(contexts),
+	)
+
 	return conn.WriteJSON(
 		protocol.MsgListContextsResponse,
 		protocol.ListContextsResponse{Contexts: contexts},
@@ -530,10 +546,25 @@ func (s *Server) handleDeleteContexts(
 	conn *protocol.Conn,
 	req protocol.DeleteContextsRequest,
 ) error {
+	s.logger.Printf(
+		"context delete requested: remote=%s ids=%s all=%t older_than=%q",
+		conn.Raw().RemoteAddr(),
+		formatStrings(req.IDs),
+		req.All,
+		req.OlderThan,
+	)
+
 	resp, err := s.deleteContexts(req)
 	if err != nil {
 		return err
 	}
+
+	s.logger.Printf(
+		"context delete handled: remote=%s deleted=%s not_found=%s",
+		conn.Raw().RemoteAddr(),
+		formatContextSummaryIDs(resp.Deleted),
+		formatStrings(resp.NotFound),
+	)
 
 	return conn.WriteJSON(protocol.MsgDeleteContextsResponse, resp)
 }

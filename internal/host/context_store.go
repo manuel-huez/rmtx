@@ -347,6 +347,16 @@ func (s *Server) deleteContexts(
 		return protocol.DeleteContextsResponse{}, err
 	}
 
+	s.logger.Printf(
+		"context delete targets selected: requested_ids=%s all=%t older_than=%q available=%d targets=%s not_found=%s",
+		formatStrings(req.IDs),
+		req.All,
+		req.OlderThan,
+		len(contexts),
+		formatContextMapIDs(targets),
+		formatStrings(notFound),
+	)
+
 	deleted, err := s.removeContexts(targets)
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
@@ -444,14 +454,62 @@ func (s *Server) removeContexts(
 ) ([]protocol.ContextSummary, error) {
 	deleted := make([]protocol.ContextSummary, 0, len(targets))
 	for id, context := range targets {
+		s.logger.Printf(
+			"deleting context: id=%s name=%q path=%s workspace=%s active=%t",
+			id,
+			context.Name,
+			context.Path,
+			context.Workspace,
+			context.Active,
+		)
+
 		if err := s.removeContextDir(id, context.Path); err != nil {
 			return nil, err
 		}
+
+		s.logger.Printf("context deleted: id=%s path=%s", id, context.Path)
 
 		deleted = append(deleted, context)
 	}
 
 	return deleted, nil
+}
+
+func formatStrings(values []string) string {
+	if len(values) == 0 {
+		return "-"
+	}
+
+	ordered := append([]string(nil), values...)
+	sort.Strings(ordered)
+
+	return strings.Join(ordered, ",")
+}
+
+func formatContextSummaryIDs(contexts []protocol.ContextSummary) string {
+	if len(contexts) == 0 {
+		return "-"
+	}
+
+	ids := make([]string, 0, len(contexts))
+	for _, context := range contexts {
+		ids = append(ids, context.ID)
+	}
+
+	return formatStrings(ids)
+}
+
+func formatContextMapIDs(contexts map[string]protocol.ContextSummary) string {
+	if len(contexts) == 0 {
+		return "-"
+	}
+
+	ids := make([]string, 0, len(contexts))
+	for id := range contexts {
+		ids = append(ids, id)
+	}
+
+	return formatStrings(ids)
 }
 
 func (s *Server) removeContextDir(id, path string) error {
