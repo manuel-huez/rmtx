@@ -22,9 +22,8 @@ import (
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
+	"github.com/manuel-huez/rmtx/internal/version"
 )
-
-const Version = "0.6.4"
 
 const (
 	defaultDirMode     = 0o755
@@ -465,7 +464,7 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 
 	return conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
 		Online:       true,
-		Version:      Version,
+		Version:      version.String(),
 		Name:         s.hostName(),
 		Address:      s.Addr(),
 		Fingerprint:  s.fingerprint,

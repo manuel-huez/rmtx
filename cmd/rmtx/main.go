@@ -16,7 +16,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/app"
 	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/config"
-	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/version"
 )
 
 const exitUsage = 2
@@ -55,7 +55,7 @@ func run(ctx context.Context, args []string) int {
 
 	switch args[0] {
 	case "version", "--version", "-v":
-		_, _ = fmt.Fprintln(os.Stdout, host.Version)
+		_, _ = fmt.Fprintln(os.Stdout, version.String())
 		return 0
 	case "host":
 		return runHost(ctx, args[1:])
