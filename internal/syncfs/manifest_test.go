@@ -93,6 +93,48 @@ func TestBuildManifestHandlesMoreFilesThanWorkers(t *testing.T) {
 	}
 }
 
+func TestBuildManifestSkipsSymlinkEscapingRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	mustWrite(t, outside, "outside")
+	mustSymlinkOrSkip(t, outside, filepath.Join(root, "outside-link"))
+
+	result, err := BuildManifest(root, []MountSpec{{Path: "."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, entry := range result.Entries {
+		if entry.Path == "outside-link" {
+			t.Fatalf("escaping symlink leaked into manifest: %#v", entry)
+		}
+	}
+}
+
+func TestBuildManifestMakesAbsoluteInRootSymlinkPortable(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	mustWrite(t, target, "target")
+	mustSymlinkOrSkip(t, target, filepath.Join(root, "target-link"))
+
+	result, err := BuildManifest(root, []MountSpec{{Path: "."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, entry := range result.Entries {
+		if entry.Path == "target-link" {
+			if entry.Kind != KindSymlink || entry.Linkname != "target.txt" {
+				t.Fatalf("unexpected portable symlink entry: %#v", entry)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("expected symlink entry in manifest: %#v", result.Entries)
+}
+
 func TestBuildManifestContextStopsCanceledWalk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -100,6 +142,29 @@ func TestBuildManifestContextStopsCanceledWalk(t *testing.T) {
 	_, err := BuildManifestContext(ctx, t.TempDir(), []MountSpec{{Path: "."}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestPreserveMissingEntriesKeepsMissingKindOnly(t *testing.T) {
+	entries := []Entry{{Path: "kept.txt", Kind: KindFile, Hash: "hash"}}
+	preserve := []Entry{
+		{Path: "link", Kind: KindSymlink, Linkname: "target"},
+		{Path: "missing.txt", Kind: KindFile, Hash: "other"},
+	}
+
+	got := PreserveMissingEntries(entries, preserve, KindSymlink)
+
+	paths := map[string]Entry{}
+	for _, entry := range got {
+		paths[entry.Path] = entry
+	}
+
+	if _, ok := paths["link"]; !ok {
+		t.Fatalf("missing symlink was not preserved: %#v", got)
+	}
+
+	if _, ok := paths["missing.txt"]; ok {
+		t.Fatalf("wrong kind was preserved: %#v", got)
 	}
 }
 
@@ -242,6 +307,7 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 	}
 
 	const hash = "abcdef"
+
 	content := "same content"
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
@@ -272,11 +338,19 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 	}
 
 	if firstInfo.ModTime().UnixNano() != firstMod {
-		t.Fatalf("first mtime changed through duplicate-content materialize: got %d want %d", firstInfo.ModTime().UnixNano(), firstMod)
+		t.Fatalf(
+			"first mtime changed through duplicate-content materialize: got %d want %d",
+			firstInfo.ModTime().UnixNano(),
+			firstMod,
+		)
 	}
 
 	if secondInfo.ModTime().UnixNano() != secondMod {
-		t.Fatalf("second mtime mismatch: got %d want %d", secondInfo.ModTime().UnixNano(), secondMod)
+		t.Fatalf(
+			"second mtime mismatch: got %d want %d",
+			secondInfo.ModTime().UnixNano(),
+			secondMod,
+		)
 	}
 }
 
@@ -289,5 +363,13 @@ func mustWrite(t *testing.T, path, content string) {
 
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func mustSymlinkOrSkip(t *testing.T, oldname, newname string) {
+	t.Helper()
+
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
 	}
 }

@@ -378,7 +378,7 @@ func walkMount(
 				return nil
 			}
 
-			entry, isFile, err := buildEntry(absPath, relRoot, d)
+			entry, isFile, err := buildEntry(root, absPath, relRoot, d)
 			if err != nil {
 				return err
 			}
@@ -448,7 +448,7 @@ func shouldSkipEntry(relRoot, relMount string, matcher excludeMatcher, d fs.DirE
 	return false, true
 }
 
-func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
+func buildEntry(root, absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
 	info, err := d.Info()
 	if err != nil {
 		return Entry{}, false, err
@@ -457,15 +457,19 @@ func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
 	mode := info.Mode()
 	switch {
 	case mode&os.ModeSymlink != 0:
-		target, err := os.Readlink(absPath)
+		linkname, ok, err := portableSymlinkTarget(root, absPath)
 		if err != nil {
-			return Entry{}, false, fmt.Errorf("read symlink %s: %w", absPath, err)
+			return Entry{}, false, err
+		}
+
+		if !ok {
+			return Entry{}, false, nil
 		}
 
 		return Entry{
 			Path:     relRoot,
 			Kind:     KindSymlink,
-			Linkname: target,
+			Linkname: linkname,
 			Mode:     uint32(mode.Perm()),
 			ModTime:  info.ModTime().UnixNano(),
 		}, false, nil
@@ -487,6 +491,45 @@ func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
 	default:
 		return Entry{}, false, nil
 	}
+}
+
+func portableSymlinkTarget(root, absPath string) (string, bool, error) {
+	target, err := os.Readlink(absPath)
+	if err != nil {
+		return "", false, fmt.Errorf("read symlink %s: %w", absPath, err)
+	}
+
+	linkDir := filepath.Dir(absPath)
+
+	if filepath.IsAbs(target) {
+		cleanTarget := filepath.Clean(target)
+		if !pathWithinRoot(root, cleanTarget) {
+			return "", false, nil
+		}
+
+		rel, err := filepath.Rel(linkDir, cleanTarget)
+		if err != nil {
+			return "", false, fmt.Errorf("rel symlink target %s: %w", absPath, err)
+		}
+
+		return filepath.ToSlash(rel), true, nil
+	}
+
+	resolved := filepath.Clean(filepath.Join(linkDir, target))
+	if !pathWithinRoot(root, resolved) {
+		return "", false, nil
+	}
+
+	return filepath.ToSlash(target), true, nil
+}
+
+func pathWithinRoot(root, absPath string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(absPath))
+	if err != nil {
+		return false
+	}
+
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func previousFileEntries(entries []Entry) map[string]Entry {
@@ -568,6 +611,26 @@ func Diff(before, after []Entry) (changed []Entry, deleted []string) {
 	return changed, deleted
 }
 
+func PreserveMissingEntries(entries, preserve []Entry, kind EntryKind) []Entry {
+	out := append([]Entry(nil), entries...)
+	seen := map[string]bool{}
+
+	for _, entry := range out {
+		seen[entry.Path] = true
+	}
+
+	for _, entry := range preserve {
+		if entry.Kind == kind && !seen[entry.Path] {
+			out = append(out, entry)
+			seen[entry.Path] = true
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+
+	return out
+}
+
 func DeletePaths(root string, paths []string) error {
 	sorted := append([]string(nil), paths...)
 	sort.Slice(sorted, func(i, j int) bool { return depth(sorted[i]) > depth(sorted[j]) })
@@ -639,6 +702,10 @@ func applyNonFileEntry(entry Entry, target string) error {
 
 		_ = os.RemoveAll(target)
 		if err := os.Symlink(entry.Linkname, target); err != nil {
+			if isUnsupportedWindowsSymlink(err) {
+				return nil
+			}
+
 			return fmt.Errorf("symlink %s: %w", entry.Path, err)
 		}
 	case KindFile:
@@ -648,6 +715,10 @@ func applyNonFileEntry(entry Entry, target string) error {
 	}
 
 	return nil
+}
+
+func isUnsupportedWindowsSymlink(err error) bool {
+	return runtime.GOOS == "windows" && strings.Contains(strings.ToLower(err.Error()), "privilege")
 }
 
 func WriteFile(root string, entry Entry, src io.Reader) error {

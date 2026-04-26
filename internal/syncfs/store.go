@@ -131,6 +131,7 @@ func copyBlobToFile(src, dest string, mode fs.FileMode, modTime int64) error {
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)
+
 		return fmt.Errorf("copy blob: %w", err)
 	}
 

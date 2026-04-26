@@ -479,16 +479,25 @@ func (s *Server) executeAndSyncRun(
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}
 
+	postEntries := post.Entries
+	if runtime.GOOS == "windows" {
+		postEntries = syncfs.PreserveMissingEntries(
+			postEntries,
+			request.Manifest,
+			syncfs.KindSymlink,
+		)
+	}
+
 	if err := s.sendWorkspaceChanges(
 		conn,
 		handle.workspace,
 		request.Manifest,
-		post.Entries,
+		postEntries,
 	); err != nil {
 		return err
 	}
 
-	if err := s.saveTrackedManifest(request.ContextID, post.Entries); err != nil {
+	if err := s.saveTrackedManifest(request.ContextID, postEntries); err != nil {
 		return err
 	}
 
