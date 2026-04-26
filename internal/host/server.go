@@ -431,7 +431,7 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
-	post, err := syncfs.BuildManifest(handle.workspace, request.Mounts)
+	post, err := syncfs.BuildManifestContext(parent, handle.workspace, request.Mounts)
 	if err != nil {
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}

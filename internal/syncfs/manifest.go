@@ -1,6 +1,7 @@
 package syncfs
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -74,66 +75,29 @@ type hashResult struct {
 }
 
 func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
+	return BuildManifestContext(context.Background(), root, mounts)
+}
+
+func BuildManifestContext(
+	ctx context.Context,
+	root string,
+	mounts []MountSpec,
+) (BuildResult, error) {
 	root, mounts, err := normalizeBuildInputs(root, mounts)
 	if err != nil {
 		return BuildResult{}, err
 	}
 
-	jobs := make(chan hashJob)
-	results := make(chan hashResult)
-
-	workers := max(runtime.GOMAXPROCS(0), minWorkers)
-
-	var wg sync.WaitGroup
-	wg.Add(workers)
-
-	for range workers {
-		go func() {
-			defer wg.Done()
-
-			for job := range jobs {
-				h, err := hashFile(job.AbsPath)
-				if err != nil {
-					results <- hashResult{Err: err}
-					continue
-				}
-
-				job.Entry.Hash = h
-				results <- hashResult{AbsPath: job.AbsPath, Entry: job.Entry}
-			}
-		}()
-	}
-
-	go func() { wg.Wait(); close(results) }()
-
 	entries := map[string]Entry{}
 	blobSources := map[string]string{}
 
-	jobCount, err := enqueueMountJobs(root, mounts, entries, jobs, results)
+	jobs, err := enqueueMountJobs(ctx, root, mounts, entries)
 	if err != nil {
 		return BuildResult{}, err
 	}
 
-	close(jobs)
-
-	for range jobCount {
-		res, ok := <-results
-		if !ok {
-			break
-		}
-
-		if res.Err != nil {
-			drainResults(results)
-			return BuildResult{}, res.Err
-		}
-
-		entries[res.Entry.Path] = res.Entry
-		if _, exists := blobSources[res.Entry.Hash]; !exists {
-			blobSources[res.Entry.Hash] = res.AbsPath
-		}
-	}
-
-	for range results {
+	if err := hashManifestFiles(ctx, jobs, entries, blobSources); err != nil {
+		return BuildResult{}, err
 	}
 
 	out := make([]Entry, 0, len(entries))
@@ -144,6 +108,95 @@ func BuildManifest(root string, mounts []MountSpec) (BuildResult, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 
 	return BuildResult{Entries: out, BlobSources: blobSources}, nil
+}
+
+func hashManifestFiles(
+	ctx context.Context,
+	jobs []hashJob,
+	entries map[string]Entry,
+	blobSources map[string]string,
+) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workers := max(runtime.GOMAXPROCS(0), minWorkers)
+	jobCh := make(chan hashJob)
+	results := make(chan hashResult)
+
+	startHashWorkers(ctx, workers, jobCh, results)
+	sendHashJobs(ctx, jobs, jobCh)
+
+	for res := range results {
+		if res.Err != nil {
+			cancel()
+
+			for range results {
+			}
+
+			return res.Err
+		}
+
+		entries[res.Entry.Path] = res.Entry
+		if _, exists := blobSources[res.Entry.Hash]; !exists {
+			blobSources[res.Entry.Hash] = res.AbsPath
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func startHashWorkers(
+	ctx context.Context,
+	workers int,
+	jobCh <-chan hashJob,
+	results chan<- hashResult,
+) {
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for range workers {
+		go func() {
+			defer wg.Done()
+
+			for job := range jobCh {
+				h, err := hashFileContext(ctx, job.AbsPath)
+				if err != nil {
+					select {
+					case results <- hashResult{Err: err}:
+					case <-ctx.Done():
+					}
+
+					continue
+				}
+
+				job.Entry.Hash = h
+				select {
+				case results <- hashResult{AbsPath: job.AbsPath, Entry: job.Entry}:
+				case <-ctx.Done():
+				}
+			}
+		}()
+	}
+
+	go func() { wg.Wait(); close(results) }()
+}
+
+func sendHashJobs(ctx context.Context, jobs []hashJob, jobCh chan<- hashJob) {
+	go func() {
+		defer close(jobCh)
+
+		for _, job := range jobs {
+			select {
+			case <-ctx.Done():
+				return
+			case jobCh <- job:
+			}
+		}
+	}()
 }
 
 func normalizeBuildInputs(root string, mounts []MountSpec) (string, []MountSpec, error) {
@@ -160,45 +213,46 @@ func normalizeBuildInputs(root string, mounts []MountSpec) (string, []MountSpec,
 }
 
 func enqueueMountJobs(
+	ctx context.Context,
 	root string,
 	mounts []MountSpec,
 	entries map[string]Entry,
-	jobs chan<- hashJob,
-	results <-chan hashResult,
-) (int, error) {
-	jobCount := 0
+) ([]hashJob, error) {
+	jobs := []hashJob{}
 
 	for _, mount := range mounts {
-		addedJobs, walkErr := walkMount(root, mount, entries, jobs)
+		addedJobs, walkErr := walkMount(ctx, root, mount, entries)
 		if walkErr != nil {
-			close(jobs)
-			drainResults(results)
-
-			return 0, walkErr
+			return nil, walkErr
 		}
 
-		jobCount += addedJobs
+		jobs = append(jobs, addedJobs...)
 	}
 
-	return jobCount, nil
+	return jobs, nil
 }
 
+//nolint:cyclop // Walk callback handles context, exclude, duplicate, and entry-kind branches.
 func walkMount(
+	ctx context.Context,
 	root string,
 	mount MountSpec,
 	entries map[string]Entry,
-	jobs chan<- hashJob,
-) (int, error) {
+) ([]hashJob, error) {
 	mountPath, err := resolveAndStatMount(root, mount.Path)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	jobCount := 0
+	jobs := []hashJob{}
 
 	walkErr := filepath.WalkDir(
 		mountPath,
 		func(absPath string, d fs.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
 			if walkErr != nil {
 				return walkErr
 			}
@@ -230,9 +284,7 @@ func walkMount(
 			}
 
 			if isFile {
-				jobCount++
-
-				jobs <- hashJob{AbsPath: absPath, Entry: entry}
+				jobs = append(jobs, hashJob{AbsPath: absPath, Entry: entry})
 
 				return nil
 			}
@@ -245,10 +297,10 @@ func walkMount(
 		},
 	)
 	if walkErr != nil {
-		return 0, fmt.Errorf("walk mount %s: %w", mount.Path, walkErr)
+		return nil, fmt.Errorf("walk mount %s: %w", mount.Path, walkErr)
 	}
 
-	return jobCount, nil
+	return jobs, nil
 }
 
 func resolveAndStatMount(root, mountPath string) (string, error) {
@@ -325,11 +377,6 @@ func buildEntry(absPath, relRoot string, d fs.DirEntry) (Entry, bool, error) {
 		}, true, nil
 	default:
 		return Entry{}, false, nil
-	}
-}
-
-func drainResults(results <-chan hashResult) {
-	for range results {
 	}
 }
 
@@ -615,7 +662,23 @@ func matchSegments(pattern, candidate []string) bool {
 	return matchSegments(pattern[1:], candidate[1:])
 }
 
-func hashFile(path string) (string, error) {
+type cancelReader struct {
+	done <-chan struct{}
+	err  func() error
+	src  io.Reader
+}
+
+func (r cancelReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.done:
+		return 0, r.err()
+	default:
+	}
+
+	return r.src.Read(p)
+}
+
+func hashFileContext(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open file %s: %w", path, err)
@@ -624,7 +687,7 @@ func hashFile(path string) (string, error) {
 	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, cancelReader{done: ctx.Done(), err: ctx.Err, src: f}); err != nil {
 		return "", fmt.Errorf("hash file %s: %w", path, err)
 	}
 

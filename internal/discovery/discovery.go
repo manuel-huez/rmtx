@@ -299,6 +299,7 @@ func RequestReverseConnect(
 	if err != nil {
 		return fmt.Errorf("resolve host %s: %w", host, err)
 	}
+
 	if len(ips) == 0 {
 		return fmt.Errorf("resolve host %s: no IPv4 address", host)
 	}
@@ -307,6 +308,7 @@ func RequestReverseConnect(
 	if err != nil {
 		return err
 	}
+
 	defer func() { _ = conn.Close() }()
 
 	msg, err := json.Marshal(packet{

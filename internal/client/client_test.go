@@ -27,6 +27,7 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() { errCh <- server.Serve(ctx) }()
 
 	waitForAddr(t, server)

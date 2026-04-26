@@ -83,7 +83,7 @@ func run(ctx context.Context, args []string) int {
 				StdinFile:  os.Stdin,
 				StdoutFile: os.Stdout,
 				StderrFile: os.Stderr,
-				TTYMode:    app.TTYAuto,
+				TTYMode:    app.TTYDisable,
 			},
 		)
 	}

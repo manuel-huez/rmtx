@@ -87,7 +87,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 
-	manifest, request, err := buildRunRequest(root, workdir, &opts)
+	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts)
 	if err != nil {
 		return 1, err
 	}
@@ -104,6 +104,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 	defer closeQuietly(conn.Raw())
+
 	stopContextClose := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
 	defer stopContextClose()
 
@@ -215,11 +216,12 @@ func computeWorkdir(root, cwd string) (string, error) {
 }
 
 func buildRunRequest(
+	ctx context.Context,
 	root string,
 	workdir string,
 	opts *ExecOptions,
 ) (syncfs.BuildResult, protocol.RunRequest, error) {
-	manifest, err := syncfs.BuildManifest(root, opts.Mounts)
+	manifest, err := syncfs.BuildManifestContext(ctx, root, opts.Mounts)
 	if err != nil {
 		return syncfs.BuildResult{}, protocol.RunRequest{}, err
 	}
@@ -302,7 +304,7 @@ func dialTLS(
 		}
 
 		return nil, fmt.Errorf(
-			"dial host %s: %w; reverse connect failed: %v",
+			"dial host %s: %w; reverse connect failed: %w",
 			address,
 			err,
 			reverseErr,
@@ -379,6 +381,7 @@ func acceptReverse(ctx context.Context, ln net.Listener) (net.Conn, error) {
 	}
 
 	resultCh := make(chan acceptResult, 1)
+
 	go func() {
 		conn, err := ln.Accept()
 		resultCh <- acceptResult{conn: conn, err: err}

@@ -1,9 +1,13 @@
 package syncfs
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBuildManifestRespectsExcludePatterns(t *testing.T) {
@@ -32,6 +36,40 @@ func TestBuildManifestRespectsExcludePatterns(t *testing.T) {
 
 	if paths[".git/config"] || paths["tmp/output.txt"] {
 		t.Fatalf("excluded files leaked into manifest: %#v", paths)
+	}
+}
+
+func TestBuildManifestHandlesMoreFilesThanWorkers(t *testing.T) {
+	root := t.TempDir()
+
+	for i := range 256 {
+		mustWrite(t, filepath.Join(root, "files", fmt.Sprintf("file-%03d.txt", i)), "content")
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := BuildManifest(root, []MountSpec{{Path: "."}})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BuildManifest timed out")
+	}
+}
+
+func TestBuildManifestContextStopsCanceledWalk(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := BuildManifestContext(ctx, t.TempDir(), []MountSpec{{Path: "."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
 
