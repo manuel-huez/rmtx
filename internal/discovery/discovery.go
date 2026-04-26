@@ -17,6 +17,9 @@ import (
 const DefaultDiscoveryPort = 33222
 const (
 	discoveryTimeoutDefault = 750 * time.Millisecond
+	announcementInterval    = 250 * time.Millisecond
+	reverseRequestInterval  = 100 * time.Millisecond
+	reverseRequestAttempts  = 3
 	discoveryPacketSize     = 2048
 	ipv4Len                 = 4
 )
@@ -25,6 +28,7 @@ type Result struct {
 	Instance        string
 	OS              string
 	Address         string
+	Service         string
 	Port            int
 	HostFingerprint string
 	PairingEnabled  bool
@@ -36,6 +40,7 @@ type packet struct {
 	Name            string `json:"name,omitempty"`
 	OS              string `json:"os,omitempty"`
 	Port            int    `json:"port,omitempty"`
+	CallbackPort    int    `json:"callback_port,omitempty"`
 	HostFingerprint string `json:"host_cert_fingerprint,omitempty"`
 	PairingEnabled  bool   `json:"pairing_enabled,omitempty"`
 }
@@ -43,9 +48,10 @@ type packet struct {
 type Responder struct{ conn *net.UDPConn }
 
 type AdvertiseOptions struct {
-	OS              string
-	HostFingerprint string
-	PairingEnabled  bool
+	OS               string
+	HostFingerprint  string
+	PairingEnabled   bool
+	OnReverseConnect func(address string)
 }
 
 func Advertise(
@@ -78,6 +84,7 @@ func Advertise(
 
 	r := &Responder{conn: conn}
 	go r.serve(ctx, service, instance, port, opts)
+	go r.announce(ctx, service, instance, port, opts)
 
 	return r, nil
 }
@@ -112,27 +119,98 @@ func (r *Responder) serve(
 			continue
 		}
 
-		if pkt.Type != "query" || pkt.Service != service {
+		if pkt.Service != service {
 			continue
 		}
 
-		response, err := json.Marshal(
-			packet{
-				Type:            "response",
-				Service:         service,
-				Name:            instance,
-				OS:              opts.OS,
-				Port:            port,
-				HostFingerprint: opts.HostFingerprint,
-				PairingEnabled:  opts.PairingEnabled,
-			},
-		)
+		if pkt.Type == "reverse_connect" {
+			handleReverseConnect(pkt, addr, opts)
+
+			continue
+		}
+
+		if pkt.Type != "query" {
+			continue
+		}
+
+		response, err := responsePacket(service, instance, port, opts)
 		if err != nil {
 			continue
 		}
 
 		_, _ = r.conn.WriteToUDP(response, addr)
 	}
+}
+
+func handleReverseConnect(pkt packet, addr *net.UDPAddr, opts AdvertiseOptions) {
+	if opts.OnReverseConnect == nil || pkt.CallbackPort == 0 {
+		return
+	}
+
+	if fingerprint := strings.TrimSpace(pkt.HostFingerprint); fingerprint != "" &&
+		fingerprint != strings.TrimSpace(opts.HostFingerprint) {
+		return
+	}
+
+	if addr == nil || addr.IP == nil {
+		return
+	}
+
+	callback := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.CallbackPort))
+	go opts.OnReverseConnect(callback)
+}
+
+func (r *Responder) announce(
+	ctx context.Context,
+	service, instance string,
+	port int,
+	opts AdvertiseOptions,
+) {
+	ticker := time.NewTicker(announcementInterval)
+	defer ticker.Stop()
+
+	for {
+		if err := r.broadcastResponse(service, instance, port, opts); err != nil {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *Responder) broadcastResponse(
+	service, instance string,
+	port int,
+	opts AdvertiseOptions,
+) error {
+	response, err := responsePacket(service, instance, port, opts)
+	if err != nil {
+		return err
+	}
+
+	for _, target := range broadcastTargets() {
+		_, _ = r.conn.WriteToUDP(response, target)
+	}
+
+	return nil
+}
+
+func responsePacket(service, instance string, port int, opts AdvertiseOptions) ([]byte, error) {
+	return json.Marshal(
+		packet{
+			Type:            "response",
+			Service:         service,
+			Name:            instance,
+			OS:              opts.OS,
+			Port:            port,
+			HostFingerprint: opts.HostFingerprint,
+			PairingEnabled:  opts.PairingEnabled,
+		},
+	)
 }
 
 func DiscoverOne(ctx context.Context, service string, timeout time.Duration) (Result, error) {
@@ -170,7 +248,7 @@ func discoverResults(
 		timeout = discoveryTimeoutDefault
 	}
 
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	conn, err := listenDiscovery()
 	if err != nil {
 		return nil, fmt.Errorf("listen for discovery responses: %w", err)
 	}
@@ -187,6 +265,78 @@ func discoverResults(
 	}
 
 	return collectResponses(ctx, conn, service, timeout)
+}
+
+func listenDiscovery() (*net.UDPConn, error) {
+	conn, err := net.ListenUDP(
+		"udp4",
+		&net.UDPAddr{IP: net.IPv4zero, Port: DefaultDiscoveryPort},
+	)
+	if err == nil {
+		return conn, nil
+	}
+
+	return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+}
+
+func RequestReverseConnect(
+	ctx context.Context,
+	service string,
+	hostAddress string,
+	callbackPort int,
+	hostFingerprint string,
+) error {
+	if callbackPort <= 0 {
+		return errors.New("callback port is required")
+	}
+
+	host, _, err := net.SplitHostPort(hostAddress)
+	if err != nil {
+		return fmt.Errorf("parse host address %s: %w", hostAddress, err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return fmt.Errorf("resolve host %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("resolve host %s: no IPv4 address", host)
+	}
+
+	conn, err := listenDiscovery()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	msg, err := json.Marshal(packet{
+		Type:            "reverse_connect",
+		Service:         service,
+		CallbackPort:    callbackPort,
+		HostFingerprint: strings.TrimSpace(hostFingerprint),
+	})
+	if err != nil {
+		return err
+	}
+
+	target := &net.UDPAddr{IP: ips[0].To4(), Port: DefaultDiscoveryPort}
+
+	for range reverseRequestAttempts {
+		if _, err = conn.WriteToUDP(msg, target); err != nil {
+			return err
+		}
+
+		timer := time.NewTimer(reverseRequestInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return nil
 }
 
 func orderedResults(results map[string]Result) []Result {
@@ -262,6 +412,7 @@ func recordResponse(results map[string]Result, service string, raw []byte, addr 
 		Instance:        pkt.Name,
 		OS:              pkt.OS,
 		Address:         address,
+		Service:         pkt.Service,
 		Port:            pkt.Port,
 		HostFingerprint: pkt.HostFingerprint,
 		PairingEnabled:  pkt.PairingEnabled,

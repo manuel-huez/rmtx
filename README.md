@@ -78,8 +78,8 @@ rmtx context prune --older-than 168h
 ## Notes
 
 - Context workspaces are persistent on the host, so repeated runs are faster.
-- Discovery uses UDP broadcast on port `33222`.
-- Windows host discovery may need firewall rule for inbound UDP `33222`.
+- Discovery uses UDP broadcast on port `33222`; hosts also send outbound announcements so clients can discover Windows hosts even when inbound UDP is blocked.
+- If direct TCP to the host is blocked, `rmtx` can fall back to a reverse LAN connection where the host dials back to the client.
 - Client state is stored in `~/.rmtx/state.json`.
 - Interactive TTY mode is supported on Linux hosts/clients.
 

@@ -27,12 +27,13 @@ import (
 const Version = "0.6.4"
 
 const (
-	defaultDirMode   = 0o755
-	streamBufferSize = 32 * 1024
-	splitNEquals     = 2
-	pipeCount        = 2
-	exitCodeNotFound = 127
-	defaultFileMode  = 0o644
+	defaultDirMode     = 0o755
+	streamBufferSize   = 32 * 1024
+	splitNEquals       = 2
+	pipeCount          = 2
+	exitCodeNotFound   = 127
+	defaultFileMode    = 0o644
+	reverseDialTimeout = 5 * time.Second
 )
 
 type Options struct {
@@ -194,6 +195,9 @@ func (s *Server) Serve(ctx context.Context) error {
 					OS:              runtime.GOOS,
 					HostFingerprint: s.fingerprint,
 					PairingEnabled:  true,
+					OnReverseConnect: func(address string) {
+						s.handleReverseConnect(ctx, address)
+					},
 				},
 			)
 			if err != nil {
@@ -225,6 +229,20 @@ func (s *Server) Serve(ctx context.Context) error {
 
 		go s.handleConn(ctx, conn)
 	}
+}
+
+func (s *Server) handleReverseConnect(parent context.Context, address string) {
+	ctx, cancel := context.WithTimeout(parent, reverseDialTimeout)
+	defer cancel()
+
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		s.logger.Printf("reverse connect to %s failed: %v", address, err)
+
+		return
+	}
+
+	s.handleConn(parent, tls.Server(raw, s.tlsConfig))
 }
 
 func (s *Server) handleConn(parent context.Context, raw net.Conn) {

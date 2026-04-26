@@ -193,31 +193,32 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 	forwardStdin := params.ForwardStdin || useTTY || ShouldForwardStdin(params.StdinFile)
 
 	return client.Run(ctx, client.ExecOptions{
-		Address:       target.Address,
-		Host:          *hostRecord,
-		ClientCertPEM: []byte(clientCertPEM),
-		ClientKeyPEM:  []byte(clientKeyPEM),
-		Root:          loaded.Root,
-		CWD:           cwd,
-		Command:       params.Command,
-		Mounts:        mounts,
-		ForwardEnv:    append([]string(nil), cfg.Env.Forward...),
-		Stdout:        params.Stdout,
-		Stderr:        params.Stderr,
-		Stdin:         params.Stdin,
-		StdinFile:     params.StdinFile,
-		StdoutFile:    params.StdoutFile,
-		StderrFile:    params.StderrFile,
-		ForwardStdin:  forwardStdin,
-		Project:       filepath.Base(loaded.Root),
-		ContextID:     loaded.ContextID(),
-		ContextName:   loaded.ContextName(),
-		TTY:           useTTY,
+		Address:          target.Address,
+		DiscoveryService: target.DiscoveryService,
+		Host:             *hostRecord,
+		ClientCertPEM:    []byte(clientCertPEM),
+		ClientKeyPEM:     []byte(clientKeyPEM),
+		Root:             loaded.Root,
+		CWD:              cwd,
+		Command:          params.Command,
+		Mounts:           mounts,
+		ForwardEnv:       append([]string(nil), cfg.Env.Forward...),
+		Stdout:           params.Stdout,
+		Stderr:           params.Stderr,
+		Stdin:            params.Stdin,
+		StdinFile:        params.StdinFile,
+		StdoutFile:       params.StdoutFile,
+		StderrFile:       params.StderrFile,
+		ForwardStdin:     forwardStdin,
+		Project:          filepath.Base(loaded.Root),
+		ContextID:        loaded.ContextID(),
+		ContextName:      loaded.ContextName(),
+		TTY:              useTTY,
 	})
 }
 
 func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingInfo, error) {
-	address, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
 	if err != nil {
 		return client.PingInfo{}, err
 	}
@@ -230,10 +231,11 @@ func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingI
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 
 	return client.Ping(ctx, client.RemoteOptions{
-		Address:       address,
-		Host:          *hostRecord,
-		ClientCertPEM: []byte(clientCertPEM),
-		ClientKeyPEM:  []byte(clientKeyPEM),
+		Address:          address,
+		DiscoveryService: service,
+		Host:             *hostRecord,
+		ClientCertPEM:    []byte(clientCertPEM),
+		ClientKeyPEM:     []byte(clientKeyPEM),
 	})
 }
 
@@ -242,7 +244,7 @@ func RunListContexts(
 	cwd string,
 	params RemoteParams,
 ) ([]client.ContextInfo, error) {
-	address, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
 	if err != nil {
 		return nil, err
 	}
@@ -255,10 +257,11 @@ func RunListContexts(
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 
 	return client.ListContexts(ctx, client.RemoteOptions{
-		Address:       address,
-		Host:          *hostRecord,
-		ClientCertPEM: []byte(clientCertPEM),
-		ClientKeyPEM:  []byte(clientKeyPEM),
+		Address:          address,
+		DiscoveryService: service,
+		Host:             *hostRecord,
+		ClientCertPEM:    []byte(clientCertPEM),
+		ClientKeyPEM:     []byte(clientKeyPEM),
 	})
 }
 
@@ -267,7 +270,7 @@ func RunDeleteContexts(
 	cwd string,
 	params ContextDeleteParams,
 ) (client.DeleteContextsResult, error) {
-	address, hostRecord, loaded, err := resolveRemoteTarget(
+	address, service, hostRecord, loaded, err := resolveRemoteTarget(
 		ctx,
 		cwd,
 		RemoteParams{
@@ -293,9 +296,13 @@ func RunDeleteContexts(
 	}
 
 	req := client.DeleteContextsOptions{
-		Remote: client.RemoteOptions{Address: address, Host: *hostRecord},
-		IDs:    ids,
-		All:    params.All,
+		Remote: client.RemoteOptions{
+			Address:          address,
+			DiscoveryService: service,
+			Host:             *hostRecord,
+		},
+		IDs: ids,
+		All: params.All,
 	}
 
 	state, err := clientstate.Load()
@@ -355,7 +362,12 @@ func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, er
 		return InitResult{}, err
 	}
 
-	if err := writeInitConfig(configPath, cwd, result.HostFingerprint); err != nil {
+	configHost := ""
+	if strings.TrimSpace(params.AddressOverride) != "" {
+		configHost = result.Address
+	}
+
+	if err := writeInitConfig(configPath, cwd, result.HostFingerprint, configHost); err != nil {
 		return InitResult{}, err
 	}
 
@@ -421,6 +433,7 @@ func completePair(
 
 	pairResp, err := client.PairHost(ctx, client.PairOptions{
 		Address:             result.Address,
+		DiscoveryService:    result.Service,
 		Host:                remoteHost,
 		Code:                code,
 		ClientLabel:         label,
@@ -525,9 +538,10 @@ func resolvePairCode(
 	}
 
 	pairCodeResp, err := client.RequestPairCode(ctx, client.PairOptions{
-		Address:     result.Address,
-		Host:        pairRemoteHost(result),
-		ClientLabel: label,
+		Address:          result.Address,
+		DiscoveryService: result.Service,
+		Host:             pairRemoteHost(result),
+		ClientLabel:      label,
 	})
 	if err != nil {
 		return "", err
@@ -655,7 +669,7 @@ func resolveRemoteTarget(
 	ctx context.Context,
 	cwd string,
 	params RemoteParams,
-) (string, *clientstate.HostRecord, *config.Loaded, error) {
+) (string, string, *clientstate.HostRecord, *config.Loaded, error) {
 	var (
 		loaded *config.Loaded
 		err    error
@@ -664,12 +678,12 @@ func resolveRemoteTarget(
 	if strings.TrimSpace(params.ConfigPath) != "" {
 		loaded, err = config.Load(params.ConfigPath)
 		if err != nil {
-			return "", nil, nil, err
+			return "", "", nil, nil, err
 		}
 	} else {
 		loaded, err = config.Search(cwd)
 		if err != nil && !errors.Is(err, config.ErrConfigNotFound) {
-			return "", nil, nil, err
+			return "", "", nil, nil, err
 		}
 
 		if errors.Is(err, config.ErrConfigNotFound) {
@@ -686,40 +700,41 @@ func resolveRemoteTarget(
 
 	target, err := resolveRemoteHost(ctx, cfg, params.AddressOverride, params.DiscoveryTimeout)
 	if err != nil {
-		return "", nil, loaded, err
+		return "", "", nil, loaded, err
 	}
 
 	state, hostRecord, err := resolveClientHost(target.Address, target.Fingerprint)
 	if err != nil {
-		return "", nil, loaded, err
+		return "", "", nil, loaded, err
 	}
 
 	if hostRecord == nil || !hostRecord.Paired {
-		return "", nil, loaded, errors.New("host not paired; run `rmtx pair`")
+		return "", "", nil, loaded, errors.New("host not paired; run `rmtx pair`")
 	}
 
 	clientCertPEM, clientKeyPEM := state.HostCredentials(target.Address, hostRecord.Fingerprint)
 	if strings.TrimSpace(clientCertPEM) == "" || strings.TrimSpace(clientKeyPEM) == "" {
-		return "", nil, loaded, errors.New("client identity missing; run `rmtx pair`")
+		return "", "", nil, loaded, errors.New("client identity missing; run `rmtx pair`")
 	}
 
 	if pinned := strings.TrimSpace(
 		cfg.TLS.HostFingerprint,
 	); pinned != "" &&
 		pinned != hostRecord.Fingerprint {
-		return "", nil, loaded, fmt.Errorf(
+		return "", "", nil, loaded, fmt.Errorf(
 			"configured host fingerprint %s does not match paired host %s",
 			pinned,
 			hostRecord.Fingerprint,
 		)
 	}
 
-	return target.Address, hostRecord, loaded, nil
+	return target.Address, target.DiscoveryService, hostRecord, loaded, nil
 }
 
 type resolvedRemoteHost struct {
-	Address     string
-	Fingerprint string
+	Address          string
+	DiscoveryService string
+	Fingerprint      string
 }
 
 //nolint:cyclop,nestif // Resolution order is policy-driven: override, env, config, then discovery variants.
@@ -733,22 +748,25 @@ func resolveRemoteHost(
 
 	if override = strings.TrimSpace(override); override != "" {
 		return resolvedRemoteHost{
-			Address:     discovery.NormalizeAddress(override, config.DefaultPort),
-			Fingerprint: pinnedFingerprint,
+			Address:          discovery.NormalizeAddress(override, config.DefaultPort),
+			DiscoveryService: cfg.Discovery.Service,
+			Fingerprint:      pinnedFingerprint,
 		}, nil
 	}
 
 	if env := strings.TrimSpace(os.Getenv("RMTX_HOST")); env != "" {
 		return resolvedRemoteHost{
-			Address:     discovery.NormalizeAddress(env, config.DefaultPort),
-			Fingerprint: pinnedFingerprint,
+			Address:          discovery.NormalizeAddress(env, config.DefaultPort),
+			DiscoveryService: cfg.Discovery.Service,
+			Fingerprint:      pinnedFingerprint,
 		}, nil
 	}
 
 	if cfgHost := strings.TrimSpace(cfg.Host); cfgHost != "" {
 		return resolvedRemoteHost{
-			Address:     discovery.NormalizeAddress(cfgHost, config.DefaultPort),
-			Fingerprint: pinnedFingerprint,
+			Address:          discovery.NormalizeAddress(cfgHost, config.DefaultPort),
+			DiscoveryService: cfg.Discovery.Service,
+			Fingerprint:      pinnedFingerprint,
 		}, nil
 	}
 
@@ -771,8 +789,9 @@ func resolveRemoteHost(
 	}
 
 	return resolvedRemoteHost{
-		Address:     result.Address,
-		Fingerprint: strings.TrimSpace(result.HostFingerprint),
+		Address:          result.Address,
+		DiscoveryService: cfg.Discovery.Service,
+		Fingerprint:      strings.TrimSpace(result.HostFingerprint),
 	}, nil
 }
 
@@ -806,8 +825,9 @@ func discoverPinnedRemoteHost(
 	}
 
 	return resolvedRemoteHost{
-		Address:     result.Address,
-		Fingerprint: strings.TrimSpace(result.HostFingerprint),
+		Address:          result.Address,
+		DiscoveryService: cfg.Discovery.Service,
+		Fingerprint:      strings.TrimSpace(result.HostFingerprint),
 	}, nil
 }
 
@@ -912,6 +932,7 @@ func resolveInitTarget(
 		strings.TrimSpace(params.Fingerprint) != "" {
 		return discovery.Result{
 			Address:         discovery.NormalizeAddress(out, config.DefaultPort),
+			Service:         cfg.Discovery.Service,
 			Instance:        "manual-host",
 			OS:              "",
 			HostFingerprint: strings.TrimSpace(params.Fingerprint),
@@ -1003,6 +1024,7 @@ func resolvePairTarget(
 	if out := strings.TrimSpace(params.AddressOverride); out != "" {
 		return discovery.Result{
 			Address:         discovery.NormalizeAddress(out, config.DefaultPort),
+			Service:         cfg.Discovery.Service,
 			Instance:        "manual-host",
 			OS:              "",
 			HostFingerprint: fingerprint,
@@ -1013,6 +1035,7 @@ func resolvePairTarget(
 	if cfgHost := strings.TrimSpace(cfg.Host); cfgHost != "" {
 		return discovery.Result{
 			Address:         discovery.NormalizeAddress(cfgHost, config.DefaultPort),
+			Service:         cfg.Discovery.Service,
 			Instance:        "configured-host",
 			OS:              "",
 			HostFingerprint: fingerprint,
@@ -1157,7 +1180,7 @@ func resolveInitConfigPath(cwd, explicitPath string) (string, error) {
 	return filepath.Join(root, ".rmtx.json"), nil
 }
 
-func writeInitConfig(path, cwd, fingerprint string) error {
+func writeInitConfig(path, cwd, fingerprint, hostAddress string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("config path is required")
 	}
@@ -1170,11 +1193,13 @@ func writeInitConfig(path, cwd, fingerprint string) error {
 	name := config.Loaded{Root: root}.ContextName()
 	payload := struct {
 		Version int                   `json:"version"`
+		Host    string                `json:"host,omitempty"`
 		Context *config.ContextConfig `json:"context,omitempty"`
 		TLS     *config.TLSConfig     `json:"tls,omitempty"`
 		Mounts  []config.Mount        `json:"mounts,omitempty"`
 	}{
 		Version: config.Default().Version,
+		Host:    strings.TrimSpace(hostAddress),
 		Context: &config.ContextConfig{Name: name},
 		TLS:     &config.TLSConfig{HostFingerprint: strings.TrimSpace(fingerprint)},
 		Mounts:  []config.Mount{{Path: "."}},

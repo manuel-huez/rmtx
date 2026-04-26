@@ -810,6 +810,10 @@ func TestRunInitManualHostBypassesDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if loaded.Config.Host != addr {
+		t.Fatalf("unexpected configured host: got %s want %s", loaded.Config.Host, addr)
+	}
+
 	assertConfigFingerprint(t, loaded.Config.TLS.HostFingerprint, server.Fingerprint())
 	assertManualInitOutput(t, stdout.String())
 

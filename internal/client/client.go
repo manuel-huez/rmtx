@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 
+	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
@@ -22,35 +24,37 @@ import (
 )
 
 type ExecOptions struct {
-	Address       string
-	Host          clientstate.HostRecord
-	ClientCertPEM []byte
-	ClientKeyPEM  []byte
-	Root          string
-	CWD           string
-	Command       []string
-	Mounts        []syncfs.MountSpec
-	ForwardEnv    []string
-	ExtraEnv      map[string]string
-	Stdout        io.Writer
-	Stderr        io.Writer
-	Stdin         io.Reader
-	StdinFile     *os.File
-	StdoutFile    *os.File
-	StderrFile    *os.File
-	ForwardStdin  bool
-	Session       string
-	Project       string
-	ContextID     string
-	ContextName   string
-	TTY           bool
+	Address          string
+	DiscoveryService string
+	Host             clientstate.HostRecord
+	ClientCertPEM    []byte
+	ClientKeyPEM     []byte
+	Root             string
+	CWD              string
+	Command          []string
+	Mounts           []syncfs.MountSpec
+	ForwardEnv       []string
+	ExtraEnv         map[string]string
+	Stdout           io.Writer
+	Stderr           io.Writer
+	Stdin            io.Reader
+	StdinFile        *os.File
+	StdoutFile       *os.File
+	StderrFile       *os.File
+	ForwardStdin     bool
+	Session          string
+	Project          string
+	ContextID        string
+	ContextName      string
+	TTY              bool
 }
 
 type RemoteOptions struct {
-	Address       string
-	Host          clientstate.HostRecord
-	ClientCertPEM []byte
-	ClientKeyPEM  []byte
+	Address          string
+	DiscoveryService string
+	Host             clientstate.HostRecord
+	ClientCertPEM    []byte
+	ClientKeyPEM     []byte
 }
 
 type PingInfo = protocol.PingResponse
@@ -65,6 +69,11 @@ type DeleteContextsOptions struct {
 }
 
 const stdinBufferSize = 32 * 1024
+const (
+	directDialTimeout   = 1500 * time.Millisecond
+	reverseDialTimeout  = 5 * time.Second
+	defaultDiscoverySvc = "rmtx"
+)
 
 func closeQuietly(c io.Closer) {
 	if c != nil {
@@ -86,6 +95,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	conn, err := dialTLS(
 		ctx,
 		opts.Address,
+		opts.DiscoveryService,
 		opts.Host.Fingerprint,
 		opts.ClientCertPEM,
 		opts.ClientKeyPEM,
@@ -265,10 +275,10 @@ func buildRunRequest(
 
 func dialTLS(
 	ctx context.Context,
-	address, fingerprint string,
+	address, discoveryService, fingerprint string,
 	clientCertPEM, clientKeyPEM []byte,
 ) (*protocol.Conn, error) {
-	dialer := net.Dialer{}
+	dialer := net.Dialer{Timeout: directDialTimeout}
 
 	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
 	if err != nil {
@@ -277,10 +287,113 @@ func dialTLS(
 
 	raw, err := tls.DialWithDialer(&dialer, "tcp", address, tlsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("dial host %s: %w", address, err)
+		reverse, reverseErr := dialReverseTLS(
+			ctx,
+			address,
+			discoveryService,
+			fingerprint,
+			clientCertPEM,
+			clientKeyPEM,
+		)
+		if reverseErr == nil {
+			return reverse, nil
+		}
+
+		return nil, fmt.Errorf(
+			"dial host %s: %w; reverse connect failed: %v",
+			address,
+			err,
+			reverseErr,
+		)
 	}
 
 	return protocol.NewConn(raw), nil
+}
+
+func dialReverseTLS(
+	ctx context.Context,
+	address, discoveryService, fingerprint string,
+	clientCertPEM, clientKeyPEM []byte,
+) (*protocol.Conn, error) {
+	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen for reverse connection: %w", err)
+	}
+	defer closeQuietly(ln)
+
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok || tcpAddr.Port == 0 {
+		return nil, fmt.Errorf("listen for reverse connection: unexpected address %s", ln.Addr())
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, reverseDialTimeout)
+	defer cancel()
+
+	if err := discovery.RequestReverseConnect(
+		ctx,
+		nonEmpty(discoveryService, defaultDiscoverySvc),
+		address,
+		tcpAddr.Port,
+		fingerprint,
+	); err != nil {
+		return nil, err
+	}
+
+	raw, err := acceptReverse(ctx, ln)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
+	if err != nil {
+		closeQuietly(raw)
+
+		return nil, err
+	}
+
+	conn := tls.Client(raw, tlsConfig)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		closeQuietly(conn)
+
+		return nil, fmt.Errorf("reverse tls handshake: %w", err)
+	}
+
+	return protocol.NewConn(conn), nil
+}
+
+func nonEmpty(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+
+	return value
+}
+
+func acceptReverse(ctx context.Context, ln net.Listener) (net.Conn, error) {
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+
+	resultCh := make(chan acceptResult, 1)
+	go func() {
+		conn, err := ln.Accept()
+		resultCh <- acceptResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = ln.Close()
+
+		return nil, fmt.Errorf("accept reverse connection: %w", ctx.Err())
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, fmt.Errorf("accept reverse connection: %w", result.err)
+		}
+
+		return result.conn, nil
+	}
 }
 
 func runHandshake(
@@ -524,6 +637,7 @@ func expectDataFrame[T any](conn *protocol.Conn, wantType string) (T, error) {
 
 type PairOptions struct {
 	Address             string
+	DiscoveryService    string
 	Host                clientstate.HostRecord
 	Code                string
 	ClientLabel         string
@@ -535,7 +649,7 @@ type PairResult = protocol.PairResponse
 type PairCodeResult = protocol.PairCodeResponse
 
 func RequestPairCode(ctx context.Context, opts PairOptions) (PairCodeResult, error) {
-	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, nil, nil)
+	conn, err := dialTLS(ctx, opts.Address, opts.DiscoveryService, opts.Host.Fingerprint, nil, nil)
 	if err != nil {
 		return PairCodeResult{}, err
 	}
@@ -550,7 +664,7 @@ func RequestPairCode(ctx context.Context, opts PairOptions) (PairCodeResult, err
 }
 
 func PairHost(ctx context.Context, opts PairOptions) (PairResult, error) {
-	conn, err := dialTLS(ctx, opts.Address, opts.Host.Fingerprint, nil, nil)
+	conn, err := dialTLS(ctx, opts.Address, opts.DiscoveryService, opts.Host.Fingerprint, nil, nil)
 	if err != nil {
 		return PairResult{}, err
 	}

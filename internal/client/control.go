@@ -10,6 +10,7 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	conn, err := dialTLS(
 		ctx,
 		opts.Address,
+		opts.DiscoveryService,
 		opts.Host.Fingerprint,
 		opts.ClientCertPEM,
 		opts.ClientKeyPEM,
@@ -30,6 +31,7 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 	conn, err := dialTLS(
 		ctx,
 		opts.Address,
+		opts.DiscoveryService,
 		opts.Host.Fingerprint,
 		opts.ClientCertPEM,
 		opts.ClientKeyPEM,
@@ -61,6 +63,7 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 	conn, err := dialTLS(
 		ctx,
 		opts.Remote.Address,
+		opts.Remote.DiscoveryService,
 		opts.Remote.Host.Fingerprint,
 		opts.Remote.ClientCertPEM,
 		opts.Remote.ClientKeyPEM,
