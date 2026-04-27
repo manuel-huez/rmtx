@@ -527,6 +527,7 @@ func (s *Server) executeAndSyncRun(
 		handle.workspace,
 		request.Manifest,
 		postEntries,
+		request.SyncBack,
 		ignoreMode,
 	); err != nil {
 		return err
@@ -640,10 +641,16 @@ func (s *Server) sendWorkspaceChanges(
 	workspace string,
 	before []syncfs.Entry,
 	after []syncfs.Entry,
+	syncBack []string,
 	ignoreMode bool,
 ) error {
-	changed, deleted := diffWorkspaceChanges(before, after, ignoreMode)
-	s.logger.Printf("sending workspace changes: changed=%d deleted=%d", len(changed), len(deleted))
+	changed, deleted := diffWorkspaceChanges(before, after, syncBack, ignoreMode)
+	s.logger.Printf(
+		"sending workspace changes: sync_back=%s changed=%d deleted=%d",
+		formatSyncBack(syncBack),
+		len(changed),
+		len(deleted),
+	)
 
 	if err := conn.WriteJSON(
 		protocol.MsgChangeSet,
@@ -658,9 +665,26 @@ func (s *Server) sendWorkspaceChanges(
 func diffWorkspaceChanges(
 	before,
 	after []syncfs.Entry,
+	syncBack []string,
 	ignoreMode bool,
 ) ([]syncfs.Entry, []string) {
-	return syncfs.Diff(before, after, syncfs.DiffOptions{IgnoreMode: ignoreMode})
+	return syncfs.Diff(
+		syncfs.FilterEntriesByPath(before, syncBack),
+		syncfs.FilterEntriesByPath(after, syncBack),
+		syncfs.DiffOptions{IgnoreMode: ignoreMode},
+	)
+}
+
+func formatSyncBack(paths []string) string {
+	if paths == nil {
+		return "all"
+	}
+
+	if len(paths) == 0 {
+		return "none"
+	}
+
+	return formatStrings(paths)
 }
 
 func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.BuildProgress) {

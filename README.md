@@ -77,6 +77,22 @@ patterns for mount-specific ignores:
 }
 ```
 
+Use `context.sync_back` to limit which host-side changes are copied back after
+each run. Paths are relative to the project root; a directory path includes its
+descendants, and glob patterns like `generated/**` are supported:
+
+```json
+{
+  "context": {
+    "name": "my-project",
+    "sync_back": ["coverage/", "generated/report.json"]
+  }
+}
+```
+
+When omitted, all mounted paths are eligible for sync-back. Only paths whose
+metadata or content changed are sent back to the client.
+
 To ignore everything under a specific directory, use `dir/**`. For example,
 `"ignore": ["data/cache/**"]` skips every file and subdirectory under
 `data/cache`. A trailing slash also works, so `"ignore": ["data/cache/"]`

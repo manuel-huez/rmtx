@@ -112,6 +112,7 @@ type RunRequest struct {
 	Env         map[string]string  `json:"env"`
 	Mounts      []syncfs.MountSpec `json:"mounts"`
 	Manifest    []syncfs.Entry     `json:"manifest"`
+	SyncBack    []string           `json:"sync_back"`
 	Session     string             `json:"session"`
 	Project     string             `json:"project,omitempty"`
 	RootHint    string             `json:"root_hint,omitempty"`

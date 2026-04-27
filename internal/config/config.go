@@ -28,7 +28,8 @@ var fileNames = []string{
 }
 
 type ContextConfig struct {
-	Name string `json:"name,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	SyncBack []string `json:"sync_back,omitempty"`
 }
 
 type Config struct {

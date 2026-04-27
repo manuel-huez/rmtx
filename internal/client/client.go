@@ -34,6 +34,7 @@ type ExecOptions struct {
 	CWD              string
 	Command          []string
 	Mounts           []syncfs.MountSpec
+	SyncBack         []string
 	ForwardEnv       []string
 	ExtraEnv         map[string]string
 	Stdout           io.Writer
@@ -406,6 +407,7 @@ func buildRunRequest(
 		Env:         env,
 		Mounts:      append([]syncfs.MountSpec(nil), opts.Mounts...),
 		Manifest:    manifest.Entries,
+		SyncBack:    cloneStringSlice(opts.SyncBack),
 		Session:     opts.Session,
 		Project:     opts.Project,
 		RootHint:    filepath.Base(root),
@@ -415,6 +417,14 @@ func buildRunRequest(
 	}
 
 	return manifest, request, nil
+}
+
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+
+	return append([]string(nil), values...)
 }
 
 func loadManifestCache(root, contextID string, logger *runLogger) []syncfs.Entry {

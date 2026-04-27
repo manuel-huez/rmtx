@@ -380,6 +380,114 @@ func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {
 	waitForServerShutdown(t, "noop-host", errCh)
 }
 
+func TestRunExecEndToEndRespectsContextSyncBack(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	configContent := `{
+  "version": 1,
+  "context": {
+    "name": "sync-back-context",
+    "sync_back": ["allowed/", "allowed-file.txt"]
+  },
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "mounts": [{"path": "."}],
+  "discovery": {"enabled": false}
+}`
+	writeTestFile(t, configPath, configContent)
+	writeTestFile(t, filepath.Join(project, "allowed-file.txt"), "before\n")
+	writeTestFile(t, filepath.Join(project, "blocked-file.txt"), "before\n")
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(ctx, project, PairParams{
+		AddressOverride: addr,
+		ConfigPath:      configPath,
+		Code:            pairCode.Code,
+		ClientLabel:     "sync-back-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code, err := RunExec(ctx, project, ExecParams{
+		AddressOverride: addr,
+		Command: []string{
+			"sh",
+			"-c",
+			`mkdir -p allowed blocked; printf "after\n" > allowed-file.txt; printf "after\n" > blocked-file.txt; printf "ok\n" > allowed/report.txt; printf "no\n" > blocked/report.txt`,
+		},
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("unexpected exit code: %d stderr=%s", code, stderr.String())
+	}
+
+	allowed, err := os.ReadFile(filepath.Join(project, "allowed-file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.TrimSpace(string(allowed)) != "after" {
+		t.Fatalf("expected allowed file to sync back, got %q", string(allowed))
+	}
+
+	blocked, err := os.ReadFile(filepath.Join(project, "blocked-file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.TrimSpace(string(blocked)) != "before" {
+		t.Fatalf("expected blocked file to remain local, got %q", string(blocked))
+	}
+
+	if _, err := os.Stat(filepath.Join(project, "allowed", "report.txt")); err != nil {
+		t.Fatalf("expected allowed dir output to sync back: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(project, "blocked", "report.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected blocked dir output to stay remote-only, got err=%v", err)
+	}
+
+	cancel()
+	waitForServerShutdown(t, "sync-back-host", errCh)
+}
+
 //nolint:cyclop // Integration test exercises multi-host setup, pairing, verification, and shutdown.
 func TestRunPairSupportsMultipleHosts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

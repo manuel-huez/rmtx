@@ -663,6 +663,22 @@ func PreserveMissingEntries(entries, preserve []Entry, kind EntryKind) []Entry {
 	return out
 }
 
+func FilterEntriesByPath(entries []Entry, includes []string) []Entry {
+	matcher := newIncludeMatcher(includes)
+	if matcher.all {
+		return append([]Entry(nil), entries...)
+	}
+
+	out := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		if matcher.Match(entry.Path) {
+			out = append(out, entry)
+		}
+	}
+
+	return out
+}
+
 func DeletePaths(root string, paths []string) error {
 	sorted := append([]string(nil), paths...)
 	sort.Slice(sorted, func(i, j int) bool { return depth(sorted[i]) > depth(sorted[j]) })
@@ -883,6 +899,70 @@ func relativeUnder(base, abs string) (string, error) {
 
 type excludeMatcher struct {
 	patterns [][]string
+}
+
+type includeMatcher struct {
+	all      bool
+	literals []string
+	patterns [][]string
+}
+
+func newIncludeMatcher(includes []string) includeMatcher {
+	if includes == nil {
+		return includeMatcher{all: true}
+	}
+
+	matcher := includeMatcher{}
+	for _, include := range includes {
+		raw := strings.TrimSpace(include)
+		if raw == "" {
+			continue
+		}
+
+		if raw == "." || raw == "/" {
+			return includeMatcher{all: true}
+		}
+
+		normalized := normalizePattern(raw)
+		if normalized == "" || normalized == "." {
+			return includeMatcher{all: true}
+		}
+
+		if hasGlob(normalized) {
+			matcher.patterns = append(matcher.patterns, splitPath(normalized))
+			continue
+		}
+
+		matcher.literals = append(matcher.literals, normalized)
+	}
+
+	return matcher
+}
+
+func (m includeMatcher) Match(rel string) bool {
+	if m.all {
+		return true
+	}
+
+	rel = normalizeRel(rel)
+	for _, literal := range m.literals {
+		if rel == literal || strings.HasPrefix(rel, literal+"/") {
+			return true
+		}
+	}
+
+	parts := splitPath(rel)
+	for _, pattern := range m.patterns {
+		if matchSegments(pattern, parts) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasGlob(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
 }
 
 func newExcludeMatcher(patterns []string) excludeMatcher {

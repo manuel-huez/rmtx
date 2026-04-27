@@ -41,12 +41,12 @@ func TestDiffWorkspaceChangesCanIgnoreModeOnlyChanges(t *testing.T) {
 		Mode: 0o666,
 	}}
 
-	changed, deleted := diffWorkspaceChanges(before, after, true)
+	changed, deleted := diffWorkspaceChanges(before, after, nil, true)
 	if len(changed) != 0 || len(deleted) != 0 {
 		t.Fatalf("mode-only change should be ignored: changed=%#v deleted=%#v", changed, deleted)
 	}
 
-	changed, deleted = diffWorkspaceChanges(before, after, false)
+	changed, deleted = diffWorkspaceChanges(before, after, nil, false)
 	if len(changed) != 1 || len(deleted) != 0 {
 		t.Fatalf("mode-only change should be reported: changed=%#v deleted=%#v", changed, deleted)
 	}

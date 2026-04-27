@@ -187,6 +187,11 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		return 1, err
 	}
 
+	syncBack := cfg.Context.SyncBack
+	if syncBack != nil {
+		syncBack = append([]string(nil), syncBack...)
+	}
+
 	forwardStdin := params.ForwardStdin || useTTY || ShouldForwardStdin(params.StdinFile)
 
 	return client.Run(ctx, client.ExecOptions{
@@ -199,6 +204,7 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		CWD:              cwd,
 		Command:          params.Command,
 		Mounts:           mounts,
+		SyncBack:         syncBack,
 		ForwardEnv:       append([]string(nil), cfg.Env.Forward...),
 		Stdout:           params.Stdout,
 		Stderr:           params.Stderr,

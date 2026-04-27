@@ -188,6 +188,45 @@ func TestDiffCanIgnoreModeOnlyChanges(t *testing.T) {
 	}
 }
 
+func TestFilterEntriesByPathIncludesFilesDirsAndGlobs(t *testing.T) {
+	entries := []Entry{
+		{Path: "keep.txt", Kind: KindFile},
+		{Path: "out", Kind: KindDir},
+		{Path: "out/report.txt", Kind: KindFile},
+		{Path: "logs/run.txt", Kind: KindFile},
+		{Path: "skip.txt", Kind: KindFile},
+	}
+
+	got := FilterEntriesByPath(entries, []string{"keep.txt", "out", "logs/*.txt"})
+
+	paths := map[string]bool{}
+	for _, entry := range got {
+		paths[entry.Path] = true
+	}
+
+	for _, want := range []string{"keep.txt", "out", "out/report.txt", "logs/run.txt"} {
+		if !paths[want] {
+			t.Fatalf("expected %s in filtered entries: %#v", want, got)
+		}
+	}
+
+	if paths["skip.txt"] {
+		t.Fatalf("unexpected skipped entry in filtered entries: %#v", got)
+	}
+}
+
+func TestFilterEntriesByPathNilIncludesAllEmptyIncludesNone(t *testing.T) {
+	entries := []Entry{{Path: "file.txt", Kind: KindFile}}
+
+	if got := FilterEntriesByPath(entries, nil); len(got) != 1 {
+		t.Fatalf("nil include should keep all entries: %#v", got)
+	}
+
+	if got := FilterEntriesByPath(entries, []string{}); len(got) != 0 {
+		t.Fatalf("empty include should keep no entries: %#v", got)
+	}
+}
+
 func TestNormalizeModesUsesReferenceModeForEquivalentEntries(t *testing.T) {
 	reference := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o644}}
 	entries := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o666}}
