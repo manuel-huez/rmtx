@@ -380,6 +380,88 @@ func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {
 	waitForServerShutdown(t, "noop-host", errCh)
 }
 
+func TestRunExecEndToEndReportsCommandStartFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	configContent := `{
+  "version": 1,
+  "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
+  "mounts": [{"path": "."}],
+  "discovery": {"enabled": false}
+}`
+	writeTestFile(t, configPath, configContent)
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(ctx, project, PairParams{
+		AddressOverride: addr,
+		ConfigPath:      configPath,
+		Code:            pairCode.Code,
+		ClientLabel:     "start-failure-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	missingCommand := "rmtx-command-that-should-not-exist"
+
+	code, err := RunExec(ctx, project, ExecParams{
+		AddressOverride: addr,
+		Command:         []string{missingCommand},
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 127 {
+		t.Fatalf("unexpected exit code: got %d want 127 stderr=%s", code, stderr.String())
+	}
+
+	if stdout.String() != "" {
+		t.Fatalf("expected empty stdout, got %q", stdout.String())
+	}
+
+	stderrOutput := stderr.String()
+	if !strings.Contains(stderrOutput, "start command:") {
+		t.Fatalf("expected start error in stderr, got %q", stderrOutput)
+	}
+
+	if !strings.Contains(stderrOutput, missingCommand) {
+		t.Fatalf("expected missing command name in stderr, got %q", stderrOutput)
+	}
+
+	cancel()
+	waitForServerShutdown(t, "start-failure-host", errCh)
+}
+
 func TestRunExecEndToEndRespectsContextSyncBack(t *testing.T) {
 	if testIsWindows() {
 		t.Skip("shell-based integration test")

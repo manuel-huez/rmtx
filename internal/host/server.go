@@ -490,7 +490,11 @@ func (s *Server) executeAndSyncRun(
 	handle contextHandle,
 	request protocol.RunRequest,
 ) error {
-	code := s.executeRequest(parent, conn, handle.workspace, request)
+	code, runErr := s.executeRequest(parent, conn, handle.workspace, request)
+	if err := writeUserVisibleRunError(conn, runErr); err != nil {
+		return err
+	}
+
 	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
 		return err
 	}
@@ -623,7 +627,7 @@ func (s *Server) executeRequest(
 	conn *protocol.Conn,
 	workspace string,
 	request protocol.RunRequest,
-) int {
+) (int, error) {
 	sessionCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -637,7 +641,7 @@ func (s *Server) executeRequest(
 		)
 	}
 
-	return code
+	return code, runErr
 }
 
 func (s *Server) sendWorkspaceChanges(
@@ -1299,6 +1303,36 @@ func streamPipe(conn *protocol.Conn, src io.Reader, stream string) error {
 			return err
 		}
 	}
+}
+
+func writeUserVisibleRunError(conn *protocol.Conn, err error) error {
+	message := userVisibleRunError(err)
+	if message == "" {
+		return nil
+	}
+
+	if !strings.HasSuffix(message, "\n") {
+		message += "\n"
+	}
+
+	return conn.WriteBytes(
+		protocol.MsgExecOutput,
+		protocol.OutputInfo{Stream: "stderr"},
+		[]byte(message),
+	)
+}
+
+func userVisibleRunError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return ""
+	}
+
+	return err.Error()
 }
 
 func mergeEnv(base []string, overrides map[string]string) []string {
