@@ -28,8 +28,7 @@ var fileNames = []string{
 }
 
 type ContextConfig struct {
-	Name     string   `json:"name,omitempty"`
-	SyncBack []string `json:"sync_back,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 
 type Config struct {
@@ -40,6 +39,7 @@ type Config struct {
 	WorkDir         string          `json:"workdir,omitempty"`
 	Discovery       DiscoveryConfig `json:"discovery,omitempty"`
 	Mounts          []Mount         `json:"mounts,omitempty"`
+	SyncBack        []string        `json:"sync_back,omitempty"`
 	Ignore          []string        `json:"ignore,omitempty"`
 	IgnoreGitignore bool            `json:"ignore_gitignore,omitempty"`
 	Env             EnvConfig       `json:"env,omitempty"`

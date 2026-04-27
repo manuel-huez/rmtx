@@ -187,7 +187,7 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		return 1, err
 	}
 
-	syncBack := cfg.Context.SyncBack
+	syncBack := cfg.SyncBack
 	if syncBack != nil {
 		syncBack = append([]string(nil), syncBack...)
 	}

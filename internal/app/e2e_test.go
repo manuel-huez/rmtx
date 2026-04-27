@@ -412,10 +412,8 @@ func TestRunExecEndToEndRespectsContextSyncBack(t *testing.T) {
 
 	configContent := `{
   "version": 1,
-  "context": {
-    "name": "sync-back-context",
-    "sync_back": ["allowed/", "allowed-file.txt"]
-  },
+  "context": {"name": "sync-back-context"},
+  "sync_back": ["allowed/", "allowed-file.txt"],
   "tls": {"host_fingerprint": "` + server.Fingerprint() + `"},
   "mounts": [{"path": "."}],
   "discovery": {"enabled": false}

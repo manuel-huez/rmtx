@@ -77,16 +77,14 @@ patterns for mount-specific ignores:
 }
 ```
 
-Use `context.sync_back` to limit which host-side changes are copied back after
+Use `sync_back` to limit which host-side changes are copied back after
 each run. Paths are relative to the project root; a directory path includes its
 descendants, and glob patterns like `generated/**` are supported:
 
 ```json
 {
-  "context": {
-    "name": "my-project",
-    "sync_back": ["coverage/", "generated/report.json"]
-  }
+  "context": { "name": "my-project" },
+  "sync_back": ["coverage/", "generated/report.json"]
 }
 ```
 
