@@ -504,20 +504,22 @@ func dialReverseTLS(
 	ctx, cancel := context.WithTimeout(ctx, reverseDialTimeout)
 	defer cancel()
 
-	if err := discovery.RequestReverseConnect(
-		ctx,
+	requestCtx, requestCancel := context.WithCancel(ctx)
+	defer requestCancel()
+
+	requestErrCh := startReverseConnectRequests(
+		requestCtx,
 		nonEmpty(discoveryService, defaultDiscoverySvc),
 		address,
 		tcpAddr.Port,
 		fingerprint,
-	); err != nil {
-		return nil, err
-	}
+	)
 
-	raw, err := acceptReverse(ctx, ln)
+	raw, err := acceptReverse(ctx, ln, requestErrCh)
 	if err != nil {
 		return nil, err
 	}
+	requestCancel()
 
 	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
 	if err != nil {
@@ -536,6 +538,27 @@ func dialReverseTLS(
 	return protocol.NewConn(conn), nil
 }
 
+func startReverseConnectRequests(
+	ctx context.Context,
+	discoveryService string,
+	address string,
+	callbackPort int,
+	fingerprint string,
+) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- discovery.RequestReverseConnect(
+			ctx,
+			discoveryService,
+			address,
+			callbackPort,
+			fingerprint,
+		)
+	}()
+
+	return errCh
+}
+
 func nonEmpty(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -545,7 +568,11 @@ func nonEmpty(value, fallback string) string {
 	return value
 }
 
-func acceptReverse(ctx context.Context, ln net.Listener) (net.Conn, error) {
+func acceptReverse(
+	ctx context.Context,
+	ln net.Listener,
+	requestErrCh <-chan error,
+) (net.Conn, error) {
 	type acceptResult struct {
 		conn net.Conn
 		err  error
@@ -558,17 +585,26 @@ func acceptReverse(ctx context.Context, ln net.Listener) (net.Conn, error) {
 		resultCh <- acceptResult{conn: conn, err: err}
 	}()
 
-	select {
-	case <-ctx.Done():
-		_ = ln.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
 
-		return nil, fmt.Errorf("accept reverse connection: %w", ctx.Err())
-	case result := <-resultCh:
-		if result.err != nil {
-			return nil, fmt.Errorf("accept reverse connection: %w", result.err)
+			return nil, fmt.Errorf("accept reverse connection: %w", ctx.Err())
+		case err := <-requestErrCh:
+			requestErrCh = nil
+			if err != nil {
+				_ = ln.Close()
+
+				return nil, err
+			}
+		case result := <-resultCh:
+			if result.err != nil {
+				return nil, fmt.Errorf("accept reverse connection: %w", result.err)
+			}
+
+			return result.conn, nil
 		}
-
-		return result.conn, nil
 	}
 }
 

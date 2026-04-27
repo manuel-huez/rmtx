@@ -1,10 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
-	"io"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,11 +17,13 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var logs lockedBuffer
+
 	server, err := host.New(host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         t.TempDir(),
 		DiscoveryService: "test-rmtx",
-		Logger:           log.New(io.Discard, "", 0),
+		Logger:           log.New(&logs, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +51,8 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 		t.Fatal("expected host name")
 	}
 
+	assertLogDoesNotContain(t, &logs, "request failed", 400*time.Millisecond)
+
 	cancel()
 
 	select {
@@ -57,6 +62,44 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func assertLogDoesNotContain(
+	t *testing.T,
+	logs interface{ String() string },
+	needle string,
+	duration time.Duration,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		content := logs.String()
+		if strings.Contains(content, needle) {
+			t.Fatalf("log contained %q: %s", needle, content)
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

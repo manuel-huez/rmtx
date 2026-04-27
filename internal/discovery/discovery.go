@@ -2,6 +2,8 @@ package discovery
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,8 +23,15 @@ const (
 	announcementInterval    = 250 * time.Millisecond
 	reverseRequestInterval  = 100 * time.Millisecond
 	reverseRequestAttempts  = 3
+	reverseRequestDedupe    = time.Second
 	discoveryPacketSize     = 2048
 	ipv4Len                 = 4
+	reverseRequestIDBytes   = 16
+)
+
+const (
+	reverseRequestKeyID       = "id"
+	reverseRequestKeyCallback = "callback"
 )
 
 type Result struct {
@@ -41,11 +51,16 @@ type packet struct {
 	OS              string `json:"os,omitempty"`
 	Port            int    `json:"port,omitempty"`
 	CallbackPort    int    `json:"callback_port,omitempty"`
+	RequestID       string `json:"request_id,omitempty"`
 	HostFingerprint string `json:"host_cert_fingerprint,omitempty"`
 	PairingEnabled  bool   `json:"pairing_enabled,omitempty"`
 }
 
-type Responder struct{ conn *net.UDPConn }
+type Responder struct {
+	conn            *net.UDPConn
+	reverseMu       sync.Mutex
+	reverseRequests map[string]time.Time
+}
 
 type AdvertiseOptions struct {
 	OS               string
@@ -82,7 +97,7 @@ func Advertise(
 		return nil, fmt.Errorf("listen for discovery: %w", err)
 	}
 
-	r := &Responder{conn: conn}
+	r := &Responder{conn: conn, reverseRequests: map[string]time.Time{}}
 	go r.serve(ctx, service, instance, port, opts)
 	go r.announce(ctx, service, instance, port, opts)
 
@@ -124,7 +139,7 @@ func (r *Responder) serve(
 		}
 
 		if pkt.Type == "reverse_connect" {
-			handleReverseConnect(pkt, addr, opts)
+			r.handleReverseConnect(pkt, addr, opts)
 
 			continue
 		}
@@ -142,7 +157,7 @@ func (r *Responder) serve(
 	}
 }
 
-func handleReverseConnect(pkt packet, addr *net.UDPAddr, opts AdvertiseOptions) {
+func (r *Responder) handleReverseConnect(pkt packet, addr *net.UDPAddr, opts AdvertiseOptions) {
 	if opts.OnReverseConnect == nil || pkt.CallbackPort == 0 {
 		return
 	}
@@ -157,7 +172,59 @@ func handleReverseConnect(pkt packet, addr *net.UDPAddr, opts AdvertiseOptions) 
 	}
 
 	callback := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.CallbackPort))
+	if !r.claimReverseRequest(pkt, callback) {
+		return
+	}
+
 	go opts.OnReverseConnect(callback)
+}
+
+func (r *Responder) claimReverseRequest(pkt packet, callback string) bool {
+	key := reverseRequestKey(pkt, callback)
+	now := time.Now()
+
+	r.reverseMu.Lock()
+	defer r.reverseMu.Unlock()
+
+	if r.reverseRequests == nil {
+		r.reverseRequests = map[string]time.Time{}
+	}
+
+	for existingKey, lastSeen := range r.reverseRequests {
+		if now.Sub(lastSeen) > reverseRequestDedupe {
+			delete(r.reverseRequests, existingKey)
+		}
+	}
+
+	if lastSeen, ok := r.reverseRequests[key]; ok && now.Sub(lastSeen) <= reverseRequestDedupe {
+		return false
+	}
+
+	r.reverseRequests[key] = now
+
+	return true
+}
+
+func reverseRequestKey(pkt packet, callback string) string {
+	fingerprint := strings.TrimSpace(pkt.HostFingerprint)
+	requestID := strings.TrimSpace(pkt.RequestID)
+	if requestID != "" {
+		return joinReverseRequestKey(
+			fingerprint,
+			reverseRequestKeyID,
+			requestID,
+		)
+	}
+
+	return joinReverseRequestKey(
+		fingerprint,
+		reverseRequestKeyCallback,
+		callback,
+	)
+}
+
+func joinReverseRequestKey(parts ...string) string {
+	return strings.Join(parts, "\x00")
 }
 
 func (r *Responder) announce(
@@ -311,10 +378,16 @@ func RequestReverseConnect(
 
 	defer func() { _ = conn.Close() }()
 
+	requestID, err := randomRequestID()
+	if err != nil {
+		return err
+	}
+
 	msg, err := json.Marshal(packet{
 		Type:            "reverse_connect",
 		Service:         service,
 		CallbackPort:    callbackPort,
+		RequestID:       requestID,
 		HostFingerprint: strings.TrimSpace(hostFingerprint),
 	})
 	if err != nil {
@@ -339,6 +412,15 @@ func RequestReverseConnect(
 	}
 
 	return nil
+}
+
+func randomRequestID() (string, error) {
+	var buf [reverseRequestIDBytes]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("generate reverse request id: %w", err)
+	}
+
+	return hex.EncodeToString(buf[:]), nil
 }
 
 func orderedResults(results map[string]Result) []Result {

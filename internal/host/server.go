@@ -284,6 +284,10 @@ func isDisconnectErrno(errno syscall.Errno) bool {
 func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
 	head, err := conn.ReadHeader()
 	if err != nil {
+		if isDisconnectError(err) {
+			return nil
+		}
+
 		return err
 	}
 

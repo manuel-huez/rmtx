@@ -1,7 +1,11 @@
 package host
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"log"
+	"net"
 	"syscall"
 	"testing"
 
@@ -22,6 +26,24 @@ func TestIsDisconnectErrorRecognizesTypedNetworkCloseErrors(t *testing.T) {
 
 	if isDisconnectError(errors.New("apply non-file entries failed")) {
 		t.Fatal("non-disconnect error should not match")
+	}
+}
+
+func TestHandleConnIgnoresDisconnectBeforeRequestHeader(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	var logs bytes.Buffer
+	s := &Server{logger: log.New(&logs, "", 0)}
+
+	if err := clientConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s.handleConn(context.Background(), serverConn)
+
+	if logs.Len() != 0 {
+		t.Fatalf("expected no request failure log for disconnect, got %q", logs.String())
 	}
 }
 
