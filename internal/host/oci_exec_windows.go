@@ -40,7 +40,7 @@ func (s *Server) ociChildCommand(
 		return nil, noopCommandCleanup, err
 	}
 
-	wslScript, err := wslPath(ctx, script)
+	wslScript, err := windowsPathToWSL(ctx, script)
 	if err != nil {
 		_ = os.Remove(script)
 		return nil, noopCommandCleanup, err
@@ -145,7 +145,7 @@ func wslPath(ctx context.Context, path string) (string, error) {
 
 	out, err := exec.CommandContext(ctx, "wsl.exe", args...).Output()
 	if err != nil {
-		return "", fmt.Errorf("convert Windows path to WSL path: %w", err)
+		return "", fmt.Errorf("convert Windows path %q to WSL path: %w", path, err)
 	}
 
 	return strings.TrimSpace(string(out)), nil
