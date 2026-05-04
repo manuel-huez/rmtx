@@ -265,6 +265,7 @@ func isDisconnectError(err error) bool {
 	var errno syscall.Errno
 
 	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
@@ -1186,7 +1187,8 @@ func (s *Server) runPipeExecCommand(
 	conn *protocol.Conn,
 	cmd *exec.Cmd,
 ) (int, error) {
-	_ = ctx
+	cancelRun := s.commandCancel(cmd, cancel)
+	defer cancelRun()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1207,6 +1209,11 @@ func (s *Server) runPipeExecCommand(
 		return exitCode(err), fmt.Errorf("start command: %w", err)
 	}
 
+	go func() {
+		<-ctx.Done()
+		cancelRun()
+	}()
+
 	var outWG sync.WaitGroup
 	outWG.Add(pipeCount)
 
@@ -1214,7 +1221,7 @@ func (s *Server) runPipeExecCommand(
 		defer outWG.Done()
 
 		if err := streamPipe(conn, stdout, "stdout"); err != nil {
-			cancel()
+			cancelRun()
 		}
 	}()
 
@@ -1222,7 +1229,7 @@ func (s *Server) runPipeExecCommand(
 		defer outWG.Done()
 
 		if err := streamPipe(conn, stderr, "stderr"); err != nil {
-			cancel()
+			cancelRun()
 		}
 	}()
 
@@ -1231,7 +1238,7 @@ func (s *Server) runPipeExecCommand(
 	go func() {
 		err := s.consumePipeInput(conn, stdin)
 		if err != nil {
-			cancel()
+			cancelRun()
 		}
 
 		stdinDone <- err
@@ -1242,20 +1249,32 @@ func (s *Server) runPipeExecCommand(
 
 	outWG.Wait()
 
-	if err := <-stdinDone; err != nil && !errors.Is(err, io.EOF) {
-		s.logger.Printf("stdin forwarding ended: %v", err)
+	select {
+	case err := <-stdinDone:
+		if err != nil && !errors.Is(err, io.EOF) && !isDisconnectError(err) {
+			s.logger.Printf("stdin forwarding ended: %v", err)
+		}
+	default:
 	}
 
 	return exitCode(waitErr), waitErr
 }
 
 func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) error {
-	defer func() { _ = stdin.Close() }()
+	var stdinClosed bool
 
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {
 			return err
+		}
+
+		if stdinClosed {
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		done, err := s.handleInputFrame(conn, head, stdin, false)
@@ -1264,7 +1283,8 @@ func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) err
 		}
 
 		if done {
-			return nil
+			stdinClosed = true
+			_ = stdin.Close()
 		}
 	}
 }
@@ -1276,6 +1296,7 @@ func (s *Server) newSessionCommand(
 	request protocol.RunRequest,
 ) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, request.Command[0], request.Command[1:]...)
+	configureCommandProcessGroup(cmd)
 	cmd.Dir = workdir
 	cmd.Env = mergeEnv(os.Environ(), request.Env)
 	cmd.Env = append(

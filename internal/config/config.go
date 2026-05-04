@@ -37,7 +37,6 @@ type Config struct {
 	Context         ContextConfig   `json:"context,omitempty"`
 	Host            string          `json:"host,omitempty"`
 	TLS             TLSConfig       `json:"tls,omitempty"`
-	WorkDir         string          `json:"workdir,omitempty"`
 	Runtime         RuntimeConfig   `json:"runtime,omitempty"`
 	Discovery       DiscoveryConfig `json:"discovery,omitempty"`
 	Mounts          []Mount         `json:"mounts,omitempty"`
@@ -292,10 +291,6 @@ func (l Loaded) ContextID() string {
 func normalize(cfg Config) Config {
 	if cfg.Version == 0 {
 		cfg.Version = 1
-	}
-
-	if strings.TrimSpace(cfg.WorkDir) == "" {
-		cfg.WorkDir = "."
 	}
 
 	if len(cfg.Mounts) == 0 {

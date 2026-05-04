@@ -36,6 +36,9 @@ func (s *Server) runTTYExecCommand(
 	cmd *exec.Cmd,
 	request protocol.RunRequest,
 ) (int, error) {
+	cancelRun := s.commandCancel(cmd, cancel)
+	defer cancelRun()
+
 	options := []conpty.ConPtyOption{
 		conpty.ConPtyWorkDir(cmd.Dir),
 		conpty.ConPtyEnv(cmd.Env),
@@ -67,9 +70,9 @@ func (s *Server) runTTYExecCommand(
 			conn,
 			&windowsTTY{pty: pty},
 		); err != nil {
-			cancel()
+			cancelRun()
 
-			if !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
 			}
 		}
@@ -77,7 +80,7 @@ func (s *Server) runTTYExecCommand(
 
 	go func() {
 		<-ctx.Done()
-		closePTY()
+		cancelRun()
 	}()
 
 	exitCode, waitErr := pty.Wait(ctx)
@@ -85,7 +88,11 @@ func (s *Server) runTTYExecCommand(
 	closePTY()
 
 	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
-		cancel()
+		if !isDisconnectError(err) {
+			s.logger.Printf("TTY output forwarding ended: %v", err)
+		}
+
+		cancelRun()
 		return int(exitCode), err
 	}
 

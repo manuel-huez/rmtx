@@ -20,6 +20,9 @@ func (s *Server) runTTYExecCommand(
 	cmd *exec.Cmd,
 	request protocol.RunRequest,
 ) (int, error) {
+	cancelRun := s.commandCancel(cmd, cancel)
+	defer cancelRun()
+
 	master, slave, err := openPTY(request.TTYRows, request.TTYCols)
 	if err != nil {
 		return 1, err
@@ -48,15 +51,20 @@ func (s *Server) runTTYExecCommand(
 
 	_ = slave.Close()
 
+	go func() {
+		<-ctx.Done()
+		cancelRun()
+	}()
+
 	outputDone := make(chan error, 1)
 
 	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
 
 	go func() {
 		if err := s.consumeTTYInput(conn, master); err != nil {
-			cancel()
+			cancelRun()
 
-			if !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
 			}
 		}
@@ -66,7 +74,11 @@ func (s *Server) runTTYExecCommand(
 	_ = master.Close()
 
 	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
-		cancel()
+		if !isDisconnectError(err) {
+			s.logger.Printf("TTY output forwarding ended: %v", err)
+		}
+
+		cancelRun()
 		return exitCode(waitErr), err
 	}
 

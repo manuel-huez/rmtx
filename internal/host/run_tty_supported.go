@@ -9,10 +9,20 @@ import (
 )
 
 func (s *Server) consumeTTYInput(conn *protocol.Conn, writer io.Writer) error {
+	inputClosed := false
+
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {
 			return err
+		}
+
+		if inputClosed {
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		done, err := s.handleInputFrame(conn, head, writer, true)
@@ -21,7 +31,7 @@ func (s *Server) consumeTTYInput(conn *protocol.Conn, writer io.Writer) error {
 		}
 
 		if done {
-			return nil
+			inputClosed = true
 		}
 	}
 }
