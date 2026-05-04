@@ -134,6 +134,12 @@ func (s *Server) prepareOCIRuntimeLocked(
 	handle contextHandle,
 	request protocol.RunRequest,
 ) (preparedRuntime, error) {
+	s.logger.Printf(
+		"preparing OCI runtime: context=%s image=%s",
+		request.ContextID,
+		request.Runtime.Image,
+	)
+
 	ref, err := oci.ParseReference(request.Runtime.Image)
 	if err != nil {
 		return preparedRuntime{}, err
@@ -144,7 +150,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	image, err := s.pullOCIImage(ctx, ref, request.Runtime, store)
+	image, err := s.pullOCIImage(ctx, ref, request.Runtime, store, request.ContextID)
 	if err != nil {
 		return preparedRuntime{}, err
 	}
@@ -154,6 +160,13 @@ func (s *Server) prepareOCIRuntimeLocked(
 
 	setupMarker := filepath.Join(rootfs, runtimeSetupMarker)
 	if _, err := os.Stat(setupMarker); errors.Is(err, os.ErrNotExist) {
+		s.logger.Printf(
+			"unpacking OCI image: context=%s rootfs=%s image=%s",
+			request.ContextID,
+			rootfs,
+			request.Runtime.Image,
+		)
+
 		if err := store.UnpackImage(rootfs, image); err != nil {
 			return preparedRuntime{}, err
 		}
@@ -167,6 +180,12 @@ func (s *Server) prepareOCIRuntimeLocked(
 		if err := os.WriteFile(setupMarker, content, contextFileMode); err != nil {
 			return preparedRuntime{}, err
 		}
+	} else {
+		s.logger.Printf(
+			"using existing OCI runtime setup marker: context=%s image=%s",
+			request.ContextID,
+			request.Runtime.Image,
+		)
 	}
 
 	if err := s.ensureOCIVolumes(handle.dir, request.Runtime.Volumes); err != nil {
@@ -185,15 +204,29 @@ func (s *Server) pullOCIImage(
 	ref oci.Reference,
 	runtimeSpec protocol.RuntimeSpec,
 	store *oci.Store,
+	contextID string,
 ) (oci.Image, error) {
 	policy := strings.TrimSpace(runtimeSpec.PullPolicy)
 	if policy == "" {
 		policy = "if_missing"
 	}
 
+	s.logger.Printf(
+		"runtime image pull start: context=%s image=%s pull_policy=%s",
+		contextID,
+		ref.Normalized(),
+		policy,
+	)
+
 	if !strings.EqualFold(policy, "always") {
 		image, err := store.LoadRef(ref)
 		if err == nil && store.ImageComplete(image) {
+			s.logger.Printf(
+				"runtime image cache hit: context=%s image=%s digest=%s",
+				contextID,
+				ref.Normalized(),
+				image.ManifestDigest,
+			)
 			return image, nil
 		}
 
@@ -203,11 +236,31 @@ func (s *Server) pullOCIImage(
 	}
 
 	client := oci.NewClient(&http.Client{Timeout: 0})
-
-	return client.Pull(ctx, ref, store, oci.PullOptions{
+	image, err := client.Pull(ctx, ref, store, oci.PullOptions{
 		PlatformOS:   "linux",
 		Architecture: runtime.GOARCH,
+		Progress: func(format string, args ...any) {
+			fields := make([]any, 0, len(args)+2)
+			fields = append(fields, contextID, ref.Normalized())
+			fields = append(fields, args...)
+			s.logger.Printf(
+				"runtime image pull: context=%s image=%s: "+format,
+				fields...,
+			)
+		},
 	})
+	if err != nil {
+		return oci.Image{}, err
+	}
+
+	s.logger.Printf(
+		"runtime image pull done: context=%s image=%s digest=%s",
+		contextID,
+		ref.Normalized(),
+		image.ManifestDigest,
+	)
+
+	return image, nil
 }
 
 func (s *Server) runImageSetupCommands(
@@ -244,7 +297,13 @@ func (s *Server) runImageSetupCommands(
 			return err
 		}
 
-		out, err := cmd.CombinedOutput()
+		s.logger.Printf("runtime image setup command start: command=%q", command)
+
+		out, err := runCommandWithLiveOutput(
+			s.logger,
+			cmd,
+			"runtime image setup command",
+		)
 		cleanupErr := cleanup()
 		if err != nil {
 			return fmt.Errorf(
@@ -330,13 +389,22 @@ func (s *Server) runOCIContextSetupCommands(
 		setupReq := request
 		setupReq.Command = []string{"/bin/sh", "-c", command}
 		setupReq.WorkDir = request.WorkDir
+		s.logger.Printf(
+			"runtime context setup command start: context=%s command=%q",
+			request.ContextID,
+			command,
+		)
 
 		cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, setupReq, preparedRuntime)
 		if err != nil {
 			return err
 		}
 
-		out, err := cmd.CombinedOutput()
+		out, err := runCommandWithLiveOutput(
+			s.logger,
+			cmd,
+			"runtime context setup command",
+		)
 		cleanupErr := cleanup()
 		if err != nil {
 			return fmt.Errorf(

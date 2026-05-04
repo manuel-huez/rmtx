@@ -25,6 +25,7 @@ const (
 type PullOptions struct {
 	PlatformOS   string
 	Architecture string
+	Progress     func(format string, args ...any)
 }
 
 type Client struct {
@@ -54,15 +55,27 @@ func (c *Client) Pull(
 		opts.Architecture = runtime.GOARCH
 	}
 
+	if opts.Progress != nil {
+		opts.Progress("fetching image manifest: %s", ref.Reference)
+	}
+
 	raw, digest, mediaType, err := c.fetchManifest(ctx, ref, ref.Reference)
 	if err != nil {
 		return Image{}, err
 	}
 
 	if isIndex(mediaType, raw) {
+		if opts.Progress != nil {
+			opts.Progress("manifest is multi-arch index: %s", digest)
+		}
+
 		desc, err := selectManifest(raw, opts)
 		if err != nil {
 			return Image{}, err
+		}
+
+		if opts.Progress != nil {
+			opts.Progress("selected manifest %s for platform %s/%s", desc.Digest, opts.PlatformOS, opts.Architecture)
 		}
 
 		raw, digest, mediaType, err = c.fetchManifest(ctx, ref, desc.Digest)
@@ -92,7 +105,11 @@ func (c *Client) Pull(
 	}
 
 	if manifest.Config.Digest != "" {
-		if err := c.ensureBlob(ctx, ref, manifest.Config, store); err != nil {
+		if opts.Progress != nil {
+			opts.Progress("fetching config blob %s", manifest.Config.Digest)
+		}
+
+		if err := c.ensureBlob(ctx, ref, manifest.Config, store, opts); err != nil {
 			return Image{}, err
 		}
 
@@ -104,7 +121,11 @@ func (c *Client) Pull(
 	}
 
 	for _, layer := range manifest.Layers {
-		if err := c.ensureBlob(ctx, ref, layer, store); err != nil {
+		if opts.Progress != nil {
+			opts.Progress("fetching layer blob %s", layer.Digest)
+		}
+
+		if err := c.ensureBlob(ctx, ref, layer, store, opts); err != nil {
 			return Image{}, err
 		}
 	}
@@ -121,9 +142,18 @@ func (c *Client) ensureBlob(
 	ref Reference,
 	desc Descriptor,
 	store *Store,
+	opts PullOptions,
 ) error {
 	if store.HasBlob(desc.Digest) {
+		if opts.Progress != nil {
+			opts.Progress("blob already present in cache: %s", desc.Digest)
+		}
+
 		return nil
+	}
+
+	if opts.Progress != nil {
+		opts.Progress("downloading blob %s (%d bytes)", desc.Digest, desc.Size)
 	}
 
 	resp, err := c.registryRequest(ctx, ref, "GET", "/v2/"+ref.Repository+"/blobs/"+desc.Digest, "")
@@ -136,7 +166,15 @@ func (c *Client) ensureBlob(
 		return fmt.Errorf("fetch blob %s: registry returned %s", desc.Digest, resp.Status)
 	}
 
-	return store.StoreBlob(desc.Digest, resp.Body)
+	if err := store.StoreBlob(desc.Digest, resp.Body); err != nil {
+		return err
+	}
+
+	if opts.Progress != nil {
+		opts.Progress("stored blob %s", desc.Digest)
+	}
+
+	return nil
 }
 
 func (c *Client) fetchManifest(

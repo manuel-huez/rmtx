@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -24,7 +25,7 @@ func (s *Server) ociChildCommand(
 		return nil, noopCommandCleanup, errors.New("OCI command is required")
 	}
 
-	if err := checkWSLAvailable(ctx, spec.WSLDistro); err != nil {
+	if err := checkWSLAvailable(ctx, s.logger, spec.WSLDistro); err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
@@ -85,7 +86,7 @@ func nvidiaUnavailableError(err error) error {
 	)
 }
 
-func checkWSLAvailable(ctx context.Context, requestedDistro string) error {
+func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro string) error {
 	requestedDistro = strings.TrimSpace(requestedDistro)
 	if requestedDistro == "" {
 		return errors.New("runtime.wsl_distro is required for OCI runtime on Windows")
@@ -101,11 +102,14 @@ func checkWSLAvailable(ctx context.Context, requestedDistro string) error {
 
 	for _, name := range installedDistros {
 		if strings.EqualFold(name, requestedDistro) {
+			if logger != nil {
+				logger.Printf("using already installed WSL distro: %s", requestedDistro)
+			}
 			return nil
 		}
 	}
 
-	if err := installWSLDistro(ctx, requestedDistro); err != nil {
+	if err := installWSLDistro(ctx, logger, requestedDistro); err != nil {
 		return fmt.Errorf(
 			"requested WSL distro %q is not installed and auto-install failed: %w",
 			requestedDistro,
@@ -200,18 +204,25 @@ func wslInstalledDistros(ctx context.Context) ([]string, error) {
 	return distros, nil
 }
 
-func installWSLDistro(ctx context.Context, distro string) error {
+func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) error {
 	if strings.TrimSpace(distro) == "" {
 		return errors.New("requested WSL distro is empty")
 	}
 
-	out, err := exec.CommandContext(
+	if logger != nil {
+		logger.Printf("installing WSL distro: %s", distro)
+	}
+
+	cmd := exec.CommandContext(
 		ctx,
 		"wsl.exe",
 		"--install",
 		"-d",
 		distro,
-	).CombinedOutput()
+	)
+	cmd.Env = os.Environ()
+
+	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro)
 	if err != nil {
 		return fmt.Errorf("install WSL distro %q: %s: %w", distro, strings.TrimSpace(string(out)), err)
 	}
