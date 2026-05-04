@@ -238,6 +238,7 @@ func runtimeSpec(runtime config.RuntimeConfig) protocol.RuntimeSpec {
 		Type:       runtime.Type,
 		Image:      runtime.Image,
 		PullPolicy: runtime.PullPolicy,
+		WSLDistro:  runtime.WSLDistro,
 		WorkDir:    runtime.WorkDir,
 		Network:    runtime.Network,
 		User:       runtime.User,
