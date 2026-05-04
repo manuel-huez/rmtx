@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 )
 
 const wslDistroEnv = "RMTX_WSL_DISTRO"
@@ -115,11 +116,28 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 }
 
 func windowsPathToWSL(ctx context.Context, path string) (string, error) {
-	if strings.TrimSpace(path) == "" || strings.HasPrefix(path, "/") {
-		return path, nil
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") {
+		return trimmed, nil
 	}
 
-	return wslPath(ctx, path)
+	if len(trimmed) >= 2 &&
+		trimmed[1] == ':' &&
+		((trimmed[0] >= 'A' && trimmed[0] <= 'Z') || (trimmed[0] >= 'a' && trimmed[0] <= 'z')) {
+		drive := unicode.ToLower(rune(trimmed[0]))
+		rest := filepath.ToSlash(trimmed[2:])
+		return "/mnt/" + string(drive) + "/" + strings.TrimPrefix(rest, "/"), nil
+	}
+
+	if strings.HasPrefix(trimmed, `\\`) {
+		return trimmed, nil
+	}
+
+	if strings.HasPrefix(trimmed, `//`) {
+		return filepath.ToSlash(trimmed), nil
+	}
+
+	return wslPath(ctx, trimmed)
 }
 
 func wslPath(ctx context.Context, path string) (string, error) {

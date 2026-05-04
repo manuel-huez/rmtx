@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"runtime"
 	"strings"
 )
 
@@ -144,7 +145,15 @@ func applyTarEntry(root string, hdr *tar.Header, src io.Reader) error {
 		}
 
 		_ = os.RemoveAll(target)
-		return os.Symlink(hdr.Linkname, target)
+		if err := os.Symlink(hdr.Linkname, target); err != nil {
+			if isUnsupportedWindowsSymlink(err) {
+				return nil
+			}
+
+			return err
+		}
+
+		return nil
 	case tar.TypeLink:
 		linkTarget, err := secureLayerPath(root, hdr.Linkname)
 		if err != nil {
@@ -177,6 +186,10 @@ func cleanTarName(name string) (string, error) {
 	}
 
 	return clean, nil
+}
+
+func isUnsupportedWindowsSymlink(err error) bool {
+	return runtime.GOOS == "windows" && strings.Contains(strings.ToLower(err.Error()), "privilege")
 }
 
 func applyWhiteout(root, dir, base string) error {
