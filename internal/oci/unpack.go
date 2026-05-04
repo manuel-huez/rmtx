@@ -264,9 +264,16 @@ func validateSymlinkTarget(root, name, linkname string) error {
 		return fmt.Errorf("unsafe symlink target %q", linkname)
 	}
 
-	parent, err := secureLayerPath(root, path.Dir(name))
-	if err != nil {
-		return err
+	parentDir := path.Dir(name)
+	var parent string
+	if parentDir == "." {
+		parent = root
+	} else {
+		var err error
+		parent, err = secureLayerPath(root, parentDir)
+		if err != nil {
+			return err
+		}
 	}
 
 	var target string
