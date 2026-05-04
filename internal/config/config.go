@@ -172,7 +172,7 @@ func Load(path string) (*Loaded, error) {
 	}
 
 	cfg = normalize(cfg)
-	if err := validate(cfg); err != nil {
+	if err := ValidateRuntime(cfg.Runtime); err != nil {
 		return nil, err
 	}
 
@@ -337,10 +337,6 @@ func normalizeRuntime(runtime RuntimeConfig) RuntimeConfig {
 	}
 
 	return runtime
-}
-
-func validate(cfg Config) error {
-	return ValidateRuntime(cfg.Runtime)
 }
 
 func ValidateRuntime(runtime RuntimeConfig) error {
