@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type Config struct {
 	Host            string          `json:"host,omitempty"`
 	TLS             TLSConfig       `json:"tls,omitempty"`
 	WorkDir         string          `json:"workdir,omitempty"`
+	Runtime         RuntimeConfig   `json:"runtime,omitempty"`
 	Discovery       DiscoveryConfig `json:"discovery,omitempty"`
 	Mounts          []Mount         `json:"mounts,omitempty"`
 	SyncBack        []string        `json:"sync_back,omitempty"`
@@ -56,6 +58,29 @@ type Mount struct {
 
 type EnvConfig struct {
 	Forward []string `json:"forward,omitempty"`
+}
+
+type RuntimeConfig struct {
+	Type       string          `json:"type,omitempty"`
+	Image      string          `json:"image,omitempty"`
+	PullPolicy string          `json:"pull_policy,omitempty"`
+	WorkDir    string          `json:"workdir,omitempty"`
+	Network    string          `json:"network,omitempty"`
+	User       string          `json:"user,omitempty"`
+	GPU        string          `json:"gpu,omitempty"`
+	Setup      RuntimeSetup    `json:"setup,omitempty"`
+	Volumes    []RuntimeVolume `json:"volumes,omitempty"`
+}
+
+type RuntimeSetup struct {
+	ImageCommands   []string `json:"image_commands,omitempty"`
+	ContextCommands []string `json:"context_commands,omitempty"`
+	ContextInputs   []string `json:"context_inputs,omitempty"`
+}
+
+type RuntimeVolume struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
 }
 
 type DiscoveryConfig struct {
@@ -147,6 +172,9 @@ func Load(path string) (*Loaded, error) {
 	}
 
 	cfg = normalize(cfg)
+	if err := validate(cfg); err != nil {
+		return nil, err
+	}
 
 	return &Loaded{Path: absPath, Root: filepath.Dir(absPath), Config: cfg}, nil
 }
@@ -282,7 +310,141 @@ func normalize(cfg Config) Config {
 		cfg.Discovery.Timeout = "750ms"
 	}
 
+	cfg.Runtime = normalizeRuntime(cfg.Runtime)
+
 	return cfg
+}
+
+func normalizeRuntime(runtime RuntimeConfig) RuntimeConfig {
+	if strings.TrimSpace(runtime.Type) == "" {
+		return runtime
+	}
+
+	if strings.TrimSpace(runtime.PullPolicy) == "" {
+		runtime.PullPolicy = "if_missing"
+	}
+
+	if strings.TrimSpace(runtime.WorkDir) == "" {
+		runtime.WorkDir = "/workspace"
+	}
+
+	if strings.TrimSpace(runtime.Network) == "" {
+		runtime.Network = "host"
+	}
+
+	if strings.TrimSpace(runtime.User) == "" {
+		runtime.User = "root"
+	}
+
+	if strings.TrimSpace(runtime.GPU) == "" {
+		runtime.GPU = "none"
+	}
+
+	return runtime
+}
+
+func validate(cfg Config) error {
+	return ValidateRuntime(cfg.Runtime)
+}
+
+func ValidateRuntime(runtime RuntimeConfig) error {
+	return validateRuntime(normalizeRuntime(runtime))
+}
+
+//nolint:cyclop // Runtime schema validation is intentionally explicit.
+func validateRuntime(runtime RuntimeConfig) error {
+	typ := strings.TrimSpace(runtime.Type)
+	if typ == "" {
+		if runtimeConfigured(runtime) {
+			return errors.New("runtime.type is required when runtime is configured")
+		}
+
+		return nil
+	}
+
+	if !equalAny(typ, "oci") {
+		return fmt.Errorf("unsupported runtime.type %q", runtime.Type)
+	}
+
+	if strings.TrimSpace(runtime.Image) == "" {
+		return errors.New("runtime.image is required for OCI runtime")
+	}
+
+	if !equalAny(runtime.PullPolicy, "if_missing", "always", "never") {
+		return fmt.Errorf("unsupported runtime.pull_policy %q", runtime.PullPolicy)
+	}
+
+	if !equalAny(runtime.Network, "host", "none") {
+		return fmt.Errorf("unsupported runtime.network %q", runtime.Network)
+	}
+
+	if !equalAny(runtime.GPU, "none", "nvidia") {
+		return fmt.Errorf("unsupported runtime.gpu %q", runtime.GPU)
+	}
+
+	if !equalAny(runtime.User, "root") {
+		return fmt.Errorf("unsupported runtime.user %q", runtime.User)
+	}
+
+	if !validRuntimeTarget(runtime.WorkDir) {
+		return fmt.Errorf("invalid runtime.workdir %q", runtime.WorkDir)
+	}
+
+	for _, volume := range runtime.Volumes {
+		if strings.TrimSpace(volume.Name) == "" {
+			return errors.New("runtime volume name is required")
+		}
+
+		if strings.ContainsAny(volume.Name, `/\`) || volume.Name == "." || volume.Name == ".." {
+			return fmt.Errorf("invalid runtime volume name %q", volume.Name)
+		}
+
+		if !validRuntimeTarget(volume.Target) {
+			return fmt.Errorf("invalid runtime volume target %q", volume.Target)
+		}
+	}
+
+	return nil
+}
+
+func runtimeConfigured(runtime RuntimeConfig) bool {
+	if strings.TrimSpace(runtime.Image) != "" ||
+		strings.TrimSpace(runtime.PullPolicy) != "" ||
+		strings.TrimSpace(runtime.WorkDir) != "" ||
+		strings.TrimSpace(runtime.Network) != "" ||
+		strings.TrimSpace(runtime.User) != "" ||
+		strings.TrimSpace(runtime.GPU) != "" {
+		return true
+	}
+
+	return len(runtime.Setup.ImageCommands) > 0 ||
+		len(runtime.Setup.ContextCommands) > 0 ||
+		len(runtime.Setup.ContextInputs) > 0 ||
+		len(runtime.Volumes) > 0
+}
+
+func validRuntimeTarget(target string) bool {
+	if !strings.HasPrefix(target, "/") || strings.Contains(target, "\x00") {
+		return false
+	}
+
+	for _, part := range strings.Split(target, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+
+	return path.Clean(target) != "."
+}
+
+func equalAny(value string, allowed ...string) bool {
+	for _, item := range allowed {
+		if strings.EqualFold(value, item) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func slug(value string) string {

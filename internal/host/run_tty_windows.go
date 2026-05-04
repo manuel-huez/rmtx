@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,16 +29,13 @@ func (w *windowsTTY) ResizeTTY(rows, cols int) error {
 	return w.pty.Resize(cols, rows)
 }
 
-func (s *Server) runTTYCommand(
+func (s *Server) runTTYExecCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
-	workspace string,
-	workdir string,
+	cmd *exec.Cmd,
 	request protocol.RunRequest,
 ) (int, error) {
-	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
-
 	options := []conpty.ConPtyOption{
 		conpty.ConPtyWorkDir(cmd.Dir),
 		conpty.ConPtyEnv(cmd.Env),
@@ -70,6 +68,7 @@ func (s *Server) runTTYCommand(
 			&windowsTTY{pty: pty},
 		); err != nil {
 			cancel()
+
 			if !errors.Is(err, io.EOF) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
 			}

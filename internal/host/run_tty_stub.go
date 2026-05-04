@@ -16,6 +16,7 @@ func (s *Server) runTTYCommand(
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
+	preparedRuntime *preparedRuntime,
 ) (int, error) {
 	_ = ctx
 	_ = cancel
@@ -23,6 +24,7 @@ func (s *Server) runTTYCommand(
 	_ = workspace
 	_ = workdir
 	_ = request
+	_ = preparedRuntime
 
 	return 1, errors.New("interactive TTY is not supported on this platform")
 }

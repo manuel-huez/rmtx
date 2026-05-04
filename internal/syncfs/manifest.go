@@ -913,6 +913,7 @@ func newIncludeMatcher(includes []string) includeMatcher {
 	}
 
 	matcher := includeMatcher{}
+
 	for _, include := range includes {
 		raw := strings.TrimSpace(include)
 		if raw == "" {

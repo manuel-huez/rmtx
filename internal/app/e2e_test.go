@@ -429,6 +429,7 @@ func TestRunExecEndToEndReportsCommandStartFailure(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
+
 	missingCommand := "rmtx-command-that-should-not-exist"
 
 	code, err := RunExec(ctx, project, ExecParams{
@@ -462,6 +463,7 @@ func TestRunExecEndToEndReportsCommandStartFailure(t *testing.T) {
 	waitForServerShutdown(t, "start-failure-host", errCh)
 }
 
+//nolint:cyclop // End-to-end sync-back coverage has several verification branches.
 func TestRunExecEndToEndRespectsContextSyncBack(t *testing.T) {
 	if testIsWindows() {
 		t.Skip("shell-based integration test")

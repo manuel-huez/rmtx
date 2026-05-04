@@ -7,14 +7,7 @@ import (
 )
 
 func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
-	conn, err := dialTLS(
-		ctx,
-		opts.Address,
-		opts.DiscoveryService,
-		opts.Host.Fingerprint,
-		opts.ClientCertPEM,
-		opts.ClientKeyPEM,
-	)
+	conn, err := dialRemote(ctx, opts)
 	if err != nil {
 		return PingInfo{}, err
 	}
@@ -28,14 +21,7 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 }
 
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
-	conn, err := dialTLS(
-		ctx,
-		opts.Address,
-		opts.DiscoveryService,
-		opts.Host.Fingerprint,
-		opts.ClientCertPEM,
-		opts.ClientKeyPEM,
-	)
+	conn, err := dialRemote(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -60,14 +46,7 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 }
 
 func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteContextsResult, error) {
-	conn, err := dialTLS(
-		ctx,
-		opts.Remote.Address,
-		opts.Remote.DiscoveryService,
-		opts.Remote.Host.Fingerprint,
-		opts.Remote.ClientCertPEM,
-		opts.Remote.ClientKeyPEM,
-	)
+	conn, err := dialRemote(ctx, opts.Remote)
 	if err != nil {
 		return DeleteContextsResult{}, err
 	}
@@ -86,4 +65,66 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 		conn,
 		protocol.MsgDeleteContextsResponse,
 	)
+}
+
+func ContextArtifacts(
+	ctx context.Context,
+	opts ContextArtifactsOptions,
+) (ContextArtifactsResult, error) {
+	conn, err := dialRemote(ctx, opts.Remote)
+	if err != nil {
+		return ContextArtifactsResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	req := protocol.ContextArtifactsRequest{
+		ContextID: opts.ContextID,
+		Prune:     opts.Prune,
+		Delete:    opts.Delete,
+		Volume:    opts.Volume,
+	}
+	if err := conn.WriteJSON(protocol.MsgContextArtifactsRequest, req); err != nil {
+		return ContextArtifactsResult{}, err
+	}
+
+	return expectDataFrame[protocol.ContextArtifactsResponse](
+		conn,
+		protocol.MsgContextArtifactsResponse,
+	)
+}
+
+func CachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, error) {
+	conn, err := dialRemote(ctx, opts)
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	if err := conn.WriteJSON(
+		protocol.MsgCachePruneRequest,
+		protocol.CachePruneRequest{},
+	); err != nil {
+		return CachePruneResult{}, err
+	}
+
+	return expectDataFrame[protocol.CachePruneResponse](
+		conn,
+		protocol.MsgCachePruneResponse,
+	)
+}
+
+func dialRemote(ctx context.Context, opts RemoteOptions) (*protocol.Conn, error) {
+	conn, err := dialTLS(
+		ctx,
+		opts.Address,
+		opts.DiscoveryService,
+		opts.Host.Fingerprint,
+		opts.ClientCertPEM,
+		opts.ClientKeyPEM,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
 }

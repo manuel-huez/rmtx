@@ -1,0 +1,298 @@
+//nolint:wsl_v5
+package oci
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+)
+
+const rootfsMarker = ".rmtx-rootfs-ready"
+const defaultRootDirMode = 0o755
+
+func (s *Store) UnpackImage(target string, image Image) error {
+	if _, err := os.Stat(filepath.Join(target, rootfsMarker)); err == nil {
+		return nil
+	}
+
+	tmp := target + ".tmp"
+	_ = os.RemoveAll(tmp)
+	if err := os.MkdirAll(tmp, dirMode); err != nil {
+		return fmt.Errorf("create rootfs temp: %w", err)
+	}
+
+	for _, layer := range image.Layers {
+		if err := s.unpackLayer(tmp, layer.Digest); err != nil {
+			_ = os.RemoveAll(tmp)
+			return err
+		}
+	}
+
+	markerContent := []byte(image.ManifestDigest + "\n")
+	markerPath := filepath.Join(tmp, rootfsMarker)
+	if err := os.WriteFile(markerPath, markerContent, storeFileMode); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+
+	_ = os.RemoveAll(target)
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.RemoveAll(tmp)
+		return fmt.Errorf("commit rootfs: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) unpackLayer(root string, digest string) error {
+	f, err := s.ReadBlob(digest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	var r io.Reader = f
+	gz, err := gzip.NewReader(f)
+	if err == nil {
+		defer func() { _ = gz.Close() }()
+		r = gz
+	} else if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		return seekErr
+	}
+
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read layer %s: %w", digest, err)
+		}
+
+		if err := applyTarEntry(root, hdr, tr); err != nil {
+			return fmt.Errorf("apply layer %s entry %s: %w", digest, hdr.Name, err)
+		}
+	}
+}
+
+//nolint:cyclop // Tar entry handling must branch by OCI whiteout and entry type.
+func applyTarEntry(root string, hdr *tar.Header, src io.Reader) error {
+	name, err := cleanTarName(hdr.Name)
+	if err != nil {
+		return err
+	}
+	if name == "" || name == "." {
+		return nil
+	}
+
+	base := path.Base(name)
+	dir := path.Dir(name)
+	if strings.HasPrefix(base, ".wh.") {
+		return applyWhiteout(root, dir, base)
+	}
+
+	target, err := secureLayerPath(root, name)
+	if err != nil {
+		return err
+	}
+
+	if err := ensureNoSymlinkParent(root, name); err != nil {
+		return err
+	}
+
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		return os.MkdirAll(target, fileMode(hdr.FileInfo().Mode(), defaultRootDirMode))
+	case tar.TypeReg, tar.TypeRegA:
+		if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
+			return err
+		}
+
+		_ = os.RemoveAll(target)
+		mode := fileMode(hdr.FileInfo().Mode(), storeFileMode)
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(f, src); err != nil {
+			_ = f.Close()
+			return err
+		}
+
+		if err := f.Close(); err != nil {
+			return err
+		}
+
+		return os.Chtimes(target, hdr.ModTime, hdr.ModTime)
+	case tar.TypeSymlink:
+		if err := validateSymlinkTarget(root, name, hdr.Linkname); err != nil {
+			return err
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
+			return err
+		}
+
+		_ = os.RemoveAll(target)
+		return os.Symlink(hdr.Linkname, target)
+	case tar.TypeLink:
+		linkTarget, err := secureLayerPath(root, hdr.Linkname)
+		if err != nil {
+			return err
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
+			return err
+		}
+
+		_ = os.RemoveAll(target)
+		return os.Link(linkTarget, target)
+	default:
+		return nil
+	}
+}
+
+func cleanTarName(name string) (string, error) {
+	if strings.Contains(name, "\x00") || path.IsAbs(name) {
+		return "", fmt.Errorf("unsafe path %q", name)
+	}
+
+	clean := path.Clean(strings.TrimPrefix(filepath.ToSlash(name), "./"))
+	if clean == "." {
+		return "", nil
+	}
+
+	if slices.Contains(strings.Split(clean, "/"), "..") {
+		return "", fmt.Errorf("unsafe path %q", name)
+	}
+
+	return clean, nil
+}
+
+func applyWhiteout(root, dir, base string) error {
+	if base == ".wh..wh..opq" {
+		target, err := secureLayerPath(root, dir)
+		if err != nil {
+			return err
+		}
+
+		entries, err := os.ReadDir(target)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			if err := os.RemoveAll(filepath.Join(target, entry.Name())); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	deleted := path.Join(dir, strings.TrimPrefix(base, ".wh."))
+	target, err := secureLayerPath(root, deleted)
+	if err != nil {
+		return err
+	}
+
+	return os.RemoveAll(target)
+}
+
+func secureLayerPath(root, name string) (string, error) {
+	if filepath.IsAbs(name) || strings.Contains(name, "\x00") {
+		return "", fmt.Errorf("unsafe path %q", name)
+	}
+
+	clean := filepath.Clean(filepath.FromSlash(name))
+	if clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || clean == ".." {
+		return "", fmt.Errorf("unsafe path %q", name)
+	}
+
+	target := filepath.Join(root, clean)
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", err
+	}
+
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes root: %q", name)
+	}
+
+	return target, nil
+}
+
+func ensureNoSymlinkParent(root, name string) error {
+	parts := strings.Split(path.Dir(name), "/")
+	current := root
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("parent path contains symlink: %s", part)
+		}
+	}
+
+	return nil
+}
+
+func validateSymlinkTarget(root, name, linkname string) error {
+	if strings.Contains(linkname, "\x00") {
+		return fmt.Errorf("unsafe symlink target %q", linkname)
+	}
+
+	parent, err := secureLayerPath(root, path.Dir(name))
+	if err != nil {
+		return err
+	}
+
+	var target string
+	if path.IsAbs(linkname) {
+		cleanTarget := strings.TrimPrefix(path.Clean(linkname), "/")
+		target = filepath.Join(root, filepath.FromSlash(cleanTarget))
+	} else {
+		target = filepath.Clean(filepath.Join(parent, filepath.FromSlash(linkname)))
+	}
+
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("symlink target escapes root: %q", linkname)
+	}
+
+	return nil
+}
+
+func fileMode(mode fs.FileMode, fallback fs.FileMode) fs.FileMode {
+	if mode == 0 {
+		return fallback
+	}
+
+	return mode.Perm()
+}

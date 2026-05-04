@@ -18,6 +18,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 	"github.com/manuel-huez/rmtx/internal/terminal"
@@ -70,6 +71,17 @@ type ContextDeleteParams struct {
 	All              bool
 	OlderThan        time.Duration
 	Current          bool
+}
+
+type ContextArtifactsParams struct {
+	AddressOverride  string
+	ConfigPath       string
+	DiscoveryTimeout time.Duration
+	ContextID        string
+	Current          bool
+	Prune            bool
+	Delete           bool
+	Volume           string
 }
 
 type HostParams struct {
@@ -205,6 +217,7 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		Command:          params.Command,
 		Mounts:           mounts,
 		SyncBack:         syncBack,
+		Runtime:          runtimeSpec(cfg.Runtime),
 		ForwardEnv:       append([]string(nil), cfg.Env.Forward...),
 		Stdout:           params.Stdout,
 		Stderr:           params.Stderr,
@@ -218,6 +231,28 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		ContextName:      loaded.ContextName(),
 		TTY:              useTTY,
 	})
+}
+
+func runtimeSpec(runtime config.RuntimeConfig) protocol.RuntimeSpec {
+	return protocol.RuntimeSpec{
+		Type:       runtime.Type,
+		Image:      runtime.Image,
+		PullPolicy: runtime.PullPolicy,
+		WorkDir:    runtime.WorkDir,
+		Network:    runtime.Network,
+		User:       runtime.User,
+		GPU:        runtime.GPU,
+		Setup: protocol.RuntimeSetup{
+			ImageCommands:   append([]string(nil), runtime.Setup.ImageCommands...),
+			ContextCommands: append([]string(nil), runtime.Setup.ContextCommands...),
+			ContextInputs:   append([]string(nil), runtime.Setup.ContextInputs...),
+		},
+		Volumes: runtimeVolumes(runtime.Volumes),
+	}
+}
+
+func runtimeVolumes(volumes []config.RuntimeVolume) []protocol.RuntimeVolume {
+	return append([]protocol.RuntimeVolume(nil), volumes...)
 }
 
 func buildMountSpecs(root string, cfg config.Config) ([]syncfs.MountSpec, error) {
@@ -404,6 +439,84 @@ func RunDeleteContexts(
 	}
 
 	return client.DeleteContexts(ctx, req)
+}
+
+func RunContextArtifacts(
+	ctx context.Context,
+	cwd string,
+	params ContextArtifactsParams,
+) (client.ContextArtifactsResult, error) {
+	address, service, hostRecord, loaded, err := resolveRemoteTarget(
+		ctx,
+		cwd,
+		RemoteParams{
+			AddressOverride:  params.AddressOverride,
+			ConfigPath:       params.ConfigPath,
+			DiscoveryTimeout: params.DiscoveryTimeout,
+		},
+	)
+	if err != nil {
+		return client.ContextArtifactsResult{}, err
+	}
+
+	contextID := strings.TrimSpace(params.ContextID)
+	if params.Current || contextID == "" {
+		if loaded == nil {
+			loaded, err = config.ResolveRequired(cwd, params.ConfigPath)
+			if err != nil {
+				return client.ContextArtifactsResult{}, err
+			}
+		}
+
+		contextID = loaded.ContextID()
+	}
+
+	state, err := clientstate.Load()
+	if err != nil {
+		return client.ContextArtifactsResult{}, err
+	}
+
+	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
+
+	return client.ContextArtifacts(ctx, client.ContextArtifactsOptions{
+		Remote: client.RemoteOptions{
+			Address:          address,
+			DiscoveryService: service,
+			Host:             *hostRecord,
+			ClientCertPEM:    []byte(clientCertPEM),
+			ClientKeyPEM:     []byte(clientKeyPEM),
+		},
+		ContextID: contextID,
+		Prune:     params.Prune,
+		Delete:    params.Delete,
+		Volume:    params.Volume,
+	})
+}
+
+func RunCachePrune(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+) (client.CachePruneResult, error) {
+	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	if err != nil {
+		return client.CachePruneResult{}, err
+	}
+
+	state, err := clientstate.Load()
+	if err != nil {
+		return client.CachePruneResult{}, err
+	}
+
+	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
+
+	return client.CachePrune(ctx, client.RemoteOptions{
+		Address:          address,
+		DiscoveryService: service,
+		Host:             *hostRecord,
+		ClientCertPEM:    []byte(clientCertPEM),
+		ClientKeyPEM:     []byte(clientKeyPEM),
+	})
 }
 
 func RunHost(ctx context.Context, params HostParams) error {

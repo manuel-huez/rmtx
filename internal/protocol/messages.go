@@ -3,36 +3,43 @@ package protocol
 import (
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
 const (
-	MsgError                  = "error"
-	MsgPairCodeRequest        = "pair_code_request"
-	MsgPairCodeResponse       = "pair_code_response"
-	MsgPairRequest            = "pair_request"
-	MsgPairResponse           = "pair_response"
-	MsgRunRequest             = "run_request"
-	MsgNeedBlobs              = "need_blobs"
-	MsgBlobUploadRequest      = "blob_upload_request"
-	MsgBlob                   = "blob"
-	MsgSyncComplete           = "sync_complete"
-	MsgWorkspaceReady         = "workspace_ready"
-	MsgStdinData              = "stdin_data"
-	MsgStdinClose             = "stdin_close"
-	MsgResizeTTY              = "resize_tty"
-	MsgExecOutput             = "exec_output"
-	MsgExecExit               = "exec_exit"
-	MsgChangeSet              = "change_set"
-	MsgChangeBlob             = "change_blob"
-	MsgChangesDone            = "changes_done"
-	MsgPingRequest            = "ping_request"
-	MsgPingResponse           = "ping_response"
-	MsgListContextsRequest    = "list_contexts_request"
-	MsgListContextsResponse   = "list_contexts_response"
-	MsgDeleteContextsRequest  = "delete_contexts_request"
-	MsgDeleteContextsResponse = "delete_contexts_response"
+	MsgError                    = "error"
+	MsgPairCodeRequest          = "pair_code_request"
+	MsgPairCodeResponse         = "pair_code_response"
+	MsgPairRequest              = "pair_request"
+	MsgPairResponse             = "pair_response"
+	MsgRunRequest               = "run_request"
+	MsgNeedBlobs                = "need_blobs"
+	MsgBlobUploadRequest        = "blob_upload_request"
+	MsgBlob                     = "blob"
+	MsgSyncComplete             = "sync_complete"
+	MsgWorkspaceReady           = "workspace_ready"
+	MsgStdinData                = "stdin_data"
+	MsgStdinClose               = "stdin_close"
+	MsgResizeTTY                = "resize_tty"
+	MsgExecOutput               = "exec_output"
+	MsgExecExit                 = "exec_exit"
+	MsgChangeSet                = "change_set"
+	MsgChangeBlob               = "change_blob"
+	MsgChangesDone              = "changes_done"
+	MsgPingRequest              = "ping_request"
+	MsgPingResponse             = "ping_response"
+	MsgListContextsRequest      = "list_contexts_request"
+	MsgListContextsResponse     = "list_contexts_response"
+	MsgDeleteContextsRequest    = "delete_contexts_request"
+	MsgDeleteContextsResponse   = "delete_contexts_response"
+	MsgContextArtifactsRequest  = "context_artifacts_request"
+	MsgContextArtifactsResponse = "context_artifacts_response"
+	MsgCachePruneRequest        = "cache_prune_request"
+	MsgCachePruneResponse       = "cache_prune_response"
 )
+
+const HostCapabilityOCIRuntime = "oci_runtime"
 
 type PairCodeRequest struct {
 	ClientLabel string `json:"client_label,omitempty"`
@@ -110,6 +117,7 @@ type RunRequest struct {
 	WorkDir     string             `json:"work_dir"`
 	Command     []string           `json:"command"`
 	Env         map[string]string  `json:"env"`
+	Runtime     RuntimeSpec        `json:"runtime,omitempty"`
 	Mounts      []syncfs.MountSpec `json:"mounts"`
 	Manifest    []syncfs.Entry     `json:"manifest"`
 	SyncBack    []string           `json:"sync_back"`
@@ -121,6 +129,10 @@ type RunRequest struct {
 	TTYCols     int                `json:"tty_cols,omitempty"`
 }
 
+type RuntimeSpec = config.RuntimeConfig
+type RuntimeSetup = config.RuntimeSetup
+type RuntimeVolume = config.RuntimeVolume
+
 type PingRequest struct{}
 
 type PingResponse struct {
@@ -131,6 +143,7 @@ type PingResponse struct {
 	Fingerprint  string    `json:"fingerprint,omitempty"`
 	Now          time.Time `json:"now"`
 	ContextCount int       `json:"context_count,omitempty"`
+	Capabilities []string  `json:"capabilities,omitempty"`
 }
 
 type ListContextsRequest struct{}
@@ -159,4 +172,33 @@ type DeleteContextsRequest struct {
 type DeleteContextsResponse struct {
 	Deleted  []ContextSummary `json:"deleted,omitempty"`
 	NotFound []string         `json:"not_found,omitempty"`
+}
+
+type ContextArtifactsRequest struct {
+	ContextID string `json:"context_id,omitempty"`
+	Prune     bool   `json:"prune,omitempty"`
+	Delete    bool   `json:"delete,omitempty"`
+	Volume    string `json:"volume,omitempty"`
+}
+
+type ContextArtifactsResponse struct {
+	ContextID string            `json:"context_id,omitempty"`
+	Artifacts []ContextArtifact `json:"artifacts,omitempty"`
+	Deleted   []ContextArtifact `json:"deleted,omitempty"`
+}
+
+type ContextArtifact struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Ref    string `json:"ref,omitempty"`
+	Size   int64  `json:"size,omitempty"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type CachePruneRequest struct{}
+
+type CachePruneResponse struct {
+	Deleted []ContextArtifact `json:"deleted,omitempty"`
+	Bytes   int64             `json:"bytes,omitempty"`
 }

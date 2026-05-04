@@ -208,6 +208,7 @@ func (r *Responder) claimReverseRequest(pkt packet, callback string) bool {
 func reverseRequestKey(pkt packet, callback string) string {
 	fingerprint := strings.TrimSpace(pkt.HostFingerprint)
 	requestID := strings.TrimSpace(pkt.RequestID)
+
 	if requestID != "" {
 		return joinReverseRequestKey(
 			fingerprint,

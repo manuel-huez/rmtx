@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ type ExecOptions struct {
 	Command          []string
 	Mounts           []syncfs.MountSpec
 	SyncBack         []string
+	Runtime          protocol.RuntimeSpec
 	ForwardEnv       []string
 	ExtraEnv         map[string]string
 	Stdout           io.Writer
@@ -62,12 +64,23 @@ type RemoteOptions struct {
 type PingInfo = protocol.PingResponse
 type ContextInfo = protocol.ContextSummary
 type DeleteContextsResult = protocol.DeleteContextsResponse
+type ContextArtifactsResult = protocol.ContextArtifactsResponse
+type ContextArtifact = protocol.ContextArtifact
+type CachePruneResult = protocol.CachePruneResponse
 
 type DeleteContextsOptions struct {
 	Remote    RemoteOptions
 	IDs       []string
 	All       bool
 	OlderThan string
+}
+
+type ContextArtifactsOptions struct {
+	Remote    RemoteOptions
+	ContextID string
+	Prune     bool
+	Delete    bool
+	Volume    string
 }
 
 const stdinBufferSize = 32 * 1024
@@ -192,6 +205,10 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		strings.Join(opts.Command, " "),
 	)
 
+	if err := ensureRuntimeSupported(ctx, opts); err != nil {
+		return 1, err
+	}
+
 	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts, logger)
 	if err != nil {
 		return 1, err
@@ -288,6 +305,54 @@ func setDefaultOutputs(opts *ExecOptions) {
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
 	}
+}
+
+func ensureRuntimeSupported(ctx context.Context, opts ExecOptions) error {
+	if !isOCIRuntime(opts.Runtime) {
+		return nil
+	}
+
+	info, err := Ping(ctx, RemoteOptions{
+		Address:          opts.Address,
+		DiscoveryService: opts.DiscoveryService,
+		Host:             opts.Host,
+		ClientCertPEM:    opts.ClientCertPEM,
+		ClientKeyPEM:     opts.ClientKeyPEM,
+	})
+	if err != nil {
+		return fmt.Errorf("verify host OCI runtime support: %w", err)
+	}
+
+	return validateRuntimeSupportedByPing(opts.Runtime, info, opts.Address)
+}
+
+func validateRuntimeSupportedByPing(
+	runtimeSpec protocol.RuntimeSpec,
+	info protocol.PingResponse,
+	address string,
+) error {
+	if !isOCIRuntime(runtimeSpec) {
+		return nil
+	}
+
+	if slices.Contains(info.Capabilities, protocol.HostCapabilityOCIRuntime) {
+		return nil
+	}
+
+	hostVersion := strings.TrimSpace(info.Version)
+	if hostVersion == "" {
+		hostVersion = "unknown"
+	}
+
+	return fmt.Errorf(
+		"host %s does not advertise OCI runtime support (version=%s); update rmtx host before using runtime.type=oci",
+		address,
+		hostVersion,
+	)
+}
+
+func isOCIRuntime(runtimeSpec protocol.RuntimeSpec) bool {
+	return strings.EqualFold(strings.TrimSpace(runtimeSpec.Type), "oci")
 }
 
 func resolveRoot(root string) (string, error) {
@@ -405,6 +470,7 @@ func buildRunRequest(
 		WorkDir:     workdir,
 		Command:     append([]string(nil), opts.Command...),
 		Env:         env,
+		Runtime:     cloneRuntimeSpec(opts.Runtime),
 		Mounts:      append([]syncfs.MountSpec(nil), opts.Mounts...),
 		Manifest:    manifest.Entries,
 		SyncBack:    cloneStringSlice(opts.SyncBack),
@@ -417,6 +483,15 @@ func buildRunRequest(
 	}
 
 	return manifest, request, nil
+}
+
+func cloneRuntimeSpec(runtime protocol.RuntimeSpec) protocol.RuntimeSpec {
+	runtime.Setup.ImageCommands = cloneStringSlice(runtime.Setup.ImageCommands)
+	runtime.Setup.ContextCommands = cloneStringSlice(runtime.Setup.ContextCommands)
+	runtime.Setup.ContextInputs = cloneStringSlice(runtime.Setup.ContextInputs)
+	runtime.Volumes = append([]protocol.RuntimeVolume(nil), runtime.Volumes...)
+
+	return runtime
 }
 
 func cloneStringSlice(values []string) []string {
@@ -519,6 +594,7 @@ func dialReverseTLS(
 	if err != nil {
 		return nil, err
 	}
+
 	requestCancel()
 
 	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
@@ -546,6 +622,7 @@ func startReverseConnectRequests(
 	fingerprint string,
 ) <-chan error {
 	errCh := make(chan error, 1)
+
 	go func() {
 		errCh <- discovery.RequestReverseConnect(
 			ctx,
@@ -593,6 +670,7 @@ func acceptReverse(
 			return nil, fmt.Errorf("accept reverse connection: %w", ctx.Err())
 		case err := <-requestErrCh:
 			requestErrCh = nil
+
 			if err != nil {
 				_ = ln.Close()
 

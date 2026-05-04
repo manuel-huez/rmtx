@@ -16,6 +16,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/app"
 	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/config"
+	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/version"
 )
 
@@ -23,6 +24,7 @@ const exitUsage = 2
 const tabWriterTabWidth = 8
 const tabWriterPadding = 2
 const defaultPairCodeTTL = 5 * time.Minute
+const commandPrune = "prune"
 
 type remoteFlags struct {
 	hostAddr         *string
@@ -40,6 +42,10 @@ type pairLikeFlags struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "__rmtx-oci-child" {
+		os.Exit(host.RunOCIChild(os.Args[2:]))
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:])
 
@@ -69,6 +75,8 @@ func run(ctx context.Context, args []string) int {
 		return runPair(ctx, args[1:])
 	case "context", "contexts":
 		return runContext(ctx, args[1:])
+	case "cache":
+		return runCache(ctx, args[1:])
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -403,8 +411,10 @@ func runContext(ctx context.Context, args []string) int {
 		return runContextList(ctx, args[1:])
 	case "delete", "rm", "remove":
 		return runContextDelete(ctx, args[1:])
-	case "prune":
+	case commandPrune:
 		return runContextPrune(ctx, args[1:])
+	case "artifacts":
+		return runContextArtifacts(ctx, args[1:])
 	default:
 		return runContextList(ctx, args)
 	}
@@ -537,6 +547,142 @@ func runContextPrune(ctx context.Context, args []string) int {
 	return 0
 }
 
+func runContextArtifacts(ctx context.Context, args []string) int {
+	if len(args) == 0 {
+		return runContextArtifactsList(ctx, nil)
+	}
+
+	switch args[0] {
+	case "list", "ls":
+		return runContextArtifactsList(ctx, args[1:])
+	case commandPrune:
+		return runContextArtifactsPrune(ctx, args[1:])
+	case "delete", "rm", "remove":
+		return runContextArtifactsDelete(ctx, args[1:])
+	default:
+		return runContextArtifactsList(ctx, args)
+	}
+}
+
+func runContextArtifactsList(ctx context.Context, args []string) int {
+	return runContextArtifactsCommand(
+		ctx,
+		args,
+		"list",
+		func(_ *app.ContextArtifactsParams, _ *flag.FlagSet) {},
+		func(result client.ContextArtifactsResult) { printArtifacts(result.Artifacts) },
+	)
+}
+
+func runContextArtifactsPrune(ctx context.Context, args []string) int {
+	return runContextArtifactsCommand(
+		ctx,
+		args,
+		commandPrune,
+		func(params *app.ContextArtifactsParams, _ *flag.FlagSet) { params.Prune = true },
+		func(result client.ContextArtifactsResult) { printDeletedArtifacts(result.Deleted) },
+	)
+}
+
+func runContextArtifactsDelete(ctx context.Context, args []string) int {
+	return runContextArtifactsCommand(
+		ctx,
+		args,
+		"delete",
+		func(params *app.ContextArtifactsParams, fs *flag.FlagSet) {
+			fs.String("volume", "", "volume name to delete")
+
+			params.Delete = true
+		},
+		func(result client.ContextArtifactsResult) { printDeletedArtifacts(result.Deleted) },
+	)
+}
+
+func runContextArtifactsCommand(
+	ctx context.Context,
+	args []string,
+	subcommand string,
+	configure func(*app.ContextArtifactsParams, *flag.FlagSet),
+	printResult func(client.ContextArtifactsResult),
+) int {
+	fs := flag.NewFlagSet("rmtx context artifacts "+subcommand, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	remote := bindRemoteFlags(fs)
+	current := fs.Bool("current", false, "use the current context")
+	contextID := fs.String("context", "", "context id")
+
+	artifactParams := app.ContextArtifactsParams{}
+	configure(&artifactParams, fs)
+
+	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
+	if code != 0 {
+		return code
+	}
+
+	artifactParams.AddressOverride = params.AddressOverride
+	artifactParams.ConfigPath = params.ConfigPath
+	artifactParams.DiscoveryTimeout = params.DiscoveryTimeout
+	artifactParams.ContextID = *contextID
+	artifactParams.Current = *current || *contextID == ""
+
+	if volume := fs.Lookup("volume"); volume != nil {
+		artifactParams.Volume = volume.Value.String()
+	}
+
+	result, err := app.RunContextArtifacts(ctx, cwd, artifactParams)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	printResult(result)
+
+	return 0
+}
+
+func runCache(ctx context.Context, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "error: cache requires prune")
+		return exitUsage
+	}
+
+	if args[0] != commandPrune {
+		fmt.Fprintln(os.Stderr, "error: cache supports only prune")
+		return exitUsage
+	}
+
+	args = args[1:]
+
+	fs := flag.NewFlagSet("rmtx cache prune", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	remote := bindRemoteFlags(fs)
+
+	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
+	if code != 0 {
+		return code
+	}
+
+	result, err := app.RunCachePrune(ctx, cwd, params)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	for _, artifact := range result.Deleted {
+		_, _ = fmt.Fprintf(
+			os.Stdout,
+			"deleted\t%s\t%s\t%s\n",
+			artifact.Kind,
+			artifact.Ref,
+			artifact.Path,
+		)
+	}
+
+	_, _ = fmt.Fprintf(os.Stdout, "deleted\t%d\tbytes=%d\n", len(result.Deleted), result.Bytes)
+
+	return 0
+}
+
 func runExec(ctx context.Context, params app.ExecParams) int {
 	cwd, err := mustGetwd()
 	if err != nil {
@@ -588,7 +734,8 @@ Usage:
   rmtx init [flags]
   rmtx pair [flags]
   rmtx ping [flags]
-  rmtx context [list|delete|prune] [flags]
+  rmtx context [list|delete|prune|artifacts] [flags]
+  rmtx cache prune [flags]
   rmtx version
   rmtx <command> [args...]
 
@@ -605,6 +752,8 @@ Examples:
   rmtx version
   rmtx context list
   rmtx context delete --current
+  rmtx context artifacts list --current
+  rmtx cache prune
 `); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "failed to print usage:", err)
 	}
@@ -663,5 +812,42 @@ func printErr(err error) {
 func printDeletedContexts(deleted []client.ContextInfo) {
 	for _, context := range deleted {
 		_, _ = fmt.Fprintf(os.Stdout, "deleted\t%s\t%s\n", context.ID, context.Name)
+	}
+}
+
+func printArtifacts(artifacts []client.ContextArtifact) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
+
+	_, _ = fmt.Fprintln(tw, "KIND\tNAME\tREF\tSIZE\tPATH\tDETAIL")
+
+	for _, artifact := range artifacts {
+		_, _ = fmt.Fprintf(
+			tw,
+			"%s\t%s\t%s\t%d\t%s\t%s\n",
+			artifact.Kind,
+			artifact.Name,
+			artifact.Ref,
+			artifact.Size,
+			artifact.Path,
+			artifact.Detail,
+		)
+	}
+
+	_ = tw.Flush()
+}
+
+func printDeletedArtifacts(deleted []client.ContextArtifact) {
+	for _, artifact := range deleted {
+		_, _ = fmt.Fprintf(
+			os.Stdout,
+			"deleted\t%s\t%s\t%s\n",
+			artifact.Kind,
+			emptyFallback(artifact.Name, artifact.Ref),
+			artifact.Path,
+		)
+	}
+
+	if len(deleted) == 0 {
+		_, _ = fmt.Fprintln(os.Stdout, "deleted\t0")
 	}
 }

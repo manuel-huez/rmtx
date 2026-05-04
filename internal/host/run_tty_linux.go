@@ -7,17 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"syscall"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
-func (s *Server) runTTYCommand(
+func (s *Server) runTTYExecCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
-	workspace string,
-	workdir string,
+	cmd *exec.Cmd,
 	request protocol.RunRequest,
 ) (int, error) {
 	master, slave, err := openPTY(request.TTYRows, request.TTYCols)
@@ -27,16 +27,19 @@ func (s *Server) runTTYCommand(
 
 	defer func() { _ = master.Close() }()
 
-	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
-
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid:  true,
-		Setctty: true,
-		Ctty:    int(slave.Fd()),
+
+	sysProcAttr := cmd.SysProcAttr
+	if sysProcAttr == nil {
+		sysProcAttr = &syscall.SysProcAttr{}
 	}
+
+	sysProcAttr.Setsid = true
+	sysProcAttr.Setctty = true
+	sysProcAttr.Ctty = int(slave.Fd())
+	cmd.SysProcAttr = sysProcAttr
 
 	if err := cmd.Start(); err != nil {
 		_ = slave.Close()
@@ -52,6 +55,7 @@ func (s *Server) runTTYCommand(
 	go func() {
 		if err := s.consumeTTYInput(conn, master); err != nil {
 			cancel()
+
 			if !errors.Is(err, io.EOF) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
 			}

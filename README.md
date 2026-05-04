@@ -13,6 +13,8 @@
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
 - `rmtx context ...`: list/delete/prune host contexts.
+- `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
+- `rmtx cache prune`: delete unreferenced host OCI cache data.
 
 ## Install
 
@@ -91,6 +93,103 @@ descendants, and glob patterns like `generated/**` are supported:
 When omitted, all mounted paths are eligible for sync-back. Only paths whose
 metadata or content changed are sent back to the client.
 
+## Isolated runtimes
+
+By default, `rmtx` still runs commands directly on the host context workspace.
+Add `runtime` to run commands inside an OCI image pulled by `rmtx` itself
+without Docker or Podman:
+
+```json
+{
+  "runtime": {
+    "type": "oci",
+    "image": "docker.io/library/ubuntu:24.04",
+    "pull_policy": "if_missing",
+    "workdir": "/workspace",
+    "network": "host",
+    "user": "root",
+    "gpu": "none",
+    "setup": {
+      "image_commands": [
+        "apt-get update",
+        "apt-get install -y build-essential nodejs npm",
+        "npm install -g pnpm"
+      ],
+      "context_commands": [
+        "pnpm install --frozen-lockfile"
+      ],
+      "context_inputs": [
+        "package.json",
+        "pnpm-lock.yaml"
+      ]
+    },
+    "volumes": [
+      { "name": "pnpm-store", "target": "/pnpm/store" },
+      { "name": "npm-cache", "target": "/root/.npm" }
+    ]
+  }
+}
+```
+
+Runtime defaults:
+
+- `pull_policy`: `if_missing`; use `always` to refresh registry metadata and
+  `never` to require the image to already exist in the local cache.
+- `workdir`: `/workspace`.
+- `network`: `host`; set `none` to isolate networking.
+- `user`: `root` only in v1.
+- `gpu`: `none`; set `nvidia` to require NVIDIA devices.
+
+Runtime storage has three roles:
+
+- Image/rootfs: base OS and global tools. Use `setup.image_commands` for system
+  packages and global CLIs. These commands run inside the isolated rootfs and
+  never install anything onto the host OS.
+- Workspace: synced project copy, mounted at `runtime.workdir`. Source files
+  and outputs that should come back to the client belong here and are governed
+  by `sync_back`.
+- Volumes: persistent host-side context artifacts mounted inside the runtime.
+  Volumes never enter the sync manifest, never upload/download, and never
+  sync back. Use them for dependency caches, package stores, build caches,
+  local DB files, model caches, and other state that should survive runs but
+  stay on the host.
+
+`setup.context_commands` run after workspace sync and before the requested
+command. When `setup.context_inputs` is set, `rmtx` hashes those workspace files
+and reruns context setup only when they change. If `context_inputs` is omitted,
+context setup runs every command.
+
+OCI image blobs, manifests, and refs are stored once in a host global cache,
+while contexts keep references to the images and prepared runtimes they use.
+Context artifact commands show the project-owned view:
+
+```bash
+rmtx context artifacts list --current
+rmtx context artifacts prune --current
+rmtx context artifacts delete --current --volume pnpm-store
+rmtx cache prune
+```
+
+`rmtx context delete --current` removes that context workspace, volumes,
+prepared runtime references, and OCI cache data that has no remaining context
+references. `rmtx cache prune` can also remove global OCI cache data with no
+remaining context references.
+
+Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
+execution. `network=none` adds a network namespace. Windows hosts delegate OCI
+execution to an already installed WSL2 environment through `wsl.exe`; rmtx does
+not install, enable, or configure WSL2. Set `RMTX_WSL_DISTRO` to choose a
+specific distro, otherwise the default WSL distro is used. The private imported
+rmtx WSL distro and WSL ext4 workspace storage are still deferred, so current
+Windows OCI runs use paths bridged from Windows into WSL and may be slower than
+native WSL ext4 storage.
+
+`gpu=nvidia` requires NVIDIA/WSL GPU devices and fails clearly when unavailable.
+Linux binds `/dev/nvidia*`, NVIDIA driver libraries discovered through
+`ldconfig`, common CUDA driver paths, and `nvidia-smi` when present. Windows
+WSL binds `/dev/dxg` and `/usr/lib/wsl/lib`. This is enough for common CUDA
+images, but it is not full `nvidia-container-runtime` parity.
+
 To ignore everything under a specific directory, use `dir/**`. For example,
 `"ignore": ["data/cache/**"]` skips every file and subdirectory under
 `data/cache`. A trailing slash also works, so `"ignore": ["data/cache/"]`
@@ -109,6 +208,8 @@ rmtx ping
 rmtx context list
 rmtx context delete --current
 rmtx context prune --older-than 168h
+rmtx context artifacts list --current
+rmtx cache prune
 ```
 
 ## Notes

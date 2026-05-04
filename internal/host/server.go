@@ -64,6 +64,7 @@ type Server struct {
 	activeContexts map[string]int
 	uploadsMu      sync.Mutex
 	uploads        map[string]*blobUploadSession
+	ociMu          sync.Mutex
 }
 
 func New(opts Options) (*Server, error) {
@@ -331,6 +332,16 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
+	runtimePrep, hasPreparedRuntime, err := s.prepareRuntimeBeforeSync(parent, handle, request)
+	if err != nil {
+		return err
+	}
+
+	var preparedRuntimeRef *preparedRuntime
+	if hasPreparedRuntime {
+		preparedRuntimeRef = &runtimePrep
+	}
+
 	currentManifest, err := s.loadTrackedManifest(request.ContextID)
 	if err != nil {
 		return err
@@ -356,13 +367,14 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	if err := s.executeAndSyncRun(parent, conn, handle, request); err != nil {
+	if err := s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef); err != nil {
 		return err
 	}
 
 	return conn.WriteJSON(protocol.MsgChangesDone, nil)
 }
 
+//nolint:cyclop // Protocol dispatch is deliberately centralized.
 func (s *Server) dispatchSessionRequest(
 	parent context.Context,
 	conn *protocol.Conn,
@@ -391,6 +403,10 @@ func (s *Server) dispatchSessionRequest(
 		return s.discardAndHandle(head, conn, s.handleListContexts)
 	case protocol.MsgDeleteContextsRequest:
 		return s.dispatchDeleteContexts(conn, head)
+	case protocol.MsgContextArtifactsRequest:
+		return s.dispatchContextArtifacts(conn, head)
+	case protocol.MsgCachePruneRequest:
+		return s.discardAndHandle(head, conn, s.handleCachePrune)
 	default:
 		if err := conn.DiscardPayload(head); err != nil {
 			return err
@@ -449,6 +465,15 @@ func (s *Server) dispatchDeleteContexts(conn *protocol.Conn, head protocol.Heade
 	return s.handleDeleteContexts(conn, req)
 }
 
+func (s *Server) dispatchContextArtifacts(conn *protocol.Conn, head protocol.Header) error {
+	req, err := protocol.DecodeData[protocol.ContextArtifactsRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleContextArtifacts(conn, req)
+}
+
 func (s *Server) discardAndHandle(
 	head protocol.Header,
 	conn *protocol.Conn,
@@ -470,6 +495,10 @@ func validateRunRequest(request protocol.RunRequest) error {
 		return errors.New("missing context id")
 	}
 
+	if err := validateRuntimeSpec(request.Runtime); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -489,8 +518,9 @@ func (s *Server) executeAndSyncRun(
 	conn *protocol.Conn,
 	handle contextHandle,
 	request protocol.RunRequest,
+	preparedRuntime *preparedRuntime,
 ) error {
-	code, runErr := s.executeRequest(parent, conn, handle.workspace, request)
+	code, runErr := s.executeRequest(parent, conn, handle.workspace, request, preparedRuntime)
 	if err := writeUserVisibleRunError(conn, runErr); err != nil {
 		return err
 	}
@@ -573,6 +603,7 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		Fingerprint:  s.fingerprint,
 		Now:          time.Now().UTC(),
 		ContextCount: len(contexts),
+		Capabilities: hostCapabilities(),
 	})
 }
 
@@ -627,11 +658,12 @@ func (s *Server) executeRequest(
 	conn *protocol.Conn,
 	workspace string,
 	request protocol.RunRequest,
+	preparedRuntime *preparedRuntime,
 ) (int, error) {
 	sessionCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	code, runErr := s.runCommand(sessionCtx, cancel, conn, workspace, request)
+	code, runErr := s.runCommand(sessionCtx, cancel, conn, workspace, request, preparedRuntime)
 	if runErr != nil {
 		s.logger.Printf(
 			"session %s context %s exited with error: %v",
@@ -1078,6 +1110,7 @@ func (s *Server) runCommand(
 	conn *protocol.Conn,
 	workspace string,
 	request protocol.RunRequest,
+	preparedRuntime *preparedRuntime,
 ) (int, error) {
 	workdir, err := secureJoin(workspace, request.WorkDir)
 	if err != nil {
@@ -1098,9 +1131,28 @@ func (s *Server) runCommand(
 		runErr error
 	)
 
-	if request.TTY {
-		code, runErr = s.runTTYCommand(ctx, cancel, conn, workspace, workdir, request)
-	} else {
+	switch {
+	case request.TTY:
+		code, runErr = s.runTTYCommand(
+			ctx,
+			cancel,
+			conn,
+			workspace,
+			workdir,
+			request,
+			preparedRuntime,
+		)
+	case isOCIRuntime(request.Runtime):
+		code, runErr = s.runOCIPipeCommand(
+			ctx,
+			cancel,
+			conn,
+			workspace,
+			workdir,
+			request,
+			preparedRuntime,
+		)
+	default:
 		code, runErr = s.runPipeCommand(ctx, cancel, conn, workspace, workdir, request)
 	}
 
@@ -1124,6 +1176,17 @@ func (s *Server) runPipeCommand(
 	request protocol.RunRequest,
 ) (int, error) {
 	cmd := s.newSessionCommand(ctx, workspace, workdir, request)
+
+	return s.runPipeExecCommand(ctx, cancel, conn, cmd)
+}
+
+func (s *Server) runPipeExecCommand(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+	cmd *exec.Cmd,
+) (int, error) {
+	_ = ctx
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

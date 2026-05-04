@@ -48,6 +48,7 @@ func TestReverseRequestKeyUsesCallbackForLegacyRequests(t *testing.T) {
 
 	got := reverseRequestKey(pkt, "192.0.2.10:64595")
 	want := "host-fingerprint\x00callback\x00192.0.2.10:64595"
+
 	if got != want {
 		t.Fatalf("unexpected legacy reverse request key: got %q want %q", got, want)
 	}
@@ -58,6 +59,7 @@ func TestReverseRequestKeyUsesRequestID(t *testing.T) {
 
 	got := reverseRequestKey(pkt, "192.0.2.10:64595")
 	want := "host-fingerprint\x00id\x00request-1"
+
 	if got != want {
 		t.Fatalf("unexpected reverse request key: got %q want %q", got, want)
 	}
