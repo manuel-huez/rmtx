@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -205,10 +204,6 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		strings.Join(opts.Command, " "),
 	)
 
-	if err := ensureRuntimeSupported(ctx, opts); err != nil {
-		return 1, err
-	}
-
 	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts, logger)
 	if err != nil {
 		return 1, err
@@ -305,54 +300,6 @@ func setDefaultOutputs(opts *ExecOptions) {
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
 	}
-}
-
-func ensureRuntimeSupported(ctx context.Context, opts ExecOptions) error {
-	if !isOCIRuntime(opts.Runtime) {
-		return nil
-	}
-
-	info, err := Ping(ctx, RemoteOptions{
-		Address:          opts.Address,
-		DiscoveryService: opts.DiscoveryService,
-		Host:             opts.Host,
-		ClientCertPEM:    opts.ClientCertPEM,
-		ClientKeyPEM:     opts.ClientKeyPEM,
-	})
-	if err != nil {
-		return fmt.Errorf("verify host OCI runtime support: %w", err)
-	}
-
-	return validateRuntimeSupportedByPing(opts.Runtime, info, opts.Address)
-}
-
-func validateRuntimeSupportedByPing(
-	runtimeSpec protocol.RuntimeSpec,
-	info protocol.PingResponse,
-	address string,
-) error {
-	if !isOCIRuntime(runtimeSpec) {
-		return nil
-	}
-
-	if slices.Contains(info.Capabilities, protocol.HostCapabilityOCIRuntime) {
-		return nil
-	}
-
-	hostVersion := strings.TrimSpace(info.Version)
-	if hostVersion == "" {
-		hostVersion = "unknown"
-	}
-
-	return fmt.Errorf(
-		"host %s does not advertise OCI runtime support (version=%s); update rmtx host before using runtime.type=oci",
-		address,
-		hostVersion,
-	)
-}
-
-func isOCIRuntime(runtimeSpec protocol.RuntimeSpec) bool {
-	return strings.EqualFold(strings.TrimSpace(runtimeSpec.Type), "oci")
 }
 
 func resolveRoot(root string) (string, error) {
@@ -863,6 +810,8 @@ func handleExecFrame(
 		}
 
 		return false, code, err
+	case protocol.MsgSyncCompressionStart:
+		return false, exitCode, enableSyncCompression(conn, head)
 	case protocol.MsgChangeSet:
 		progress, err := applyChangeSet(conn, head, root, logger)
 		*downloadProgress = progress
@@ -910,6 +859,21 @@ func decodeExitCode(head protocol.Header) (int, error) {
 	}
 
 	return info.Code, nil
+}
+
+func enableSyncCompression(conn *protocol.Conn, head protocol.Header) error {
+	info, err := protocol.DecodeData[protocol.CompressionInfo](head)
+	if err != nil {
+		return err
+	}
+
+	switch info.Algorithm {
+	case protocol.CompressionZstd:
+		_, err := conn.EnableZstdReader()
+		return err
+	default:
+		return fmt.Errorf("unsupported sync compression: %s", info.Algorithm)
+	}
 }
 
 func applyChangeSet(
@@ -1241,20 +1205,23 @@ func sendMissingBlobs(
 	}
 
 	parallel := uploadParallelism(need, len(ordered))
+	compression := chooseBlobUploadCompression(ordered)
 	progress := newTransferProgress("upload", logger, len(ordered), totalBytes)
 	logger.Printf(
-		"uploading missing file blobs: files=%d bytes=%s parallel=%d",
+		"uploading missing file blobs: files=%d bytes=%s parallel=%d compression=%s",
 		len(ordered),
 		formatBytes(totalBytes),
 		parallel,
+		compression,
 	)
 
-	if need.UploadToken != "" && parallel > 1 {
+	if need.UploadToken != "" && (parallel > 1 || compression != "") {
 		if err := sendMissingBlobsParallel(
 			ctx,
 			ordered,
 			parallel,
 			need.UploadToken,
+			compression,
 			opts,
 			progress,
 		); err != nil {
@@ -1304,6 +1271,22 @@ func prepareUploadItems(
 	return items, totalBytes, nil
 }
 
+func chooseBlobUploadCompression(items []blobUploadItem) string {
+	candidates := make([]syncfs.CompressionCandidate, 0, len(items))
+	for _, item := range items {
+		candidates = append(candidates, syncfs.CompressionCandidate{
+			Path: item.path,
+			Size: item.size,
+		})
+	}
+
+	if syncfs.ShouldCompressTransfer(candidates) {
+		return protocol.CompressionZstd
+	}
+
+	return ""
+}
+
 func uploadParallelism(need protocol.NeedBlobs, total int) int {
 	parallel := need.Parallel
 	if parallel <= 0 {
@@ -1346,6 +1329,7 @@ func sendMissingBlobsParallel(
 	items []blobUploadItem,
 	parallel int,
 	token string,
+	compression string,
 	opts ExecOptions,
 	progress *transferProgress,
 ) error {
@@ -1362,7 +1346,7 @@ func sendMissingBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			if err := uploadBlobWorker(ctx, jobs, token, opts, progress); err != nil {
+			if err := uploadBlobWorker(ctx, jobs, token, compression, opts, progress); err != nil {
 				select {
 				case errCh <- err:
 					cancel()
@@ -1407,6 +1391,7 @@ func uploadBlobWorker(
 	ctx context.Context,
 	jobs <-chan blobUploadItem,
 	token string,
+	compression string,
 	opts ExecOptions,
 	progress *transferProgress,
 ) error {
@@ -1425,12 +1410,22 @@ func uploadBlobWorker(
 	defer closeQuietly(conn.Raw())
 
 	req := protocol.BlobUploadRequest{
-		ContextID: opts.ContextID,
-		Session:   opts.Session,
-		Token:     token,
+		ContextID:   opts.ContextID,
+		Session:     opts.Session,
+		Token:       token,
+		Compression: compression,
 	}
 	if err := conn.WriteJSON(protocol.MsgBlobUploadRequest, req); err != nil {
 		return err
+	}
+
+	var closeCompressed func() error
+	if compression == protocol.CompressionZstd {
+		closeCompressed, err = conn.EnableZstdWriter()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = closeCompressed() }()
 	}
 
 	for item := range jobs {
@@ -1445,7 +1440,15 @@ func uploadBlobWorker(
 		progress.CompleteFile()
 	}
 
-	return conn.WriteJSON(protocol.MsgSyncComplete, nil)
+	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
+		return err
+	}
+
+	if closeCompressed != nil {
+		return closeCompressed()
+	}
+
+	return nil
 }
 
 func sendBlob(

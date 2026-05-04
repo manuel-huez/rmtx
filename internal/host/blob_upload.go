@@ -132,6 +132,20 @@ func (s *Server) handleBlobUploadRequest(
 		return err
 	}
 
+	if req.Compression != "" {
+		switch req.Compression {
+		case protocol.CompressionZstd:
+			closeReader, err := conn.EnableZstdReader()
+			if err != nil {
+				return upload.fail(err)
+			}
+
+			defer closeReader()
+		default:
+			return upload.fail(fmt.Errorf("unsupported blob upload compression: %s", req.Compression))
+		}
+	}
+
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {

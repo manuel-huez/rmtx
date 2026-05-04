@@ -27,6 +27,7 @@ const (
 	MsgChangeSet                = "change_set"
 	MsgChangeBlob               = "change_blob"
 	MsgChangesDone              = "changes_done"
+	MsgSyncCompressionStart     = "sync_compression_start"
 	MsgPingRequest              = "ping_request"
 	MsgPingResponse             = "ping_response"
 	MsgListContextsRequest      = "list_contexts_request"
@@ -38,8 +39,6 @@ const (
 	MsgCachePruneRequest        = "cache_prune_request"
 	MsgCachePruneResponse       = "cache_prune_response"
 )
-
-const HostCapabilityOCIRuntime = "oci_runtime"
 
 type PairCodeRequest struct {
 	ClientLabel string `json:"client_label,omitempty"`
@@ -90,9 +89,10 @@ type NeedBlobs struct {
 }
 
 type BlobUploadRequest struct {
-	ContextID string `json:"context_id"`
-	Session   string `json:"session"`
-	Token     string `json:"token"`
+	ContextID   string `json:"context_id"`
+	Session     string `json:"session"`
+	Token       string `json:"token"`
+	Compression string `json:"compression,omitempty"`
 }
 
 type ChangeSet struct {
@@ -143,7 +143,6 @@ type PingResponse struct {
 	Fingerprint  string    `json:"fingerprint,omitempty"`
 	Now          time.Time `json:"now"`
 	ContextCount int       `json:"context_count,omitempty"`
-	Capabilities []string  `json:"capabilities,omitempty"`
 }
 
 type ListContextsRequest struct{}

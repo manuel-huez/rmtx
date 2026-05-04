@@ -11,7 +11,6 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/host"
-	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
@@ -63,32 +62,6 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
-	}
-}
-
-func TestValidateRuntimeSupportedByPingRejectsMissingOCICapability(t *testing.T) {
-	err := validateRuntimeSupportedByPing(
-		protocol.RuntimeSpec{Type: "oci", Image: "node:22"},
-		protocol.PingResponse{Version: "0.1.0"},
-		"127.0.0.1:33221",
-	)
-	if err == nil {
-		t.Fatal("expected missing OCI runtime capability error")
-	}
-
-	if !strings.Contains(err.Error(), "does not advertise OCI runtime support") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateRuntimeSupportedByPingAcceptsOCICapability(t *testing.T) {
-	err := validateRuntimeSupportedByPing(
-		protocol.RuntimeSpec{Type: "oci", Image: "node:22"},
-		protocol.PingResponse{Capabilities: []string{protocol.HostCapabilityOCIRuntime}},
-		"127.0.0.1:33221",
-	)
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -368,11 +368,7 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	if err := s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef); err != nil {
-		return err
-	}
-
-	return conn.WriteJSON(protocol.MsgChangesDone, nil)
+	return s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef)
 }
 
 //nolint:cyclop // Protocol dispatch is deliberately centralized.
@@ -561,16 +557,22 @@ func (s *Server) executeAndSyncRun(
 		)
 	}
 
-	if err := s.sendWorkspaceChanges(
+	closeCompressed, err := s.sendWorkspaceChanges(
 		conn,
 		handle.workspace,
 		request.Manifest,
 		postEntries,
 		request.SyncBack,
 		ignoreMode,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeCompressed != nil {
+			_ = closeCompressed()
+		}
+	}()
 
 	if err := s.saveTrackedManifest(request.ContextID, postEntries); err != nil {
 		return err
@@ -579,6 +581,14 @@ func (s *Server) executeAndSyncRun(
 	handle.meta.UpdatedAt = time.Now().UTC()
 	if err := saveContextMetadata(handle.dir, handle.meta); err != nil {
 		return err
+	}
+
+	if err := conn.WriteJSON(protocol.MsgChangesDone, nil); err != nil {
+		return err
+	}
+
+	if closeCompressed != nil {
+		return closeCompressed()
 	}
 
 	return nil
@@ -604,7 +614,6 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		Fingerprint:  s.fingerprint,
 		Now:          time.Now().UTC(),
 		ContextCount: len(contexts),
-		Capabilities: hostCapabilities(),
 	})
 }
 
@@ -684,23 +693,73 @@ func (s *Server) sendWorkspaceChanges(
 	after []syncfs.Entry,
 	syncBack []string,
 	ignoreMode bool,
-) error {
+) (func() error, error) {
 	changed, deleted := diffWorkspaceChanges(before, after, syncBack, ignoreMode)
+	compression := chooseWorkspaceChangeCompression(workspace, changed)
 	s.logger.Printf(
-		"sending workspace changes: sync_back=%s changed=%d deleted=%d",
+		"sending workspace changes: sync_back=%s changed=%d deleted=%d compression=%s",
 		formatSyncBack(syncBack),
 		len(changed),
 		len(deleted),
+		compression,
 	)
+
+	var closeCompressed func() error
+	if compression != "" {
+		if err := conn.WriteJSON(
+			protocol.MsgSyncCompressionStart,
+			protocol.CompressionInfo{Algorithm: compression},
+		); err != nil {
+			return nil, err
+		}
+
+		var err error
+		closeCompressed, err = conn.EnableZstdWriter()
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if err := conn.WriteJSON(
 		protocol.MsgChangeSet,
 		protocol.ChangeSet{Entries: changed, Deleted: deleted},
 	); err != nil {
-		return err
+		if closeCompressed != nil {
+			_ = closeCompressed()
+		}
+
+		return nil, err
 	}
 
-	return s.sendChangedFileBlobs(conn, workspace, changed)
+	if err := s.sendChangedFileBlobs(conn, workspace, changed); err != nil {
+		if closeCompressed != nil {
+			_ = closeCompressed()
+		}
+
+		return nil, err
+	}
+
+	return closeCompressed, nil
+}
+
+func chooseWorkspaceChangeCompression(workspace string, entries []syncfs.Entry) string {
+	candidates := make([]syncfs.CompressionCandidate, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile {
+			continue
+		}
+
+		candidates = append(candidates, syncfs.CompressionCandidate{
+			Path: filepath.Join(workspace, filepath.FromSlash(entry.Path)),
+			Size: entry.Size,
+		})
+	}
+
+	if syncfs.ShouldCompressTransfer(candidates) {
+		return protocol.CompressionZstd
+	}
+
+	return ""
 }
 
 func diffWorkspaceChanges(
