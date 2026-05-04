@@ -108,6 +108,7 @@ without Docker or Podman:
     "workdir": "/workspace",
     "network": "host",
     "user": "root",
+    "wsl_distro": "Ubuntu-24.04",
     "gpu": "none",
     "setup": {
       "image_commands": [
@@ -139,6 +140,7 @@ Runtime defaults:
 - `network`: `host`; set `none` to isolate networking.
 - `user`: `root` only in v1.
 - `gpu`: `none`; set `nvidia` to require NVIDIA devices.
+- `wsl_distro` (Windows hosts only): required. Distro name passed to WSL.
 
 Runtime storage has three roles:
 
@@ -177,12 +179,11 @@ remaining context references.
 
 Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI
-execution to an already installed WSL2 environment through `wsl.exe`; rmtx does
-not install, enable, or configure WSL2. Set `RMTX_WSL_DISTRO` to choose a
-specific distro, otherwise the default WSL distro is used. The private imported
-rmtx WSL distro and WSL ext4 workspace storage are still deferred, so current
-Windows OCI runs use paths bridged from Windows into WSL and may be slower than
-native WSL ext4 storage.
+execution to WSL2 through `wsl.exe`. Set `runtime.wsl_distro` in the project
+config; rmtx uses that distro and auto-installs it if missing.
+The private imported rmtx WSL distro and WSL ext4 workspace storage are still
+deferred, so Windows OCI runs use paths bridged from Windows into WSL and may be
+slower than native WSL ext4 storage.
 
 `gpu=nvidia` requires NVIDIA/WSL GPU devices and fails clearly when unavailable.
 Linux binds `/dev/nvidia*`, NVIDIA driver libraries discovered through

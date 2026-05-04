@@ -15,8 +15,6 @@ import (
 	"unicode"
 )
 
-const wslDistroEnv = "RMTX_WSL_DISTRO"
-
 func (s *Server) ociChildCommand(
 	ctx context.Context,
 	spec ociChildSpec,
@@ -26,7 +24,7 @@ func (s *Server) ociChildCommand(
 		return nil, noopCommandCleanup, errors.New("OCI command is required")
 	}
 
-	if err := checkWSLAvailable(ctx); err != nil {
+	if err := checkWSLAvailable(ctx, spec.WSLDistro); err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
@@ -40,13 +38,13 @@ func (s *Server) ociChildCommand(
 		return nil, noopCommandCleanup, err
 	}
 
-	wslScript, err := windowsPathToWSL(ctx, script)
+	wslScript, err := windowsPathToWSL(ctx, spec.WSLDistro, script)
 	if err != nil {
 		_ = os.Remove(script)
 		return nil, noopCommandCleanup, err
 	}
 
-	args := wslCommandArgs("--user", "root", "--exec", "sh", wslScript)
+	args := wslCommandArgs(spec.WSLDistro, "--user", "root", "--exec", "sh", wslScript)
 	cmd := exec.CommandContext(ctx, "wsl.exe", args...)
 	cmd.Env = os.Environ()
 
@@ -87,16 +85,39 @@ func nvidiaUnavailableError(err error) error {
 	)
 }
 
-func checkWSLAvailable(ctx context.Context) error {
-	if err := exec.CommandContext(ctx, "wsl.exe", "--status").Run(); err != nil {
-		return fmt.Errorf("WSL2 is required for OCI runtime on Windows: %w", err)
+func checkWSLAvailable(ctx context.Context, requestedDistro string) error {
+	requestedDistro = strings.TrimSpace(requestedDistro)
+	if requestedDistro == "" {
+		return errors.New("runtime.wsl_distro is required for OCI runtime on Windows")
+	}
+
+	installedDistros, err := wslInstalledDistros(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"WSL2 is required for OCI runtime on Windows: cannot list installed distros: %w",
+			err,
+		)
+	}
+
+	for _, name := range installedDistros {
+		if strings.EqualFold(name, requestedDistro) {
+			return nil
+		}
+	}
+
+	if err := installWSLDistro(ctx, requestedDistro); err != nil {
+		return fmt.Errorf(
+			"requested WSL distro %q is not installed and auto-install failed: %w",
+			requestedDistro,
+			err,
+		)
 	}
 
 	return nil
 }
 
 func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) {
-	rootfs, err := windowsPathToWSL(ctx, spec.RootFS)
+	rootfs, err := windowsPathToWSL(ctx, spec.WSLDistro, spec.RootFS)
 	if err != nil {
 		return ociChildSpec{}, err
 	}
@@ -104,7 +125,7 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 	spec.RootFS = rootfs
 
 	for i, bind := range spec.Binds {
-		source, err := windowsPathToWSL(ctx, bind.Source)
+		source, err := windowsPathToWSL(ctx, spec.WSLDistro, bind.Source)
 		if err != nil {
 			return ociChildSpec{}, err
 		}
@@ -115,7 +136,7 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 	return spec, nil
 }
 
-func windowsPathToWSL(ctx context.Context, path string) (string, error) {
+func windowsPathToWSL(ctx context.Context, distro string, path string) (string, error) {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" || strings.HasPrefix(trimmed, "/") {
 		return trimmed, nil
@@ -137,11 +158,11 @@ func windowsPathToWSL(ctx context.Context, path string) (string, error) {
 		return filepath.ToSlash(trimmed), nil
 	}
 
-	return wslPath(ctx, trimmed)
+	return wslPath(ctx, distro, trimmed)
 }
 
-func wslPath(ctx context.Context, path string) (string, error) {
-	args := wslCommandArgs("--exec", "wslpath", "-a", path)
+func wslPath(ctx context.Context, distro, path string) (string, error) {
+	args := wslCommandArgs(distro, "--exec", "wslpath", "-a", path)
 
 	out, err := exec.CommandContext(ctx, "wsl.exe", args...).Output()
 	if err != nil {
@@ -149,6 +170,53 @@ func wslPath(ctx context.Context, path string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+func wslInstalledDistros(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "wsl.exe", "--list", "--quiet").CombinedOutput()
+	trimmedOutput := strings.TrimSpace(string(out))
+	if err != nil {
+		if strings.Contains(strings.ToLower(trimmedOutput), "no installed distributions") {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("list installed WSL distributions: %s: %w", trimmedOutput, err)
+	}
+
+	if trimmedOutput == "" {
+		return nil, nil
+	}
+
+	lines := strings.Split(trimmedOutput, "\n")
+	distros := make([]string, 0, len(lines))
+	for _, line := range lines {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		distros = append(distros, name)
+	}
+
+	return distros, nil
+}
+
+func installWSLDistro(ctx context.Context, distro string) error {
+	if strings.TrimSpace(distro) == "" {
+		return errors.New("requested WSL distro is empty")
+	}
+
+	out, err := exec.CommandContext(
+		ctx,
+		"wsl.exe",
+		"--install",
+		"-d",
+		distro,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("install WSL distro %q: %s: %w", distro, strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
 }
 
 func writeWSLChildScript(contextDir string, spec ociChildSpec) (string, error) {
@@ -186,8 +254,8 @@ func writeWSLChildScript(contextDir string, spec ociChildSpec) (string, error) {
 	return script.Name(), nil
 }
 
-func wslCommandArgs(args ...string) []string {
-	distro := strings.TrimSpace(os.Getenv(wslDistroEnv))
+func wslCommandArgs(distro string, args ...string) []string {
+	distro = strings.TrimSpace(distro)
 	if distro == "" {
 		return args
 	}

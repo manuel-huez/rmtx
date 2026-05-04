@@ -40,4 +40,5 @@ type ociChildSpec struct {
 	Binds   []ociBind `json:"binds,omitempty"`
 	Network string    `json:"network,omitempty"`
 	GPU     string    `json:"gpu,omitempty"`
+	WSLDistro string  `json:"wsl_distro,omitempty"`
 }

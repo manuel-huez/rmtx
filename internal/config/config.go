@@ -67,6 +67,7 @@ type RuntimeConfig struct {
 	Network    string          `json:"network,omitempty"`
 	User       string          `json:"user,omitempty"`
 	GPU        string          `json:"gpu,omitempty"`
+	WSLDistro  string          `json:"wsl_distro,omitempty"`
 	Setup      RuntimeSetup    `json:"setup,omitempty"`
 	Volumes    []RuntimeVolume `json:"volumes,omitempty"`
 }
@@ -405,6 +406,7 @@ func validateRuntime(runtime RuntimeConfig) error {
 func runtimeConfigured(runtime RuntimeConfig) bool {
 	if strings.TrimSpace(runtime.Image) != "" ||
 		strings.TrimSpace(runtime.PullPolicy) != "" ||
+		strings.TrimSpace(runtime.WSLDistro) != "" ||
 		strings.TrimSpace(runtime.WorkDir) != "" ||
 		strings.TrimSpace(runtime.Network) != "" ||
 		strings.TrimSpace(runtime.User) != "" ||

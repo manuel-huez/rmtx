@@ -236,6 +236,7 @@ func (s *Server) runImageSetupCommands(
 			Binds:   gpuRuntime.Binds,
 			Network: runtimeSpec.Network,
 			GPU:     runtimeSpec.GPU,
+			WSLDistro: runtimeSpec.WSLDistro,
 		}
 
 		cmd, cleanup, err := s.ociChildCommand(ctx, spec, rootfs)
@@ -427,6 +428,7 @@ func (s *Server) newOCICommand(
 		Binds:   binds,
 		Network: request.Runtime.Network,
 		GPU:     request.Runtime.GPU,
+		WSLDistro: request.Runtime.WSLDistro,
 	}
 
 	return s.ociChildCommand(ctx, spec, handle.dir)
