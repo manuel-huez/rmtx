@@ -78,8 +78,7 @@ func run(ctx context.Context, args []string) int {
 	case "cache":
 		return runCache(ctx, args[1:])
 	case "help", "--help", "-h":
-		printUsage(os.Stdout)
-		return 0
+		return runHelp(args[1:])
 	default:
 		return runExec(
 			ctx,
@@ -748,6 +747,26 @@ func emptyFallback(value, fallback string) string {
 	return value
 }
 
+func runHelp(args []string) int {
+	if len(args) == 0 {
+		printUsage(os.Stdout)
+		return 0
+	}
+
+	switch args[0] {
+	case "config", ".rmtx.json", "rmtx.json":
+		printConfigHelp(os.Stdout)
+		return 0
+	case "commands", "command", "cli":
+		printUsage(os.Stdout)
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown help topic %q\n", args[0])
+		fmt.Fprintln(os.Stderr, "topics: commands, config")
+		return exitUsage
+	}
+}
+
 func printUsage(f *os.File) {
 	if _, err := fmt.Fprint(f, `rmtx runs local commands on a host machine over the local network.
 
@@ -778,8 +797,198 @@ Examples:
   rmtx context delete --current
   rmtx context artifacts list --current
   rmtx cache prune
+
+Help topics:
+  rmtx help commands       full command reference
+  rmtx help config         full .rmtx.json schema and defaults
+
+How rmtx works:
+  1. Run "rmtx host" on a host machine. It listens on TCP 33221 by default and
+     advertises itself on LAN discovery service "rmtx".
+  2. Run "rmtx init" in a client project. It discovers or uses --host, verifies
+     host TLS fingerprint, writes .rmtx.json, and pairs a client identity.
+  3. Run "rmtx <command> [args...]" or "rmtx exec -- <command> [args...]".
+     rmtx syncs configured mounts to a persistent host context, runs the command
+     in that context, streams stdin/stdout/stderr, then syncs changed files back.
+
+Config lookup:
+  Remote commands search upward from the current directory for .rmtx.json, then
+  rmtx.json. Use --config PATH to override. "rmtx init --config PATH" creates a
+  config at PATH. "rmtx help config" documents every supported field.
+
+Command reference:
+  rmtx host [--listen ADDR] [--state-dir DIR] [--name NAME]
+            [--service NAME] [--no-discovery]
+      Start host service. Defaults: --listen :33221, --service rmtx.
+
+  rmtx host pair-code [--state-dir DIR] [--ttl DURATION]
+      Print one-time pairing code plus host fingerprint. Default ttl: 5m.
+      Output: code=<code> host=<name> fingerprint=sha256:<hex> expires=<rfc3339>
+
+  rmtx init [--host ADDR] [--fingerprint sha256:<hex>] [--config PATH]
+            [--code CODE] [--label LABEL] [--select INDEX]
+            [--discovery-timeout DURATION]
+      Create project config and pair client. Discovery chooses host unless
+      --host is set. --fingerprint is required for manual init without trusted
+      discovery result. Output: initialized<TAB><config><TAB><addr><TAB><fp>
+
+  rmtx pair [--host ADDR] [--fingerprint sha256:<hex>] [--config PATH]
+            [--code CODE] [--label LABEL] [--select INDEX]
+            [--discovery-timeout DURATION]
+      Pair or re-pair current client with configured/discovered host.
+      Output: paired<TAB><name><TAB><addr><TAB><fingerprint>
+
+  rmtx exec [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
+            [--tty|--no-tty] -- <command> [args...]
+      Run command remotely. "rmtx <command> [args...]" is shorthand for exec
+      with TTY disabled. Use --tty for interactive shells/programs.
+
+  rmtx ping [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
+      Verify host reachability, TLS fingerprint, and pairing.
+      Output: online<TAB><name><TAB><addr><TAB>version=... contexts=...
+
+  rmtx context list [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
+      List contexts on host. Columns: ID, NAME, UPDATED, ACTIVE, WORKSPACE.
+
+  rmtx context delete [--current] [ID ...] [--host ADDR] [--config PATH]
+      Delete context IDs. With no IDs, deletes current config context.
+
+  rmtx context prune (--all|--older-than DURATION) [--host ADDR] [--config PATH]
+      Delete old/all contexts.
+
+  rmtx context artifacts list [--current|--context ID] [remote flags]
+      List context artifacts. Columns: KIND, NAME, REF, SIZE, PATH, DETAIL.
+
+  rmtx context artifacts prune [--current|--context ID] [remote flags]
+      Delete unreferenced artifacts for context.
+
+  rmtx context artifacts delete [--current|--context ID] --volume NAME [remote flags]
+      Delete named persistent runtime volume.
+
+  rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
+      Delete host global OCI cache data with no remaining context refs.
+
+Remote resolution order:
+  --host ADDR, RMTX_HOST env var, config host, LAN discovery.
+  Host ports default to 33221 when omitted.
+
+State files:
+  Client pairings live in ~/.rmtx/state.json.
+  Host state defaults to a platform app-data directory unless --state-dir set.
+
+Exit codes:
+  0 success. 1 runtime/error. 2 usage/invalid flags.
 `); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "failed to print usage:", err)
+	}
+}
+
+func printConfigHelp(f *os.File) {
+	if _, err := fmt.Fprint(f, `rmtx config file reference (.rmtx.json or rmtx.json)
+
+Lookup:
+  rmtx searches current directory, then parents, for .rmtx.json then rmtx.json.
+  --config PATH overrides lookup. Paths inside config are relative to config dir.
+  "rmtx exec" and "rmtx <command>" require config. Utility commands such as
+  ping/context/pair can also use --host, env, pairing state, or discovery.
+
+Minimal config:
+  {
+    "version": 1,
+    "context": { "name": "my-project" },
+    "host": "192.168.1.42:33221",
+    "tls": { "host_fingerprint": "sha256:..." },
+    "mounts": [{ "path": "." }]
+  }
+
+Full schema:
+  {
+    "version": 1,
+    "context": { "name": "my-project" },
+    "host": "192.168.1.42:33221",
+    "tls": { "host_fingerprint": "sha256:..." },
+    "discovery": {
+      "enabled": true,
+      "service": "rmtx",
+      "timeout": "750ms"
+    },
+    "mounts": [
+      { "path": ".", "exclude": ["tmp/**"] }
+    ],
+    "sync_back": ["coverage/", "generated/report.json"],
+    "ignore": [".git/**", "node_modules/**", "dist/**"],
+    "ignore_gitignore": true,
+    "env": { "forward": ["GITHUB_TOKEN", "AWS_PROFILE"] },
+    "runtime": {
+      "type": "oci",
+      "image": "docker.io/library/ubuntu:24.04",
+      "pull_policy": "if_missing",
+      "workdir": "/workspace",
+      "network": "host",
+      "user": "root",
+      "gpu": "none",
+      "wsl_distro": "Ubuntu-24.04",
+      "setup": {
+        "image_commands": ["apt-get update"],
+        "context_commands": ["npm ci"],
+        "context_inputs": ["package.json", "package-lock.json"]
+      },
+      "volumes": [
+        { "name": "npm-cache", "target": "/root/.npm" }
+      ]
+    }
+  }
+
+Top-level fields:
+  version              Config version. Default: 1.
+  context.name         Stable context name on host. Default: config dir basename.
+  host                 Preferred host address. Port defaults to 33221 if omitted.
+  tls.host_fingerprint Expected host TLS cert fingerprint. Required for trust.
+  discovery.enabled    Enable LAN discovery. Default: true.
+  discovery.service    Discovery service name. Default: rmtx.
+  discovery.timeout    Go duration for discovery wait, e.g. 750ms, 2s. Default: 750ms.
+  mounts               Client paths synced to host. Default: [{ "path": "." }].
+  mounts[].path        File/dir relative to config dir, or absolute path.
+  mounts[].exclude     Ignore patterns for that mount only.
+  ignore               Global ignore patterns for every mount.
+  ignore_gitignore     Add root .gitignore patterns to ignores. Default: false.
+  sync_back            Paths/globs copied back after command. Default: all mounts.
+  env.forward          Env var names copied from client to remote command.
+  runtime              Optional isolated OCI runtime. Omit to run directly on host.
+
+Ignore and sync patterns:
+  Patterns use slash paths. Directory pattern dir/** excludes descendants.
+  Trailing slash means same tree, e.g. data/cache/ equals data/cache/**.
+  Negated .gitignore patterns are ignored. rmtx rules only exclude.
+  sync_back paths are relative to project root. Directory paths include children.
+
+Runtime fields:
+  runtime.type         Supported: oci. Required when runtime configured.
+  runtime.image        OCI image ref. Required for oci.
+  runtime.pull_policy  if_missing, always, never. Default: if_missing.
+  runtime.workdir      Workspace mount path inside runtime. Default: /workspace.
+  runtime.network      host or none. Default: host.
+  runtime.user         root only in v1. Default: root.
+  runtime.gpu          none or nvidia. Default: none.
+  runtime.wsl_distro   Windows host WSL distro for OCI runs.
+  setup.image_commands Commands run once per prepared image/rootfs.
+  setup.context_commands Commands run after workspace sync before requested command.
+  setup.context_inputs Files hashed to decide when context_commands rerun.
+  volumes[].name       Persistent volume name. No slash, not "." or "..".
+  volumes[].target     Absolute runtime path for persistent host-side volume.
+
+Runtime behavior:
+  image_commands affect isolated rootfs, not host OS.
+  context_commands run in synced workspace. If context_inputs omitted, they run
+  before every command. If set, they rerun only when listed inputs change.
+  volumes persist on host, do not sync, do not enter manifests, do not sync back.
+
+Validation:
+  Unsupported top-level token/token_env fields fail; use "rmtx pair".
+  runtime target paths must be absolute and must not contain ".." path elements.
+  unsupported runtime values fail before command execution.
+`); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "failed to print config help:", err)
 	}
 }
 
