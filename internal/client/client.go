@@ -239,6 +239,8 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, err
 	}
 
+	opts.Root = root
+
 	logger := newRunLogger(opts.Stderr)
 	logger.Printf(
 		"preparing remote run: host=%s context=%s workdir=%s command=%q",
@@ -410,7 +412,7 @@ func buildRunRequest(
 	opts *ExecOptions,
 	logger *runLogger,
 ) (syncfs.BuildResult, protocol.RunRequest, error) {
-	logger.Printf("synchronizing local files: root=%s mounts=%s", root, formatMounts(opts.Mounts))
+	logger.Printf("local-to-host sync started: root=%s mounts=%s", root, formatMounts(opts.Mounts))
 
 	previous := loadManifestCache(root, opts.ContextID, logger)
 
@@ -752,17 +754,22 @@ func finishRunHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
-	logger.Printf("local-to-host sync complete")
-
 	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
 		return protocol.WorkspaceReady{}, err
 	}
 
-	return expectDataFrameWithOutput[protocol.WorkspaceReady](
+	ready, err := expectDataFrameWithOutput[protocol.WorkspaceReady](
 		conn,
 		protocol.MsgWorkspaceReady,
 		opts.Stderr,
 	)
+	if err != nil {
+		return protocol.WorkspaceReady{}, err
+	}
+
+	logger.Printf("local-to-host sync complete")
+
+	return ready, nil
 }
 
 func expectDataFrameWithOutput[T any](
@@ -948,7 +955,8 @@ func handleExecFrame(
 	case protocol.MsgExecExit:
 		code, err := decodeExitCode(head)
 		if err == nil {
-			logger.Printf("command exited: exit_code=%d; syncing host changes back", code)
+			logger.Printf("command exited: exit_code=%d", code)
+			logger.Printf("host-to-local sync started")
 		}
 
 		return false, code, err
@@ -1089,6 +1097,12 @@ func applyChangeBlob(
 		ModTime: info.ModTime,
 	}
 
+	logger.Printf(
+		"download file started: path=%s bytes=%s",
+		info.Path,
+		formatBytes(head.PayloadLen),
+	)
+
 	var received int64
 
 	reader := &progressReader{
@@ -1100,7 +1114,7 @@ func applyChangeBlob(
 			}
 
 			logger.Every(
-				"download-file",
+				"download-file:"+info.Path,
 				"download file: current_file=%s bytes=%s/%s",
 				info.Path,
 				formatBytes(received),
@@ -1116,6 +1130,12 @@ func applyChangeBlob(
 	if progress != nil {
 		progress.CompleteFile()
 	}
+
+	logger.Printf(
+		"download file done: path=%s bytes=%s",
+		info.Path,
+		formatBytes(received),
+	)
 
 	return nil
 }
@@ -1203,9 +1223,10 @@ func GenerateCSR(keyPEM []byte, label string) ([]byte, error) {
 }
 
 type blobUploadItem struct {
-	hash string
-	path string
-	size int64
+	hash        string
+	path        string
+	displayPath string
+	size        int64
 }
 
 type transferProgress struct {
@@ -1337,7 +1358,7 @@ func sendMissingBlobs(
 	opts ExecOptions,
 	logger *runLogger,
 ) error {
-	ordered, totalBytes, err := prepareUploadItems(need.Hashes, blobSources)
+	ordered, totalBytes, err := prepareUploadItems(need.Hashes, blobSources, opts.Root)
 	if err != nil {
 		return err
 	}
@@ -1350,16 +1371,24 @@ func sendMissingBlobs(
 
 	parallel := uploadParallelism(need, len(ordered))
 	compression := chooseBlobUploadCompression(ordered)
+	useUploadWorkers := need.UploadToken != "" && (parallel > 1 || compression != "")
+	actualParallel := 1
+	actualCompression := ""
+	if useUploadWorkers {
+		actualParallel = parallel
+		actualCompression = compression
+	}
+
 	progress := newTransferProgress("upload", logger, len(ordered), totalBytes)
 	logger.Printf(
 		"uploading missing file blobs: files=%d bytes=%s parallel=%d compression=%s",
 		len(ordered),
 		formatBytes(totalBytes),
-		parallel,
-		compression,
+		actualParallel,
+		actualCompression,
 	)
 
-	if need.UploadToken != "" && (parallel > 1 || compression != "") {
+	if useUploadWorkers {
 		if err := sendMissingBlobsParallel(
 			ctx,
 			ordered,
@@ -1368,6 +1397,7 @@ func sendMissingBlobs(
 			compression,
 			opts,
 			progress,
+			logger,
 		); err != nil {
 			return err
 		}
@@ -1377,7 +1407,7 @@ func sendMissingBlobs(
 		return nil
 	}
 
-	if err := sendMissingBlobsSequential(conn, ordered, progress); err != nil {
+	if err := sendMissingBlobsSequential(conn, ordered, progress, logger); err != nil {
 		return err
 	}
 
@@ -1389,6 +1419,7 @@ func sendMissingBlobs(
 func prepareUploadItems(
 	hashes []string,
 	blobSources map[string]string,
+	root string,
 ) ([]blobUploadItem, int64, error) {
 	ordered := append([]string(nil), hashes...)
 	sort.Strings(ordered)
@@ -1408,11 +1439,27 @@ func prepareUploadItems(
 			return nil, 0, fmt.Errorf("stat blob source %s: %w", srcPath, err)
 		}
 
-		items = append(items, blobUploadItem{hash: hash, path: srcPath, size: info.Size()})
+		items = append(items, blobUploadItem{
+			hash:        hash,
+			path:        srcPath,
+			displayPath: uploadDisplayPath(root, srcPath),
+			size:        info.Size(),
+		})
 		totalBytes += info.Size()
 	}
 
 	return items, totalBytes, nil
+}
+
+func uploadDisplayPath(root, srcPath string) string {
+	if strings.TrimSpace(root) != "" {
+		rel, err := filepath.Rel(root, srcPath)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return filepath.ToSlash(filepath.Clean(rel))
+		}
+	}
+
+	return filepath.ToSlash(srcPath)
 }
 
 func chooseBlobUploadCompression(items []blobUploadItem) string {
@@ -1456,9 +1503,10 @@ func sendMissingBlobsSequential(
 	conn *protocol.Conn,
 	items []blobUploadItem,
 	progress *transferProgress,
+	logger *runLogger,
 ) error {
 	for _, item := range items {
-		if err := sendBlob(conn, item, progress); err != nil {
+		if err := sendBlob(conn, item, progress, logger); err != nil {
 			return err
 		}
 
@@ -1476,6 +1524,7 @@ func sendMissingBlobsParallel(
 	compression string,
 	opts ExecOptions,
 	progress *transferProgress,
+	logger *runLogger,
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1490,7 +1539,7 @@ func sendMissingBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			if err := uploadBlobWorker(ctx, jobs, token, compression, opts, progress); err != nil {
+			if err := uploadBlobWorker(ctx, jobs, token, compression, opts, progress, logger); err != nil {
 				select {
 				case errCh <- err:
 					cancel()
@@ -1538,6 +1587,7 @@ func uploadBlobWorker(
 	compression string,
 	opts ExecOptions,
 	progress *transferProgress,
+	logger *runLogger,
 ) error {
 	conn, err := dialTLS(
 		ctx,
@@ -1587,7 +1637,7 @@ func uploadBlobWorker(
 			return err
 		}
 
-		if err := sendBlob(conn, item, progress); err != nil {
+		if err := sendBlob(conn, item, progress, logger); err != nil {
 			return err
 		}
 
@@ -1609,7 +1659,13 @@ func sendBlob(
 	conn *protocol.Conn,
 	item blobUploadItem,
 	progress *transferProgress,
+	logger *runLogger,
 ) error {
+	displayPath := item.displayPath
+	if displayPath == "" {
+		displayPath = filepath.ToSlash(item.path)
+	}
+
 	f, err := os.Open(item.path)
 	if err != nil {
 		return fmt.Errorf("open blob source %s: %w", item.path, err)
@@ -1617,17 +1673,45 @@ func sendBlob(
 
 	defer closeQuietly(f)
 
+	logger.Printf(
+		"upload file started: path=%s bytes=%s",
+		displayPath,
+		formatBytes(item.size),
+	)
+
+	var uploaded int64
+
 	reader := &progressReader{
-		src:    f,
-		onRead: progress.AddBytes,
+		src: f,
+		onRead: func(n int) {
+			uploaded += int64(n)
+			progress.AddBytes(n)
+			logger.Every(
+				"upload-file:"+item.hash,
+				"upload file: current_file=%s bytes=%s/%s",
+				displayPath,
+				formatBytes(uploaded),
+				formatBytes(item.size),
+			)
+		},
 	}
 
-	return conn.WriteFrom(
+	if err := conn.WriteFrom(
 		protocol.MsgBlob,
-		protocol.BlobInfo{Hash: item.hash, Size: item.size},
+		protocol.BlobInfo{Path: displayPath, Hash: item.hash, Size: item.size},
 		reader,
 		item.size,
+	); err != nil {
+		return err
+	}
+
+	logger.Printf(
+		"upload file done: path=%s bytes=%s",
+		displayPath,
+		formatBytes(uploaded),
 	)
+
+	return nil
 }
 
 type progressReader struct {

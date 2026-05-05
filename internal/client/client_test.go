@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,60 @@ import (
 	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
+
+func TestPrepareUploadItemsUsesRelativeDisplayPath(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "dir", "file.txt")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(src, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items, total, err := prepareUploadItems(
+		[]string{"hash"},
+		map[string]string{"hash": src},
+		root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if total != int64(len("content")) {
+		t.Fatalf("total bytes=%d want %d", total, len("content"))
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("items=%d want 1", len(items))
+	}
+
+	if items[0].displayPath != "dir/file.txt" {
+		t.Fatalf("display path=%q want dir/file.txt", items[0].displayPath)
+	}
+}
+
+func TestSendMissingBlobsDoesNotLogFilesWhenNothingTransfers(t *testing.T) {
+	var logs bytes.Buffer
+
+	err := sendMissingBlobs(
+		context.Background(),
+		nil,
+		protocol.NeedBlobs{},
+		nil,
+		ExecOptions{},
+		newRunLogger(&logs),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(logs.String(), "upload file started") ||
+		strings.Contains(logs.String(), "upload file done") {
+		t.Fatalf("unexpected file upload log: %s", logs.String())
+	}
+}
 
 func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
