@@ -28,6 +28,7 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 			_ *log.Logger,
 			targetVersion string,
 			_ string,
+			_ io.Writer,
 		) (updateResult, error) {
 			gotVersion = targetVersion
 
@@ -91,6 +92,115 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 	}
 }
 
+func TestStreamsHostLogsIncludesHostUpdateRequests(t *testing.T) {
+	if !streamsHostLogs(protocol.MsgHostUpdateRequest) {
+		t.Fatal("host update requests should stream host logs")
+	}
+}
+
+func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+
+	client := protocol.NewConn(clientConn)
+	var hostLogs strings.Builder
+	serverProtocol := protocol.NewConn(serverConn)
+	requestLogs := newHostLogSubscription(serverProtocol)
+	defer requestLogs.Close()
+
+	s := &Server{
+		logger: log.New(&hostLogs, "", 0),
+		updateRunner: func(
+			_ context.Context,
+			_ *log.Logger,
+			targetVersion string,
+			_ string,
+			live io.Writer,
+		) (updateResult, error) {
+			if _, err := io.WriteString(live, "downloaded module\n"); err != nil {
+				return updateResult{}, err
+			}
+
+			return updateResult{
+				InstallTarget: updateInstallTarget(targetVersion),
+				Executable:    "/tmp/rmtx-updated",
+			}, nil
+		},
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		errCh <- s.handleHostUpdateRequest(
+			context.Background(),
+			serverProtocol,
+			protocol.HostUpdateRequest{Version: "v9.8.7"},
+			requestLogs,
+		)
+	}()
+
+	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	gotInstallerLog := false
+	gotResponse := false
+
+	for !gotInstallerLog || !gotResponse {
+		head, err := client.ReadHeader()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		switch head.Type {
+		case protocol.MsgExecOutput:
+			if _, err := protocol.DecodeData[protocol.OutputInfo](head); err != nil {
+				t.Fatal(err)
+			}
+
+			payload, err := io.ReadAll(client.PayloadReader(head))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if strings.Contains(string(payload), "downloaded module") {
+				gotInstallerLog = true
+			}
+		case protocol.MsgHostUpdateResponse:
+			resp, err := protocol.DecodeData[protocol.HostUpdateResponse](head)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !resp.Updated || !resp.Restarting {
+				t.Fatalf("unexpected update response: %#v", resp)
+			}
+
+			gotResponse = true
+		case protocol.MsgError:
+			errMsg, err := protocol.DecodeData[protocol.ErrorMessage](head)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Fatalf("server error: %s", errMsg.Message)
+		default:
+			t.Fatalf("unexpected frame type: %s", head.Type)
+		}
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(hostLogs.String(), "host update installed") {
+		t.Fatalf("host logs missing update progress: %q", hostLogs.String())
+	}
+}
+
 func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 
@@ -106,6 +216,7 @@ func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *tes
 			_ *log.Logger,
 			_ string,
 			_ string,
+			_ io.Writer,
 		) (updateResult, error) {
 			runnerCalled = true
 
@@ -184,6 +295,7 @@ func TestHandleHostUpdateRequestWaitsForActiveRunBeforeRestart(t *testing.T) {
 			_ *log.Logger,
 			targetVersion string,
 			_ string,
+			_ io.Writer,
 		) (updateResult, error) {
 			return updateResult{
 				InstallTarget: updateInstallTarget(targetVersion),

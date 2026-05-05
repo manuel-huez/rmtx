@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -15,7 +16,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/version"
 )
 
-type updateRunner func(context.Context, *log.Logger, string, string) (updateResult, error)
+type updateRunner func(context.Context, *log.Logger, string, string, io.Writer) (updateResult, error)
 
 type updateResult struct {
 	InstallTarget string
@@ -27,6 +28,7 @@ func defaultUpdateRunner(
 	logger *log.Logger,
 	targetVersion string,
 	installDir string,
+	live io.Writer,
 ) (updateResult, error) {
 	target := updateInstallTarget(targetVersion)
 	result := updateResult{
@@ -41,7 +43,7 @@ func defaultUpdateRunner(
 	cmd := exec.CommandContext(ctx, "go", "install", target)
 	cmd.Env = environWith("GOBIN", installDir)
 
-	out, err := runCommandWithLiveOutput(logger, cmd, "host update", nil, nil)
+	out, err := runCommandWithLiveOutput(logger, cmd, "host update", live, live)
 	if err != nil {
 		return result, fmt.Errorf(
 			"go install %s: %s: %w",
@@ -145,7 +147,14 @@ func (s *Server) handleHostUpdateRequest(
 		runner = defaultUpdateRunner
 	}
 
-	result, err := runner(ctx, s.logger, targetVersion, installDir)
+	s.logHostUpdateProgress(
+		requestLogs,
+		"host update installing: target=%s install_dir=%s",
+		updateInstallTarget(targetVersion),
+		installDir,
+	)
+
+	result, err := runner(ctx, s.logger, targetVersion, installDir, requestLogs)
 	if err != nil {
 		return fmt.Errorf("update host to %s: %w", targetVersion, err)
 	}
@@ -158,7 +167,8 @@ func (s *Server) handleHostUpdateRequest(
 		return fmt.Errorf("update host to %s: missing restart executable", targetVersion)
 	}
 
-	s.logger.Printf(
+	s.logHostUpdateProgress(
+		requestLogs,
 		"host update installed: target=%s executable=%s",
 		result.InstallTarget,
 		result.Executable,
@@ -193,4 +203,16 @@ func (s *Server) handleHostUpdateRequest(
 	s.finishRestart()
 
 	return nil
+}
+
+func (s *Server) logHostUpdateProgress(
+	requestLogs *hostLogSubscription,
+	format string,
+	args ...any,
+) {
+	s.logger.Printf(format, args...)
+
+	if requestLogs != nil {
+		_, _ = fmt.Fprintf(requestLogs, "rmtx: "+format+"\n", args...)
+	}
 }

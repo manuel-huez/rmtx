@@ -434,7 +434,7 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	}
 
 	var requestLogs *hostLogSubscription
-	if head.Type == protocol.MsgRunRequest {
+	if streamsHostLogs(head.Type) {
 		requestLogs = s.logHub.Subscribe(conn)
 		defer requestLogs.Close()
 	}
@@ -453,6 +453,11 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	}
 
 	return nil
+}
+
+func streamsHostLogs(messageType string) bool {
+	return messageType == protocol.MsgRunRequest ||
+		messageType == protocol.MsgHostUpdateRequest
 }
 
 func (s *Server) handleRunRequest(
