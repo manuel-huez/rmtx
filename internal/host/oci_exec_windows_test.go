@@ -69,6 +69,49 @@ func TestWSLChildScriptBindsHostNetworkFilesForHostNetwork(t *testing.T) {
 	}
 }
 
+func TestWSLChildScriptStagesRootFSWhenConfigured(t *testing.T) {
+	script, err := wslChildScript(ociChildSpec{
+		RootFS:       "/mnt/c/rmtx/rootfs",
+		StagedRootFS: "/var/lib/rmtx/rootfs/key",
+		RootFSID:     "instance",
+		WorkDir:      "/workspace",
+		Command:      []string{"sh"},
+		Network:      "host",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"source_rootfs='/mnt/c/rmtx/rootfs'",
+		"rootfs='/var/lib/rmtx/rootfs/key'",
+		"rootfs_id='instance'",
+		"tar -cpf - .",
+		".rmtx-rootfs-stage-id",
+		".rmtx-wsl-stage-canonical",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestWSLStagedRootFSPathUsesNativeWSLPath(t *testing.T) {
+	first := wslStagedRootFSPath("/mnt/c/state/rootfs/a")
+	second := wslStagedRootFSPath("/mnt/c/state/rootfs/a")
+	other := wslStagedRootFSPath("/mnt/c/state/rootfs/b")
+
+	if !strings.HasPrefix(first, "/var/lib/rmtx/rootfs/") {
+		t.Fatalf("unexpected staged rootfs path: %s", first)
+	}
+	if first != second {
+		t.Fatal("staged rootfs path should be deterministic")
+	}
+	if first == other {
+		t.Fatal("different rootfs paths should use different staging paths")
+	}
+}
+
 func TestWSLChildScriptSkipsHostNetworkFilesForNoNetwork(t *testing.T) {
 	script, err := wslChildScript(ociChildSpec{
 		RootFS:  "/rootfs",

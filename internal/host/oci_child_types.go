@@ -13,12 +13,14 @@ type ociBind struct {
 }
 
 type ociChildSpec struct {
-	RootFS    string    `json:"rootfs"`
-	WorkDir   string    `json:"workdir"`
-	Command   []string  `json:"command"`
-	Env       []string  `json:"env"`
-	Binds     []ociBind `json:"binds,omitempty"`
-	Network   string    `json:"network,omitempty"`
-	GPU       string    `json:"gpu,omitempty"`
-	WSLDistro string    `json:"wsl_distro,omitempty"`
+	RootFS       string    `json:"rootfs"`
+	StagedRootFS string    `json:"staged_rootfs,omitempty"`
+	RootFSID     string    `json:"rootfs_id,omitempty"`
+	WorkDir      string    `json:"workdir"`
+	Command      []string  `json:"command"`
+	Env          []string  `json:"env"`
+	Binds        []ociBind `json:"binds,omitempty"`
+	Network      string    `json:"network,omitempty"`
+	GPU          string    `json:"gpu,omitempty"`
+	WSLDistro    string    `json:"wsl_distro,omitempty"`
 }

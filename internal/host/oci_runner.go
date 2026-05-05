@@ -28,6 +28,7 @@ const (
 	runtimeRootFSDirName = "rootfs"
 	runtimeSpecDirName   = "specs"
 	runtimeSetupMarker   = ".rmtx-image-setup-ready"
+	rootFSInstanceMarker = ".rmtx-rootfs-instance"
 	contextSetupFile     = "context-setup.json"
 	artifactStateFile    = "artifacts.json"
 	defaultOCIPathEnv    = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -183,6 +184,11 @@ func (s *Server) prepareOCIRuntimeLocked(
 			return preparedRuntime{}, err
 		}
 
+		if err := writeRootFSInstanceMarker(rootfs); err != nil {
+			_ = os.RemoveAll(rootfs)
+			return preparedRuntime{}, err
+		}
+
 		if err := s.runImageSetupCommands(
 			ctx,
 			rootfs,
@@ -204,6 +210,10 @@ func (s *Server) prepareOCIRuntimeLocked(
 			request.ContextID,
 			request.Runtime.Image,
 		)
+
+		if err := ensureRootFSInstanceMarker(rootfs); err != nil {
+			return preparedRuntime{}, err
+		}
 	}
 
 	if err := s.ensureOCIVolumes(handle.dir, request.Runtime.Volumes); err != nil {
@@ -279,6 +289,26 @@ func (s *Server) pullOCIImage(
 	)
 
 	return image, nil
+}
+
+func ensureRootFSInstanceMarker(rootfs string) error {
+	path := filepath.Join(rootfs, rootFSInstanceMarker)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat rootfs instance marker: %w", err)
+	}
+
+	return writeRootFSInstanceMarker(rootfs)
+}
+
+func writeRootFSInstanceMarker(rootfs string) error {
+	content := []byte(fmt.Sprintf("%d-%d\n", time.Now().UTC().UnixNano(), os.Getpid()))
+	if err := os.WriteFile(filepath.Join(rootfs, rootFSInstanceMarker), content, contextFileMode); err != nil {
+		return fmt.Errorf("write rootfs instance marker: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Server) runImageSetupCommands(

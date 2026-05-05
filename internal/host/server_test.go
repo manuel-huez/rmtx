@@ -302,6 +302,44 @@ func TestOCIBaseEnvPreservesImagePath(t *testing.T) {
 	}
 }
 
+func TestEnsureRootFSInstanceMarkerCreatesMarker(t *testing.T) {
+	rootfs := t.TempDir()
+
+	if err := ensureRootFSInstanceMarker(rootfs); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(rootfs, rootFSInstanceMarker))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(content) == 0 {
+		t.Fatal("expected rootfs instance marker content")
+	}
+}
+
+func TestEnsureRootFSInstanceMarkerPreservesExistingMarker(t *testing.T) {
+	rootfs := t.TempDir()
+	path := filepath.Join(rootfs, rootFSInstanceMarker)
+	if err := os.WriteFile(path, []byte("existing\n"), contextFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureRootFSInstanceMarker(rootfs); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(content) != "existing\n" {
+		t.Fatalf("marker was overwritten: %q", content)
+	}
+}
+
 func TestContextSetupKeyIncludesRuntimeIdentity(t *testing.T) {
 	workspace := t.TempDir()
 	if err := os.WriteFile(

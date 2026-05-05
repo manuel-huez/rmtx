@@ -4,6 +4,8 @@ package host
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -121,12 +123,21 @@ func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro 
 }
 
 func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) {
+	rootfsID, err := readRootFSInstanceID(spec.RootFS)
+	if err != nil {
+		return ociChildSpec{}, err
+	}
+
 	rootfs, err := windowsPathToWSL(ctx, spec.WSLDistro, spec.RootFS)
 	if err != nil {
 		return ociChildSpec{}, err
 	}
 
 	spec.RootFS = rootfs
+	if rootfsID != "" {
+		spec.RootFSID = rootfsID
+		spec.StagedRootFS = wslStagedRootFSPath(rootfs)
+	}
 
 	for i, bind := range spec.Binds {
 		source, err := windowsPathToWSL(ctx, spec.WSLDistro, bind.Source)
@@ -138,6 +149,24 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 	}
 
 	return spec, nil
+}
+
+func readRootFSInstanceID(rootfs string) (string, error) {
+	content, err := os.ReadFile(filepath.Join(rootfs, rootFSInstanceMarker))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read rootfs instance marker: %w", err)
+	}
+
+	return strings.TrimSpace(string(content)), nil
+}
+
+func wslStagedRootFSPath(rootfs string) string {
+	sum := sha256.Sum256([]byte(rootfs))
+
+	return "/var/lib/rmtx/rootfs/" + hex.EncodeToString(sum[:])
 }
 
 func windowsPathToWSL(ctx context.Context, distro string, path string) (string, error) {
@@ -337,7 +366,14 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 
 	b.WriteString("fi\n")
 	b.WriteString("mount --make-rprivate / 2>/dev/null || true\n")
-	b.WriteString("rootfs=" + shellQuote(spec.RootFS) + "\n")
+	b.WriteString("source_rootfs=" + shellQuote(spec.RootFS) + "\n")
+	if strings.TrimSpace(spec.StagedRootFS) != "" && strings.TrimSpace(spec.RootFSID) != "" {
+		b.WriteString("rootfs=" + shellQuote(spec.StagedRootFS) + "\n")
+		b.WriteString("rootfs_id=" + shellQuote(strings.TrimSpace(spec.RootFSID)) + "\n")
+		b.WriteString(wslStageRootFSSnippet())
+	} else {
+		b.WriteString("rootfs=\"$source_rootfs\"\n")
+	}
 
 	if strings.EqualFold(strings.TrimSpace(spec.GPU), "nvidia") {
 		b.WriteString(
@@ -388,6 +424,28 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	b.WriteByte('\n')
 
 	return b.String(), nil
+}
+
+func wslStageRootFSSnippet() string {
+	return strings.Join([]string{
+		"stage_marker=\"$rootfs/.rmtx-rootfs-stage-id\"",
+		"source_stage_marker=\"$source_rootfs/.rmtx-wsl-stage-canonical\"",
+		"current_stage_id=\"\"",
+		"if [ -f \"$stage_marker\" ]; then current_stage_id=$(cat \"$stage_marker\" 2>/dev/null || true); fi",
+		"if [ \"$current_stage_id\" != \"$rootfs_id\" ]; then",
+		"  if [ -f \"$source_stage_marker\" ]; then echo 'error: staged WSL OCI rootfs is missing or stale; prune the context runtime artifact and rerun' >&2; exit 1; fi",
+		"  if ! command -v tar >/dev/null 2>&1; then echo 'error: WSL OCI runtime staging requires tar' >&2; exit 1; fi",
+		"  tmp=\"$rootfs.tmp.$$\"",
+		"  rm -rf \"$tmp\"",
+		"  mkdir -p \"$(dirname \"$rootfs\")\" \"$tmp\"",
+		"  if ! (cd \"$source_rootfs\" && tar -cpf - .) | (cd \"$tmp\" && tar -xpf -); then rm -rf \"$tmp\"; exit 1; fi",
+		"  printf '%s\\n' \"$rootfs_id\" > \"$tmp/.rmtx-rootfs-stage-id\"",
+		"  rm -rf \"$rootfs\"",
+		"  mv \"$tmp\" \"$rootfs\"",
+		"  printf '%s\\n' \"$rootfs_id\" > \"$source_stage_marker\" 2>/dev/null || true",
+		"fi",
+		"",
+	}, "\n")
 }
 
 func wslHostNetworkFilesSnippet() string {
