@@ -180,7 +180,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 			request.Runtime.Image,
 		)
 
-		if err := store.UnpackImage(rootfs, image); err != nil {
+		if err := store.UnpackImageContext(ctx, rootfs, image); err != nil {
 			return preparedRuntime{}, err
 		}
 

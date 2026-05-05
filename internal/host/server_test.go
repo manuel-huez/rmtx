@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/protocol"
@@ -31,6 +32,29 @@ func TestIsDisconnectErrorRecognizesTypedNetworkCloseErrors(t *testing.T) {
 
 	if isDisconnectError(errors.New("apply non-file entries failed")) {
 		t.Fatal("non-disconnect error should not match")
+	}
+}
+
+func TestIsDisconnectErrorDistinguishesConnDeadlineFromContextDeadline(t *testing.T) {
+	if isDisconnectError(context.DeadlineExceeded) {
+		t.Fatal("context deadline should not be treated as a disconnect")
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	if err := serverConn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := serverConn.Read([]byte{0})
+	if err == nil {
+		t.Fatal("expected read deadline error")
+	}
+
+	if !isDisconnectError(err) {
+		t.Fatalf("read deadline should be treated as a disconnect: %v", err)
 	}
 }
 

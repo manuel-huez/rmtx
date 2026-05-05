@@ -183,6 +183,8 @@ func (s *Server) receiveBlobUploadFrame(
 	}
 
 	switch head.Type {
+	case protocol.MsgHeartbeat:
+		return true, conn.DiscardPayload(head)
 	case protocol.MsgBlob:
 		if err := s.receiveUploadBlob(conn, head, upload); err != nil {
 			return false, err

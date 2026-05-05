@@ -5,6 +5,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -69,7 +70,7 @@ func TestUnpackImageAppliesWhiteout(t *testing.T) {
 
 func TestApplyTarEntryUnpacksLegacyRegularFile(t *testing.T) {
 	root := t.TempDir()
-	if err := applyTarEntry(root, &tar.Header{
+	if err := applyTarEntry(context.Background(), root, &tar.Header{
 		Name:     "legacy.txt",
 		Typeflag: legacyTarRegularFile,
 		Mode:     0o644,

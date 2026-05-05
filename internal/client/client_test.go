@@ -122,6 +122,10 @@ func serveHandshakeSetupOutput(conn *protocol.Conn) error {
 		return err
 	}
 
+	if err := conn.WriteJSON(protocol.MsgHeartbeat, nil); err != nil {
+		return err
+	}
+
 	if err := conn.WriteJSON(protocol.MsgNeedBlobs, protocol.NeedBlobs{}); err != nil {
 		return err
 	}

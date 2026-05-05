@@ -66,6 +66,10 @@ func (c *Conn) write(msgType string, payload any, data any, payloadLen int64) er
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	return c.writeLocked(msgType, payload, data, payloadLen)
+}
+
+func (c *Conn) writeLocked(msgType string, payload any, data any, payloadLen int64) error {
 	h := Header{Type: msgType, PayloadLen: payloadLen}
 
 	if payload != nil {

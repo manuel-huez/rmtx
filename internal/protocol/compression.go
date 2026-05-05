@@ -17,6 +17,21 @@ func (c *Conn) EnableZstdWriter() (func() error, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	return c.enableZstdWriterLocked()
+}
+
+func (c *Conn) WriteJSONAndEnableZstdWriter(msgType string, payload any) (func() error, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.writeLocked(msgType, payload, nil, 0); err != nil {
+		return nil, err
+	}
+
+	return c.enableZstdWriterLocked()
+}
+
+func (c *Conn) enableZstdWriterLocked() (func() error, error) {
 	if err := c.w.Flush(); err != nil {
 		return nil, fmt.Errorf("flush before zstd writer: %w", err)
 	}

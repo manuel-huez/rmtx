@@ -43,6 +43,9 @@ func UpdateHost(
 		return HostUpdateResult{}, err
 	}
 
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+
 	return expectDataFrameWithOutput[protocol.HostUpdateResponse](
 		conn,
 		protocol.MsgHostUpdateResponse,
@@ -92,6 +95,9 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 		return DeleteContextsResult{}, err
 	}
 
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+
 	return expectDataFrameWithOutput[protocol.DeleteContextsResponse](
 		conn,
 		protocol.MsgDeleteContextsResponse,
@@ -119,6 +125,9 @@ func ContextArtifacts(
 		return ContextArtifactsResult{}, err
 	}
 
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+
 	return expectDataFrameWithOutput[protocol.ContextArtifactsResponse](
 		conn,
 		protocol.MsgContextArtifactsResponse,
@@ -139,6 +148,9 @@ func CachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, erro
 	); err != nil {
 		return CachePruneResult{}, err
 	}
+
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
 
 	return expectDataFrameWithOutput[protocol.CachePruneResponse](
 		conn,

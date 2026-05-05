@@ -91,6 +91,12 @@ const (
 	defaultDiscoverySvc = "rmtx"
 	progressEvery       = 3 * time.Second
 	parallelBlobUploads = 4
+	tcpKeepAliveEvery   = 15 * time.Second
+)
+
+var (
+	sessionIdleTimeout       = 45 * time.Second
+	sessionHeartbeatInterval = 10 * time.Second
 )
 
 type runLogger struct {
@@ -191,6 +197,42 @@ func closeQuietly(c io.Closer) {
 	}
 }
 
+func startConnectionLiveness(
+	ctx context.Context,
+	conn *protocol.Conn,
+	expectPeerHeartbeat bool,
+) func() {
+	if conn == nil || conn.Raw() == nil {
+		return func() {}
+	}
+
+	if idleConn, ok := conn.Raw().(interface{ SetWriteIdleTimeout(time.Duration) }); ok {
+		idleConn.SetWriteIdleTimeout(sessionIdleTimeout)
+	}
+	if expectPeerHeartbeat {
+		if idleConn, ok := conn.Raw().(interface{ SetReadIdleTimeout(time.Duration) }); ok {
+			idleConn.SetReadIdleTimeout(sessionIdleTimeout)
+		}
+	}
+
+	stopHeartbeat := protocol.StartHeartbeat(
+		ctx,
+		conn,
+		sessionHeartbeatInterval,
+		func(error) { closeQuietly(conn.Raw()) },
+	)
+
+	return func() {
+		stopHeartbeat()
+		if idleConn, ok := conn.Raw().(interface{ SetWriteIdleTimeout(time.Duration) }); ok {
+			idleConn.SetWriteIdleTimeout(0)
+		}
+		if idleConn, ok := conn.Raw().(interface{ SetReadIdleTimeout(time.Duration) }); ok {
+			idleConn.SetReadIdleTimeout(0)
+		}
+	}
+}
+
 func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	root, workdir, err := resolvePaths(&opts)
 	if err != nil {
@@ -233,10 +275,18 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	stopContextClose := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
 	defer stopContextClose()
 
-	ready, err := runHandshake(ctx, conn, request, manifest.BlobSources, opts, logger)
+	ready, stopLiveness, err := runHandshakeWithLiveness(
+		ctx,
+		conn,
+		request,
+		manifest.BlobSources,
+		opts,
+		logger,
+	)
 	if err != nil {
 		return 1, err
 	}
+	defer stopLiveness()
 
 	logger.Printf(
 		"remote workspace ready: context=%s workspace=%s",
@@ -481,7 +531,7 @@ func dialTLS(
 	address, discoveryService, fingerprint string,
 	clientCertPEM, clientKeyPEM []byte,
 ) (*protocol.Conn, error) {
-	dialer := net.Dialer{Timeout: directDialTimeout}
+	dialer := net.Dialer{Timeout: directDialTimeout, KeepAlive: tcpKeepAliveEvery}
 
 	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
 	if err != nil {
@@ -510,7 +560,7 @@ func dialTLS(
 		)
 	}
 
-	return protocol.NewConn(raw), nil
+	return protocol.NewConn(protocol.NewIdleDeadlineConn(raw)), nil
 }
 
 func dialReverseTLS(
@@ -518,7 +568,8 @@ func dialReverseTLS(
 	address, discoveryService, fingerprint string,
 	clientCertPEM, clientKeyPEM []byte,
 ) (*protocol.Conn, error) {
-	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	listenConfig := net.ListenConfig{KeepAlive: tcpKeepAliveEvery}
+	ln, err := listenConfig.Listen(ctx, "tcp4", "0.0.0.0:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen for reverse connection: %w", err)
 	}
@@ -564,7 +615,7 @@ func dialReverseTLS(
 		return nil, fmt.Errorf("reverse tls handshake: %w", err)
 	}
 
-	return protocol.NewConn(conn), nil
+	return protocol.NewConn(protocol.NewIdleDeadlineConn(conn)), nil
 }
 
 func startReverseConnectRequests(
@@ -653,6 +704,41 @@ func runHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
+	return finishRunHandshake(ctx, conn, blobSources, opts, logger)
+}
+
+func runHandshakeWithLiveness(
+	ctx context.Context,
+	conn *protocol.Conn,
+	request protocol.RunRequest,
+	blobSources map[string]string,
+	opts ExecOptions,
+	logger *runLogger,
+) (protocol.WorkspaceReady, func(), error) {
+	logger.Printf("sending run request and manifest: entries=%d", len(request.Manifest))
+
+	if err := conn.WriteJSON(protocol.MsgRunRequest, request); err != nil {
+		return protocol.WorkspaceReady{}, nil, err
+	}
+
+	stopLiveness := startConnectionLiveness(ctx, conn, true)
+
+	ready, err := finishRunHandshake(ctx, conn, blobSources, opts, logger)
+	if err != nil {
+		stopLiveness()
+		return protocol.WorkspaceReady{}, nil, err
+	}
+
+	return ready, stopLiveness, nil
+}
+
+func finishRunHandshake(
+	ctx context.Context,
+	conn *protocol.Conn,
+	blobSources map[string]string,
+	opts ExecOptions,
+	logger *runLogger,
+) (protocol.WorkspaceReady, error) {
 	need, err := expectDataFrameWithOutput[protocol.NeedBlobs](
 		conn,
 		protocol.MsgNeedBlobs,
@@ -697,6 +783,10 @@ func expectDataFrameWithOutput[T any](
 		}
 
 		switch head.Type {
+		case protocol.MsgHeartbeat:
+			if err := conn.DiscardPayload(head); err != nil {
+				return zero, err
+			}
 		case protocol.MsgError:
 			return zero, decodeServerError(head)
 		case protocol.MsgExecOutput:
@@ -849,6 +939,8 @@ func handleExecFrame(
 	downloadProgress **transferProgress,
 ) (bool, int, error) {
 	switch head.Type {
+	case protocol.MsgHeartbeat:
+		return false, exitCode, conn.DiscardPayload(head)
 	case protocol.MsgError:
 		return false, exitCode, decodeServerError(head)
 	case protocol.MsgExecOutput:
@@ -1467,19 +1559,28 @@ func uploadBlobWorker(
 		Token:       token,
 		Compression: compression,
 	}
-	if err := conn.WriteJSON(protocol.MsgBlobUploadRequest, req); err != nil {
-		return err
-	}
 
 	var closeCompressed func() error
 	if compression == protocol.CompressionZstd {
-		closeCompressed, err = conn.EnableZstdWriter()
+		closeCompressed, err = conn.WriteJSONAndEnableZstdWriter(
+			protocol.MsgBlobUploadRequest,
+			req,
+		)
 		if err != nil {
 			return err
 		}
 
-		defer func() { _ = closeCompressed() }()
+	} else if err := conn.WriteJSON(protocol.MsgBlobUploadRequest, req); err != nil {
+		return err
 	}
+
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+	defer func() {
+		if closeCompressed != nil {
+			_ = closeCompressed()
+		}
+	}()
 
 	for item := range jobs {
 		if err := ctx.Err(); err != nil {

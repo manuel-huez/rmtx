@@ -28,6 +28,7 @@ const (
 	MsgChangeBlob               = "change_blob"
 	MsgChangesDone              = "changes_done"
 	MsgSyncCompressionStart     = "sync_compression_start"
+	MsgHeartbeat                = "heartbeat"
 	MsgPingRequest              = "ping_request"
 	MsgPingResponse             = "ping_response"
 	MsgHostUpdateRequest        = "host_update_request"

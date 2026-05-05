@@ -111,6 +111,114 @@ func TestRunPipeExecCommandDisconnectCancelsProcessTree(t *testing.T) {
 	}
 }
 
+func TestRunPipeExecCommandIdleTimeoutCancelsSilentClient(t *testing.T) {
+	t.Helper()
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	raw := protocol.NewIdleDeadlineConn(serverConn)
+	raw.SetIdleTimeout(80 * time.Millisecond)
+
+	server := &Server{logger: log.New(io.Discard, "", 0)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 60")
+	cmd.Dir = t.TempDir()
+
+	resultCh := make(chan struct {
+		code int
+		err  error
+	}, 1)
+
+	go func() {
+		code, err := server.runPipeExecCommand(ctx, cancel, protocol.NewConn(raw), cmd)
+		resultCh <- struct {
+			code int
+			err  error
+		}{code, err}
+	}()
+
+	client := protocol.NewConn(clientConn)
+	time.Sleep(40 * time.Millisecond)
+
+	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
+		t.Fatalf("send stdin close: %v", err)
+	}
+
+	select {
+	case result := <-resultCh:
+		if result.err == nil {
+			t.Fatalf("expected idle timeout to cancel run, got code=%d", result.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("command did not stop after silent client idle timeout")
+	}
+}
+
+func TestRunPipeExecCommandHeartbeatsKeepIdleClientAlive(t *testing.T) {
+	t.Helper()
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	raw := protocol.NewIdleDeadlineConn(serverConn)
+	raw.SetIdleTimeout(120 * time.Millisecond)
+
+	server := &Server{logger: log.New(io.Discard, "", 0)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 0.25")
+	cmd.Dir = t.TempDir()
+
+	resultCh := make(chan struct {
+		code int
+		err  error
+	}, 1)
+
+	go func() {
+		code, err := server.runPipeExecCommand(ctx, cancel, protocol.NewConn(raw), cmd)
+		resultCh <- struct {
+			code int
+			err  error
+		}{code, err}
+	}()
+
+	client := protocol.NewConn(clientConn)
+	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
+		t.Fatalf("send stdin close: %v", err)
+	}
+
+	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
+	defer stopHeartbeat()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				_ = client.WriteJSON(protocol.MsgHeartbeat, nil)
+			}
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("run failed while client heartbeats were flowing: %v", result.err)
+		}
+		if result.code != 0 {
+			t.Fatalf("exit code=%d want 0", result.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("command did not finish while client heartbeats were flowing")
+	}
+}
+
 func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	t.Helper()
 

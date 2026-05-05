@@ -39,11 +39,16 @@ const (
 	blobUploadParallel = 4
 	hostUpdateTimeout  = 5 * time.Minute
 	restartPollEvery   = 100 * time.Millisecond
+	tcpKeepAliveEvery  = 15 * time.Second
 )
 
 var (
 	ErrRestartRequested = errors.New("host restart requested")
 	errRestartPending   = errors.New("host restart in progress; retry shortly")
+
+	requestHeaderIdleTimeout = 30 * time.Second
+	sessionIdleTimeout       = 45 * time.Second
+	sessionHeartbeatInterval = 10 * time.Second
 )
 
 type RestartRequestedError struct {
@@ -303,7 +308,8 @@ func (s *Server) hostName() string {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	base, err := net.Listen("tcp", s.opts.ListenAddr)
+	listenConfig := net.ListenConfig{KeepAlive: tcpKeepAliveEvery}
+	base, err := listenConfig.Listen(ctx, "tcp", s.opts.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.opts.ListenAddr, err)
 	}
@@ -381,7 +387,7 @@ func (s *Server) handleReverseConnect(parent context.Context, address string) {
 	ctx, cancel := context.WithTimeout(parent, reverseDialTimeout)
 	defer cancel()
 
-	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	raw, err := (&net.Dialer{KeepAlive: tcpKeepAliveEvery}).DialContext(ctx, "tcp", address)
 	if err != nil {
 		s.logger.Printf("reverse connect to %s failed: %v", address, err)
 
@@ -392,10 +398,17 @@ func (s *Server) handleReverseConnect(parent context.Context, address string) {
 }
 
 func (s *Server) handleConn(parent context.Context, raw net.Conn) {
+	raw = protocol.NewIdleDeadlineConn(raw)
 	defer func() { _ = raw.Close() }()
 
+	sessionCtx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	stopContextClose := context.AfterFunc(sessionCtx, func() { _ = raw.Close() })
+	defer stopContextClose()
+
 	conn := protocol.NewConn(raw)
-	if err := s.handleConnSession(parent, conn); err != nil {
+	if err := s.handleConnSession(sessionCtx, cancel, conn); err != nil {
 		s.logger.Printf("request failed: remote=%s error=%v", raw.RemoteAddr(), err)
 		_ = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
@@ -405,8 +418,10 @@ func isDisconnectError(err error) bool {
 	var errno syscall.Errno
 
 	return errors.Is(err, io.EOF) ||
+		errors.Is(err, context.Canceled) ||
 		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
@@ -423,7 +438,13 @@ func isDisconnectErrno(errno syscall.Errno) bool {
 		errno == windowsConnectionReset
 }
 
-func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) error {
+func (s *Server) handleConnSession(
+	parent context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+) error {
+	setConnectionIdleTimeout(conn, requestHeaderIdleTimeout)
+
 	head, err := conn.ReadHeader()
 	if err != nil {
 		if isDisconnectError(err) {
@@ -440,6 +461,17 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 	}
 
 	s.logger.Printf("request received: remote=%s type=%s", conn.Raw().RemoteAddr(), head.Type)
+
+	stopLiveness := func() { setConnectionIdleTimeout(conn, 0) }
+	if requestUsesSessionLiveness(head.Type) {
+		stopLiveness = startSessionLiveness(
+			parent,
+			cancel,
+			conn,
+			requestUsesOutboundHeartbeat(head.Type),
+		)
+	}
+	defer stopLiveness()
 
 	if err := s.dispatchSessionRequest(parent, conn, head, requestLogs); err != nil {
 		if isDisconnectError(err) {
@@ -957,19 +989,16 @@ func (s *Server) sendWorkspaceChanges(
 		compression,
 	)
 
-	var closeCompressed func() error
+	var (
+		closeCompressed func() error
+		err             error
+	)
 
 	if compression != "" {
-		if err := conn.WriteJSON(
+		closeCompressed, err = conn.WriteJSONAndEnableZstdWriter(
 			protocol.MsgSyncCompressionStart,
 			protocol.CompressionInfo{Algorithm: compression},
-		); err != nil {
-			return nil, err
-		}
-
-		var err error
-
-		closeCompressed, err = conn.EnableZstdWriter()
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1185,7 +1214,12 @@ func sendChangedFileBlob(
 }
 
 func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, error) {
-	tlsConn, ok := conn.Raw().(*tls.Conn)
+	raw := conn.Raw()
+	if wrapped, ok := raw.(interface{ Underlying() net.Conn }); ok {
+		raw = wrapped.Underlying()
+	}
+
+	tlsConn, ok := raw.(*tls.Conn)
 	if !ok {
 		return nil, errors.New("connection is not tls")
 	}
@@ -1313,6 +1347,10 @@ func (s *Server) receiveBlobs(
 		}
 
 		switch head.Type {
+		case protocol.MsgHeartbeat:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
 		case protocol.MsgBlob:
 			if err := s.receiveControlBlob(
 				conn,
@@ -1660,6 +1698,8 @@ func (s *Server) handleInputFrame(
 	allowResize bool,
 ) (bool, error) {
 	switch head.Type {
+	case protocol.MsgHeartbeat:
+		return false, conn.DiscardPayload(head)
 	case protocol.MsgStdinData:
 		_, err := io.Copy(writer, conn.PayloadReader(head))
 		return false, err

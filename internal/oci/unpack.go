@@ -4,6 +4,7 @@ package oci
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,24 @@ const rootfsMarker = ".rmtx-rootfs-ready"
 const defaultRootDirMode = 0o755
 const legacyTarRegularFile byte = 0
 
+type contextReader struct {
+	ctx context.Context
+	src io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return r.src.Read(p)
+}
+
 func (s *Store) UnpackImage(target string, image Image) error {
+	return s.UnpackImageContext(context.Background(), target, image)
+}
+
+func (s *Store) UnpackImageContext(ctx context.Context, target string, image Image) error {
 	if _, err := os.Stat(filepath.Join(target, rootfsMarker)); err == nil {
 		return nil
 	}
@@ -32,7 +50,12 @@ func (s *Store) UnpackImage(target string, image Image) error {
 	}
 
 	for _, layer := range image.Layers {
-		if err := s.unpackLayer(tmp, layer.Digest); err != nil {
+		if err := ctx.Err(); err != nil {
+			_ = os.RemoveAll(tmp)
+			return err
+		}
+
+		if err := s.unpackLayer(ctx, tmp, layer.Digest); err != nil {
 			_ = os.RemoveAll(tmp)
 			return err
 		}
@@ -54,7 +77,7 @@ func (s *Store) UnpackImage(target string, image Image) error {
 	return nil
 }
 
-func (s *Store) unpackLayer(root string, digest string) error {
+func (s *Store) unpackLayer(ctx context.Context, root string, digest string) error {
 	f, err := s.ReadBlob(digest)
 	if err != nil {
 		return err
@@ -72,6 +95,10 @@ func (s *Store) unpackLayer(root string, digest string) error {
 
 	tr := tar.NewReader(r)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -80,14 +107,14 @@ func (s *Store) unpackLayer(root string, digest string) error {
 			return fmt.Errorf("read layer %s: %w", digest, err)
 		}
 
-		if err := applyTarEntry(root, hdr, tr); err != nil {
+		if err := applyTarEntry(ctx, root, hdr, tr); err != nil {
 			return fmt.Errorf("apply layer %s entry %s: %w", digest, hdr.Name, err)
 		}
 	}
 }
 
 //nolint:cyclop // Tar entry handling must branch by OCI whiteout and entry type.
-func applyTarEntry(root string, hdr *tar.Header, src io.Reader) error {
+func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Reader) error {
 	name, err := cleanTarName(hdr.Name)
 	if err != nil {
 		return err
@@ -126,7 +153,7 @@ func applyTarEntry(root string, hdr *tar.Header, src io.Reader) error {
 			return err
 		}
 
-		if _, err := io.Copy(f, src); err != nil {
+		if _, err := io.Copy(f, contextReader{ctx: ctx, src: src}); err != nil {
 			_ = f.Close()
 			return err
 		}
