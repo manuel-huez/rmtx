@@ -76,6 +76,7 @@ func (s *Server) prepareRuntimeBeforeSync(
 	ctx context.Context,
 	handle contextHandle,
 	request protocol.RunRequest,
+	runLogs *hostLogSubscription,
 ) (preparedRuntime, bool, error) {
 	if !isOCIRuntime(request.Runtime) {
 		return preparedRuntime{}, false, nil
@@ -88,7 +89,7 @@ func (s *Server) prepareRuntimeBeforeSync(
 		)
 	}
 
-	prepared, err := s.prepareOCIRuntime(ctx, handle, request)
+	prepared, err := s.prepareOCIRuntime(ctx, handle, request, runLogs)
 	if err != nil {
 		return preparedRuntime{}, false, err
 	}
@@ -104,12 +105,20 @@ func (s *Server) runOCIPipeCommand(
 	workdir string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (int, error) {
-	if err := s.prepareOCIContextSetup(ctx, workspace, request, preparedRuntime); err != nil {
+	if err := s.prepareOCIContextSetup(
+		ctx,
+		workspace,
+		request,
+		preparedRuntime,
+		runLogs,
+	); err != nil {
 		return 1, err
 	}
+	runLogs.Flush()
 
-	cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime)
+	cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime, runLogs)
 	if err != nil {
 		return 1, err
 	}
@@ -123,17 +132,19 @@ func (s *Server) prepareOCIRuntime(
 	ctx context.Context,
 	handle contextHandle,
 	request protocol.RunRequest,
+	runLogs *hostLogSubscription,
 ) (preparedRuntime, error) {
 	s.ociMu.Lock()
 	defer s.ociMu.Unlock()
 
-	return s.prepareOCIRuntimeLocked(ctx, handle, request)
+	return s.prepareOCIRuntimeLocked(ctx, handle, request, runLogs)
 }
 
 func (s *Server) prepareOCIRuntimeLocked(
 	ctx context.Context,
 	handle contextHandle,
 	request protocol.RunRequest,
+	runLogs *hostLogSubscription,
 ) (preparedRuntime, error) {
 	s.logger.Printf(
 		"preparing OCI runtime: context=%s image=%s",
@@ -172,7 +183,13 @@ func (s *Server) prepareOCIRuntimeLocked(
 			return preparedRuntime{}, err
 		}
 
-		if err := s.runImageSetupCommands(ctx, rootfs, request.Runtime, image.Env); err != nil {
+		if err := s.runImageSetupCommands(
+			ctx,
+			rootfs,
+			request.Runtime,
+			image.Env,
+			runLogs,
+		); err != nil {
 			_ = os.RemoveAll(rootfs)
 			return preparedRuntime{}, err
 		}
@@ -269,6 +286,7 @@ func (s *Server) runImageSetupCommands(
 	rootfs string,
 	runtimeSpec protocol.RuntimeSpec,
 	imageEnv []string,
+	runLogs *hostLogSubscription,
 ) error {
 	gpuRuntime, err := nvidiaRuntime(runtimeSpec.GPU)
 	if err != nil {
@@ -304,7 +322,11 @@ func (s *Server) runImageSetupCommands(
 			s.logger,
 			cmd,
 			"runtime image setup command",
+			runLogs,
+			runLogs,
 		)
+		runLogs.Flush()
+
 		cleanupErr := cleanup()
 		if err != nil {
 			return fmt.Errorf(
@@ -328,6 +350,7 @@ func (s *Server) prepareOCIContextSetup(
 	workspace string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) error {
 	if len(request.Runtime.Setup.ContextCommands) == 0 {
 		return nil
@@ -342,7 +365,13 @@ func (s *Server) prepareOCIContextSetup(
 		dir:       filepath.Join(s.contextsRoot(), request.ContextID),
 		workspace: workspace,
 	}
-	prepared, err := s.ensurePreparedOCIRuntime(ctx, handle, request, preparedRuntime)
+	prepared, err := s.ensurePreparedOCIRuntime(
+		ctx,
+		handle,
+		request,
+		preparedRuntime,
+		runLogs,
+	)
 	if err != nil {
 		return err
 	}
@@ -368,6 +397,7 @@ func (s *Server) prepareOCIContextSetup(
 		workdir,
 		request,
 		&prepared,
+		runLogs,
 	); err != nil {
 		return err
 	}
@@ -381,6 +411,7 @@ func (s *Server) runOCIContextSetupCommands(
 	workdir string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) error {
 	for _, command := range request.Runtime.Setup.ContextCommands {
 		if strings.TrimSpace(command) == "" {
@@ -396,7 +427,14 @@ func (s *Server) runOCIContextSetupCommands(
 			command,
 		)
 
-		cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, setupReq, preparedRuntime)
+		cmd, cleanup, err := s.newOCICommand(
+			ctx,
+			workspace,
+			workdir,
+			setupReq,
+			preparedRuntime,
+			runLogs,
+		)
 		if err != nil {
 			return err
 		}
@@ -405,7 +443,11 @@ func (s *Server) runOCIContextSetupCommands(
 			s.logger,
 			cmd,
 			"runtime context setup command",
+			runLogs,
+			runLogs,
 		)
+		runLogs.Flush()
+
 		cleanupErr := cleanup()
 		if err != nil {
 			return fmt.Errorf(
@@ -448,13 +490,14 @@ func (s *Server) newOCICommand(
 	workdir string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	handle := contextHandle{
 		dir:       filepath.Join(s.contextsRoot(), request.ContextID),
 		workspace: workspace,
 	}
 
-	prepared, err := s.ensurePreparedOCIRuntime(ctx, handle, request, preparedRuntime)
+	prepared, err := s.ensurePreparedOCIRuntime(ctx, handle, request, preparedRuntime, runLogs)
 	if err != nil {
 		return nil, noopCommandCleanup, err
 	}
@@ -557,12 +600,13 @@ func (s *Server) ensurePreparedOCIRuntime(
 	handle contextHandle,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (preparedRuntime, error) {
 	if preparedRuntime != nil {
 		return *preparedRuntime, nil
 	}
 
-	return s.prepareOCIRuntime(ctx, handle, request)
+	return s.prepareOCIRuntime(ctx, handle, request, runLogs)
 }
 
 func ociWorkspaceTargets(workspace, workdir, configuredWorkdir string) (string, string) {

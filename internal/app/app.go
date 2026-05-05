@@ -61,12 +61,14 @@ type RemoteParams struct {
 	AddressOverride  string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
+	Stderr           io.Writer
 }
 
 type ContextDeleteParams struct {
 	AddressOverride  string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
+	Stderr           io.Writer
 	IDs              []string
 	All              bool
 	OlderThan        time.Duration
@@ -77,6 +79,7 @@ type ContextArtifactsParams struct {
 	AddressOverride  string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
+	Stderr           io.Writer
 	ContextID        string
 	Current          bool
 	Prune            bool
@@ -103,6 +106,7 @@ type PairParams struct {
 	Fingerprint      string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
+	Stderr           io.Writer
 	Code             string
 	ClientLabel      string
 	SelectionIndex   int
@@ -115,6 +119,7 @@ type InitParams struct {
 	Fingerprint      string
 	ConfigPath       string
 	DiscoveryTimeout time.Duration
+	Stderr           io.Writer
 	Code             string
 	ClientLabel      string
 	SelectionIndex   int
@@ -357,6 +362,7 @@ func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingI
 		Host:             *hostRecord,
 		ClientCertPEM:    []byte(clientCertPEM),
 		ClientKeyPEM:     []byte(clientKeyPEM),
+		Stderr:           params.Stderr,
 	})
 }
 
@@ -383,6 +389,7 @@ func RunListContexts(
 		Host:             *hostRecord,
 		ClientCertPEM:    []byte(clientCertPEM),
 		ClientKeyPEM:     []byte(clientKeyPEM),
+		Stderr:           params.Stderr,
 	})
 }
 
@@ -398,6 +405,7 @@ func RunDeleteContexts(
 			AddressOverride:  params.AddressOverride,
 			ConfigPath:       params.ConfigPath,
 			DiscoveryTimeout: params.DiscoveryTimeout,
+			Stderr:           params.Stderr,
 		},
 	)
 	if err != nil {
@@ -421,6 +429,7 @@ func RunDeleteContexts(
 			Address:          address,
 			DiscoveryService: service,
 			Host:             *hostRecord,
+			Stderr:           params.Stderr,
 		},
 		IDs: ids,
 		All: params.All,
@@ -454,6 +463,7 @@ func RunContextArtifacts(
 			AddressOverride:  params.AddressOverride,
 			ConfigPath:       params.ConfigPath,
 			DiscoveryTimeout: params.DiscoveryTimeout,
+			Stderr:           params.Stderr,
 		},
 	)
 	if err != nil {
@@ -486,6 +496,7 @@ func RunContextArtifacts(
 			Host:             *hostRecord,
 			ClientCertPEM:    []byte(clientCertPEM),
 			ClientKeyPEM:     []byte(clientKeyPEM),
+			Stderr:           params.Stderr,
 		},
 		ContextID: contextID,
 		Prune:     params.Prune,
@@ -517,6 +528,7 @@ func RunCachePrune(
 		Host:             *hostRecord,
 		ClientCertPEM:    []byte(clientCertPEM),
 		ClientKeyPEM:     []byte(clientKeyPEM),
+		Stderr:           params.Stderr,
 	})
 }
 
@@ -638,6 +650,7 @@ func completePair(
 		ClientLabel:         label,
 		PreviousFingerprint: previousFingerprint,
 		CSRPEM:              csrPEM,
+		Stderr:              params.Stderr,
 	})
 	if err != nil {
 		return clientstate.HostRecord{}, err
@@ -741,6 +754,7 @@ func resolvePairCode(
 		DiscoveryService: result.Service,
 		Host:             pairRemoteHost(result),
 		ClientLabel:      label,
+		Stderr:           params.Stderr,
 	})
 	if err != nil {
 		return "", err
@@ -773,7 +787,7 @@ func promptForPairCode(params *PairParams, response client.PairCodeResult) (stri
 
 	_, _ = fmt.Fprintf(
 		params.Stdout,
-		"pair code shown on %s; expires %s\nEnter code: ",
+		"pair code requested from %s; expires %s\nEnter code: ",
 		hostName,
 		response.ExpiresAt.Format(time.RFC3339),
 	)

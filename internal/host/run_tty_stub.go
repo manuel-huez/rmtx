@@ -10,21 +10,14 @@ import (
 )
 
 func (s *Server) runTTYCommand(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	conn *protocol.Conn,
-	workspace string,
-	workdir string,
-	request protocol.RunRequest,
-	preparedRuntime *preparedRuntime,
+	_ context.Context,
+	_ context.CancelFunc,
+	_ *protocol.Conn,
+	_ string,
+	_ string,
+	_ protocol.RunRequest,
+	_ *preparedRuntime,
+	_ *hostLogSubscription,
 ) (int, error) {
-	_ = ctx
-	_ = cancel
-	_ = conn
-	_ = workspace
-	_ = workdir
-	_ = request
-	_ = preparedRuntime
-
 	return 1, errors.New("interactive TTY is not supported on this platform")
 }

@@ -879,7 +879,7 @@ func TestRunPairRequestsCodeWhenCodeOmitted(t *testing.T) {
 	}
 
 	output := stdout.String()
-	if !strings.Contains(output, "pair code shown on") {
+	if !strings.Contains(output, "pair code requested from") {
 		t.Fatalf("expected pair prompt in stdout, got %q", output)
 	}
 

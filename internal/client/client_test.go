@@ -3,7 +3,9 @@ package client
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
@@ -63,6 +66,99 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
 	}
+}
+
+func TestRunHandshakeStreamsSetupOutput(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+
+	serverErr := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		serverErr <- serveHandshakeSetupOutput(protocol.NewConn(serverConn))
+	}()
+
+	var stderr bytes.Buffer
+
+	ready, err := runHandshake(
+		context.Background(),
+		protocol.NewConn(clientConn),
+		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{"true"}},
+		nil,
+		ExecOptions{Stderr: &stderr},
+		newRunLogger(&bytes.Buffer{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ready.ContextID != "ctx" {
+		t.Fatalf("ready context=%s want ctx", ready.ContextID)
+	}
+
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"image setup before sync\n",
+		"image setup before ready\n",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("missing setup output %q in %q", want, stderr.String())
+		}
+	}
+}
+
+func serveHandshakeSetupOutput(conn *protocol.Conn) error {
+	if err := expectDiscardedClientFrame(conn, protocol.MsgRunRequest); err != nil {
+		return err
+	}
+
+	if err := writeSetupStderr(conn, "image setup before sync\n"); err != nil {
+		return err
+	}
+
+	if err := conn.WriteJSON(protocol.MsgNeedBlobs, protocol.NeedBlobs{}); err != nil {
+		return err
+	}
+
+	if err := expectDiscardedClientFrame(conn, protocol.MsgSyncComplete); err != nil {
+		return err
+	}
+
+	if err := writeSetupStderr(conn, "image setup before ready\n"); err != nil {
+		return err
+	}
+
+	return conn.WriteJSON(
+		protocol.MsgWorkspaceReady,
+		protocol.WorkspaceReady{ContextID: "ctx", Workspace: "/tmp/rmtx"},
+	)
+}
+
+func expectDiscardedClientFrame(conn *protocol.Conn, wantType string) error {
+	head, err := conn.ReadHeader()
+	if err != nil {
+		return err
+	}
+
+	if head.Type != wantType {
+		return fmt.Errorf("expected %s, got %s", wantType, head.Type)
+	}
+
+	return conn.DiscardPayload(head)
+}
+
+func writeSetupStderr(conn *protocol.Conn, output string) error {
+	return conn.WriteBytes(
+		protocol.MsgExecOutput,
+		protocol.OutputInfo{Stream: "stderr"},
+		[]byte(output),
+	)
 }
 
 type lockedBuffer struct {

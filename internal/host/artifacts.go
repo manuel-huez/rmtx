@@ -17,6 +17,7 @@ import (
 func (s *Server) handleContextArtifacts(
 	conn *protocol.Conn,
 	req protocol.ContextArtifactsRequest,
+	requestLogs *hostLogSubscription,
 ) error {
 	contextID, err := normalizeContextID(req.ContextID)
 	if err != nil {
@@ -59,11 +60,16 @@ func (s *Server) handleContextArtifacts(
 		return err
 	}
 
-	return conn.WriteJSON(protocol.MsgContextArtifactsResponse, protocol.ContextArtifactsResponse{
-		ContextID: contextID,
-		Artifacts: artifacts,
-		Deleted:   deleted,
-	})
+	return writeJSONAfterLogs(
+		conn,
+		requestLogs,
+		protocol.MsgContextArtifactsResponse,
+		protocol.ContextArtifactsResponse{
+			ContextID: contextID,
+			Artifacts: artifacts,
+			Deleted:   deleted,
+		},
+	)
 }
 
 func (s *Server) deleteContextArtifact(
@@ -191,16 +197,24 @@ func (s *Server) listContextArtifacts(
 	return out, nil
 }
 
-func (s *Server) handleCachePrune(conn *protocol.Conn) error {
+func (s *Server) handleCachePrune(
+	conn *protocol.Conn,
+	requestLogs *hostLogSubscription,
+) error {
 	deleted, bytes, err := s.pruneUnreferencedOCICache()
 	if err != nil {
 		return err
 	}
 
-	return conn.WriteJSON(protocol.MsgCachePruneResponse, protocol.CachePruneResponse{
-		Deleted: deleted,
-		Bytes:   bytes,
-	})
+	return writeJSONAfterLogs(
+		conn,
+		requestLogs,
+		protocol.MsgCachePruneResponse,
+		protocol.CachePruneResponse{
+			Deleted: deleted,
+			Bytes:   bytes,
+		},
+	)
 }
 
 func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64, error) {

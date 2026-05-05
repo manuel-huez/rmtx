@@ -325,6 +325,7 @@ func pairLikeParams(flags pairLikeFlags) app.PairParams {
 		AddressOverride:  *flags.hostAddr,
 		ConfigPath:       *flags.cfgPath,
 		DiscoveryTimeout: *flags.discoveryTimeout,
+		Stderr:           os.Stderr,
 		Code:             *flags.code,
 		ClientLabel:      *flags.label,
 		SelectionIndex:   *flags.selectIndex,
@@ -622,6 +623,7 @@ func runContextArtifactsCommand(
 	artifactParams.AddressOverride = params.AddressOverride
 	artifactParams.ConfigPath = params.ConfigPath
 	artifactParams.DiscoveryTimeout = params.DiscoveryTimeout
+	artifactParams.Stderr = params.Stderr
 	artifactParams.ContextID = *contextID
 	artifactParams.Current = *current || *contextID == ""
 
@@ -772,6 +774,7 @@ func (r remoteFlags) params() app.RemoteParams {
 		AddressOverride:  *r.hostAddr,
 		ConfigPath:       *r.cfgPath,
 		DiscoveryTimeout: *r.discoveryTimeout,
+		Stderr:           os.Stderr,
 	}
 }
 
@@ -780,6 +783,7 @@ func (r remoteFlags) deleteParams() app.ContextDeleteParams {
 		AddressOverride:  *r.hostAddr,
 		ConfigPath:       *r.cfgPath,
 		DiscoveryTimeout: *r.discoveryTimeout,
+		Stderr:           os.Stderr,
 	}
 }
 

@@ -190,7 +190,8 @@ func wslInstalledDistros() ([]string, error) {
 
 		return nil, fmt.Errorf("open WSL distro registry key: %w", err)
 	}
-	defer key.Close()
+
+	defer func() { _ = key.Close() }()
 
 	subkeys, err := key.ReadSubKeyNames(-1)
 	if err != nil {
@@ -210,6 +211,7 @@ func wslInstalledDistros() ([]string, error) {
 
 		name, _, err := distroKey.GetStringValue("DistributionName")
 		_ = distroKey.Close()
+
 		if err != nil {
 			if errors.Is(err, registry.ErrNotExist) {
 				continue
@@ -247,7 +249,7 @@ func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) er
 	)
 	cmd.Env = os.Environ()
 
-	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro)
+	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro, nil, nil)
 	if err != nil {
 		return fmt.Errorf(
 			"install WSL distro %q: %s: %w",

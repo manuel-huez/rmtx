@@ -58,6 +58,7 @@ type RemoteOptions struct {
 	Host             clientstate.HostRecord
 	ClientCertPEM    []byte
 	ClientKeyPEM     []byte
+	Stderr           io.Writer
 }
 
 type PingInfo = protocol.PingResponse
@@ -647,7 +648,11 @@ func runHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
-	need, err := expectDataFrame[protocol.NeedBlobs](conn, protocol.MsgNeedBlobs)
+	need, err := expectDataFrameWithOutput[protocol.NeedBlobs](
+		conn,
+		protocol.MsgNeedBlobs,
+		opts.Stderr,
+	)
 	if err != nil {
 		return protocol.WorkspaceReady{}, err
 	}
@@ -662,7 +667,47 @@ func runHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
-	return expectDataFrame[protocol.WorkspaceReady](conn, protocol.MsgWorkspaceReady)
+	return expectDataFrameWithOutput[protocol.WorkspaceReady](
+		conn,
+		protocol.MsgWorkspaceReady,
+		opts.Stderr,
+	)
+}
+
+func expectDataFrameWithOutput[T any](
+	conn *protocol.Conn,
+	wantType string,
+	output io.Writer,
+) (T, error) {
+	var zero T
+
+	if output == nil {
+		output = io.Discard
+	}
+
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return zero, err
+		}
+
+		switch head.Type {
+		case protocol.MsgError:
+			return zero, decodeServerError(head)
+		case protocol.MsgExecOutput:
+			if err := copyExecOutputTo(conn, head, output); err != nil {
+				return zero, err
+			}
+		case wantType:
+			return protocol.DecodeData[T](head)
+		default:
+			if err := conn.DiscardPayload(head); err != nil {
+				return zero, err
+			}
+
+			return zero, fmt.Errorf("expected %s, got %s", wantType, head.Type)
+		}
+	}
 }
 
 func processExecFrames(
@@ -852,6 +897,26 @@ func copyExecOutput(conn *protocol.Conn, head protocol.Header, opts ExecOptions)
 	return err
 }
 
+func copyExecOutputTo(conn *protocol.Conn, head protocol.Header, stderr io.Writer) error {
+	info, err := protocol.DecodeData[protocol.OutputInfo](head)
+	if err != nil {
+		return err
+	}
+
+	dst := stderr
+	if info.Stream == "stdout" {
+		dst = io.Discard
+	}
+
+	if dst == nil {
+		dst = io.Discard
+	}
+
+	_, err = io.Copy(dst, conn.PayloadReader(head))
+
+	return err
+}
+
 func decodeExitCode(head protocol.Header) (int, error) {
 	info, err := protocol.DecodeData[protocol.ExitInfo](head)
 	if err != nil {
@@ -975,33 +1040,6 @@ func changeSetFileTotals(entries []syncfs.Entry) (int, int64) {
 	return files, bytes
 }
 
-func expectFrame(conn *protocol.Conn, wantType string) (protocol.Header, error) {
-	head, err := conn.ReadHeader()
-	if err != nil {
-		return protocol.Header{}, err
-	}
-
-	if head.Type == protocol.MsgError {
-		return protocol.Header{}, decodeServerError(head)
-	}
-
-	if head.Type != wantType {
-		return protocol.Header{}, fmt.Errorf("expected %s, got %s", wantType, head.Type)
-	}
-
-	return head, nil
-}
-
-func expectDataFrame[T any](conn *protocol.Conn, wantType string) (T, error) {
-	head, err := expectFrame(conn, wantType)
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-
-	return protocol.DecodeData[T](head)
-}
-
 type PairOptions struct {
 	Address             string
 	DiscoveryService    string
@@ -1010,6 +1048,7 @@ type PairOptions struct {
 	ClientLabel         string
 	PreviousFingerprint string
 	CSRPEM              []byte
+	Stderr              io.Writer
 }
 
 type PairResult = protocol.PairResponse
@@ -1027,7 +1066,11 @@ func RequestPairCode(ctx context.Context, opts PairOptions) (PairCodeResult, err
 		return PairCodeResult{}, err
 	}
 
-	return expectDataFrame[protocol.PairCodeResponse](conn, protocol.MsgPairCodeResponse)
+	return expectDataFrameWithOutput[protocol.PairCodeResponse](
+		conn,
+		protocol.MsgPairCodeResponse,
+		opts.Stderr,
+	)
 }
 
 func PairHost(ctx context.Context, opts PairOptions) (PairResult, error) {
@@ -1047,7 +1090,11 @@ func PairHost(ctx context.Context, opts PairOptions) (PairResult, error) {
 		return PairResult{}, err
 	}
 
-	return expectDataFrame[protocol.PairResponse](conn, protocol.MsgPairResponse)
+	return expectDataFrameWithOutput[protocol.PairResponse](
+		conn,
+		protocol.MsgPairResponse,
+		opts.Stderr,
+	)
 }
 
 func GenerateClientIdentity(label string) ([]byte, []byte, []byte, error) {

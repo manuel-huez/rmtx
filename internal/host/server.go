@@ -53,6 +53,7 @@ type Server struct {
 	listener    net.Listener
 	blobStore   *syncfs.BlobStore
 	logger      *log.Logger
+	logHub      *hostLogHub
 	advertiser  *discovery.Responder
 	tlsConfig   *tls.Config
 	hostPKI     security.HostPKI
@@ -106,10 +107,14 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 
+	logHub := newHostLogHub(opts.Logger.Writer())
+	logger := log.New(logHub, opts.Logger.Prefix(), opts.Logger.Flags())
+
 	return &Server{
 		opts:           opts,
 		blobStore:      store,
-		logger:         opts.Logger,
+		logger:         logger,
+		logHub:         logHub,
 		tlsConfig:      tlsConfig,
 		hostPKI:        hostPKI,
 		fingerprint:    fingerprint,
@@ -294,14 +299,23 @@ func (s *Server) handleConnSession(parent context.Context, conn *protocol.Conn) 
 		return err
 	}
 
+	var requestLogs *hostLogSubscription
+	if head.Type == protocol.MsgRunRequest {
+		requestLogs = s.logHub.Subscribe(conn)
+		defer requestLogs.Close()
+	}
+
 	s.logger.Printf("request received: remote=%s type=%s", conn.Raw().RemoteAddr(), head.Type)
 
-	if err := s.dispatchSessionRequest(parent, conn, head); err != nil {
+	if err := s.dispatchSessionRequest(parent, conn, head, requestLogs); err != nil {
 		if isDisconnectError(err) {
 			return nil
 		}
 
-		return err
+		s.logger.Printf("request failed: remote=%s error=%v", conn.Raw().RemoteAddr(), err)
+		requestLogs.Flush()
+
+		return conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
 
 	return nil
@@ -311,6 +325,7 @@ func (s *Server) handleRunRequest(
 	parent context.Context,
 	conn *protocol.Conn,
 	request protocol.RunRequest,
+	runLogs *hostLogSubscription,
 ) error {
 	if err := validateRunRequest(request); err != nil {
 		return err
@@ -334,7 +349,12 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	runtimePrep, hasPreparedRuntime, err := s.prepareRuntimeBeforeSync(parent, handle, request)
+	runtimePrep, hasPreparedRuntime, err := s.prepareRuntimeBeforeSync(
+		parent,
+		handle,
+		request,
+		runLogs,
+	)
 	if err != nil {
 		return err
 	}
@@ -357,6 +377,7 @@ func (s *Server) handleRunRequest(
 		handle.workspace,
 		currentManifest,
 		request.Manifest,
+		runLogs,
 	); err != nil {
 		return err
 	}
@@ -365,11 +386,13 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
+	runLogs.Flush()
+
 	if err := writeWorkspaceReady(conn, request.ContextID, handle); err != nil {
 		return err
 	}
 
-	return s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef)
+	return s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef, runLogs)
 }
 
 //nolint:cyclop // Protocol dispatch is deliberately centralized.
@@ -377,13 +400,14 @@ func (s *Server) dispatchSessionRequest(
 	parent context.Context,
 	conn *protocol.Conn,
 	head protocol.Header,
+	requestLogs *hostLogSubscription,
 ) error {
 	if head.Type == protocol.MsgPairCodeRequest {
-		return s.dispatchPairCodeRequest(conn, head)
+		return s.dispatchPairCodeRequest(conn, head, requestLogs)
 	}
 
 	if head.Type == protocol.MsgPairRequest {
-		return s.dispatchPairRequest(conn, head)
+		return s.dispatchPairRequest(conn, head, requestLogs)
 	}
 
 	if _, err := s.requireTrustedClient(conn); err != nil {
@@ -392,19 +416,25 @@ func (s *Server) dispatchSessionRequest(
 
 	switch head.Type {
 	case protocol.MsgRunRequest:
-		return s.dispatchRunRequest(parent, conn, head)
+		return s.dispatchRunRequest(parent, conn, head, requestLogs)
 	case protocol.MsgBlobUploadRequest:
 		return s.dispatchBlobUploadRequest(conn, head)
 	case protocol.MsgPingRequest:
-		return s.discardAndHandle(head, conn, s.handlePing)
+		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
+			return s.handlePing(conn, requestLogs)
+		})
 	case protocol.MsgListContextsRequest:
-		return s.discardAndHandle(head, conn, s.handleListContexts)
+		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
+			return s.handleListContexts(conn, requestLogs)
+		})
 	case protocol.MsgDeleteContextsRequest:
-		return s.dispatchDeleteContexts(conn, head)
+		return s.dispatchDeleteContexts(conn, head, requestLogs)
 	case protocol.MsgContextArtifactsRequest:
-		return s.dispatchContextArtifacts(conn, head)
+		return s.dispatchContextArtifacts(conn, head, requestLogs)
 	case protocol.MsgCachePruneRequest:
-		return s.discardAndHandle(head, conn, s.handleCachePrune)
+		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
+			return s.handleCachePrune(conn, requestLogs)
+		})
 	default:
 		if err := conn.DiscardPayload(head); err != nil {
 			return err
@@ -414,35 +444,44 @@ func (s *Server) dispatchSessionRequest(
 	}
 }
 
-func (s *Server) dispatchPairCodeRequest(conn *protocol.Conn, head protocol.Header) error {
+func (s *Server) dispatchPairCodeRequest(
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
 	req, err := protocol.DecodeData[protocol.PairCodeRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handlePairCodeRequest(conn, req)
+	return s.handlePairCodeRequest(conn, req, requestLogs)
 }
 
-func (s *Server) dispatchPairRequest(conn *protocol.Conn, head protocol.Header) error {
+func (s *Server) dispatchPairRequest(
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
 	req, err := protocol.DecodeData[protocol.PairRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handlePairRequest(conn, req)
+	return s.handlePairRequest(conn, req, requestLogs)
 }
 
 func (s *Server) dispatchRunRequest(
 	parent context.Context,
 	conn *protocol.Conn,
 	head protocol.Header,
+	runLogs *hostLogSubscription,
 ) error {
 	req, err := protocol.DecodeData[protocol.RunRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handleRunRequest(parent, conn, req)
+	return s.handleRunRequest(parent, conn, req, runLogs)
 }
 
 func (s *Server) dispatchBlobUploadRequest(conn *protocol.Conn, head protocol.Header) error {
@@ -454,22 +493,30 @@ func (s *Server) dispatchBlobUploadRequest(conn *protocol.Conn, head protocol.He
 	return s.handleBlobUploadRequest(conn, req)
 }
 
-func (s *Server) dispatchDeleteContexts(conn *protocol.Conn, head protocol.Header) error {
+func (s *Server) dispatchDeleteContexts(
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
 	req, err := protocol.DecodeData[protocol.DeleteContextsRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handleDeleteContexts(conn, req)
+	return s.handleDeleteContexts(conn, req, requestLogs)
 }
 
-func (s *Server) dispatchContextArtifacts(conn *protocol.Conn, head protocol.Header) error {
+func (s *Server) dispatchContextArtifacts(
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
 	req, err := protocol.DecodeData[protocol.ContextArtifactsRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handleContextArtifacts(conn, req)
+	return s.handleContextArtifacts(conn, req, requestLogs)
 }
 
 func (s *Server) discardAndHandle(
@@ -511,17 +558,40 @@ func writeWorkspaceReady(conn *protocol.Conn, contextID string, handle contextHa
 	)
 }
 
+func writeJSONAfterLogs(
+	conn *protocol.Conn,
+	requestLogs *hostLogSubscription,
+	msgType string,
+	payload any,
+) error {
+	requestLogs.Flush()
+
+	return conn.WriteJSON(msgType, payload)
+}
+
 func (s *Server) executeAndSyncRun(
 	parent context.Context,
 	conn *protocol.Conn,
 	handle contextHandle,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) error {
-	code, runErr := s.executeRequest(parent, conn, handle.workspace, request, preparedRuntime)
+	code, runErr := s.executeRequest(
+		parent,
+		conn,
+		handle.workspace,
+		request,
+		preparedRuntime,
+		runLogs,
+	)
+	runLogs.Flush()
+
 	if err := writeUserVisibleRunError(conn, runErr); err != nil {
 		return err
 	}
+
+	runLogs.Flush()
 
 	if err := conn.WriteJSON(protocol.MsgExecExit, protocol.ExitInfo{Code: code}); err != nil {
 		return err
@@ -585,6 +655,8 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
+	runLogs.Flush()
+
 	if err := conn.WriteJSON(protocol.MsgChangesDone, nil); err != nil {
 		return err
 	}
@@ -596,7 +668,10 @@ func (s *Server) executeAndSyncRun(
 	return nil
 }
 
-func (s *Server) handlePing(conn *protocol.Conn) error {
+func (s *Server) handlePing(
+	conn *protocol.Conn,
+	requestLogs *hostLogSubscription,
+) error {
 	contexts, err := s.listContexts()
 	if err != nil {
 		return err
@@ -608,7 +683,7 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 		len(contexts),
 	)
 
-	return conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
+	return writeJSONAfterLogs(conn, requestLogs, protocol.MsgPingResponse, protocol.PingResponse{
 		Online:       true,
 		Version:      version.String(),
 		Name:         s.hostName(),
@@ -619,7 +694,10 @@ func (s *Server) handlePing(conn *protocol.Conn) error {
 	})
 }
 
-func (s *Server) handleListContexts(conn *protocol.Conn) error {
+func (s *Server) handleListContexts(
+	conn *protocol.Conn,
+	requestLogs *hostLogSubscription,
+) error {
 	contexts, err := s.listContexts()
 	if err != nil {
 		return err
@@ -632,7 +710,9 @@ func (s *Server) handleListContexts(conn *protocol.Conn) error {
 		formatContextSummaryIDs(contexts),
 	)
 
-	return conn.WriteJSON(
+	return writeJSONAfterLogs(
+		conn,
+		requestLogs,
 		protocol.MsgListContextsResponse,
 		protocol.ListContextsResponse{Contexts: contexts},
 	)
@@ -641,6 +721,7 @@ func (s *Server) handleListContexts(conn *protocol.Conn) error {
 func (s *Server) handleDeleteContexts(
 	conn *protocol.Conn,
 	req protocol.DeleteContextsRequest,
+	requestLogs *hostLogSubscription,
 ) error {
 	s.logger.Printf(
 		"context delete requested: remote=%s ids=%s all=%t older_than=%q",
@@ -662,7 +743,7 @@ func (s *Server) handleDeleteContexts(
 		formatStrings(resp.NotFound),
 	)
 
-	return conn.WriteJSON(protocol.MsgDeleteContextsResponse, resp)
+	return writeJSONAfterLogs(conn, requestLogs, protocol.MsgDeleteContextsResponse, resp)
 }
 
 func (s *Server) executeRequest(
@@ -671,11 +752,20 @@ func (s *Server) executeRequest(
 	workspace string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (int, error) {
 	sessionCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	code, runErr := s.runCommand(sessionCtx, cancel, conn, workspace, request, preparedRuntime)
+	code, runErr := s.runCommand(
+		sessionCtx,
+		cancel,
+		conn,
+		workspace,
+		request,
+		preparedRuntime,
+		runLogs,
+	)
 	if runErr != nil {
 		s.logger.Printf(
 			"session %s context %s exited with error: %v",
@@ -959,7 +1049,11 @@ func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, e
 	return clientCert, nil
 }
 
-func (s *Server) handlePairCodeRequest(conn *protocol.Conn, req protocol.PairCodeRequest) error {
+func (s *Server) handlePairCodeRequest(
+	conn *protocol.Conn,
+	req protocol.PairCodeRequest,
+	requestLogs *hostLogSubscription,
+) error {
 	info, err := createPairCodeInfo(s.opts.StateDir, s.hostName(), 0)
 	if err != nil {
 		return err
@@ -983,13 +1077,22 @@ func (s *Server) handlePairCodeRequest(conn *protocol.Conn, req protocol.PairCod
 		info.ExpiresAt.Format(time.RFC3339),
 	)
 
-	return conn.WriteJSON(protocol.MsgPairCodeResponse, protocol.PairCodeResponse{
-		HostName:  info.HostName,
-		ExpiresAt: info.ExpiresAt,
-	})
+	return writeJSONAfterLogs(
+		conn,
+		requestLogs,
+		protocol.MsgPairCodeResponse,
+		protocol.PairCodeResponse{
+			HostName:  info.HostName,
+			ExpiresAt: info.ExpiresAt,
+		},
+	)
 }
 
-func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest) error {
+func (s *Server) handlePairRequest(
+	conn *protocol.Conn,
+	req protocol.PairRequest,
+	requestLogs *hostLogSubscription,
+) error {
 	return withPairCode(s.opts.StateDir, req.Code, func() error {
 		if strings.TrimSpace(req.CSRPEM) == "" {
 			return errors.New("csr is required")
@@ -1009,10 +1112,15 @@ func (s *Server) handlePairRequest(conn *protocol.Conn, req protocol.PairRequest
 			return err
 		}
 
-		return conn.WriteJSON(protocol.MsgPairResponse, protocol.PairResponse{
-			ClientCertPEM: string(clientCertPEM),
-			Fingerprint:   fingerprint,
-		})
+		return writeJSONAfterLogs(
+			conn,
+			requestLogs,
+			protocol.MsgPairResponse,
+			protocol.PairResponse{
+				ClientCertPEM: string(clientCertPEM),
+				Fingerprint:   fingerprint,
+			},
+		)
 	})
 }
 
@@ -1175,6 +1283,7 @@ func (s *Server) runCommand(
 	workspace string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (int, error) {
 	workdir, err := secureJoin(workspace, request.WorkDir)
 	if err != nil {
@@ -1205,6 +1314,7 @@ func (s *Server) runCommand(
 			workdir,
 			request,
 			preparedRuntime,
+			runLogs,
 		)
 	case isOCIRuntime(request.Runtime):
 		code, runErr = s.runOCIPipeCommand(
@@ -1215,6 +1325,7 @@ func (s *Server) runCommand(
 			workdir,
 			request,
 			preparedRuntime,
+			runLogs,
 		)
 	default:
 		code, runErr = s.runPipeCommand(ctx, cancel, conn, workspace, workdir, request)

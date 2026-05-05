@@ -550,6 +550,7 @@ func (s *Server) syncContextFromClient(
 	workspace string,
 	current []syncfs.Entry,
 	target []syncfs.Entry,
+	runLogs *hostLogSubscription,
 ) error {
 	changed, deleted := syncfs.Diff(current, target, syncfs.DiffOptions{})
 
@@ -570,6 +571,8 @@ func (s *Server) syncContextFromClient(
 		len(deleted),
 		len(missing),
 	)
+
+	runLogs.Flush()
 
 	if err := conn.WriteJSON(
 		protocol.MsgNeedBlobs,

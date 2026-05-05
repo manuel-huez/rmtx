@@ -17,7 +17,11 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 		return PingInfo{}, err
 	}
 
-	return expectDataFrame[protocol.PingResponse](conn, protocol.MsgPingResponse)
+	return expectDataFrameWithOutput[protocol.PingResponse](
+		conn,
+		protocol.MsgPingResponse,
+		opts.Stderr,
+	)
 }
 
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
@@ -34,9 +38,10 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 		return nil, err
 	}
 
-	resp, err := expectDataFrame[protocol.ListContextsResponse](
+	resp, err := expectDataFrameWithOutput[protocol.ListContextsResponse](
 		conn,
 		protocol.MsgListContextsResponse,
+		opts.Stderr,
 	)
 	if err != nil {
 		return nil, err
@@ -61,9 +66,10 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 		return DeleteContextsResult{}, err
 	}
 
-	return expectDataFrame[protocol.DeleteContextsResponse](
+	return expectDataFrameWithOutput[protocol.DeleteContextsResponse](
 		conn,
 		protocol.MsgDeleteContextsResponse,
+		opts.Remote.Stderr,
 	)
 }
 
@@ -87,9 +93,10 @@ func ContextArtifacts(
 		return ContextArtifactsResult{}, err
 	}
 
-	return expectDataFrame[protocol.ContextArtifactsResponse](
+	return expectDataFrameWithOutput[protocol.ContextArtifactsResponse](
 		conn,
 		protocol.MsgContextArtifactsResponse,
+		opts.Remote.Stderr,
 	)
 }
 
@@ -107,9 +114,10 @@ func CachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, erro
 		return CachePruneResult{}, err
 	}
 
-	return expectDataFrame[protocol.CachePruneResponse](
+	return expectDataFrameWithOutput[protocol.CachePruneResponse](
 		conn,
 		protocol.MsgCachePruneResponse,
+		opts.Stderr,
 	)
 }
 

@@ -17,8 +17,16 @@ func (s *Server) runTTYCommand(
 	workdir string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (int, error) {
-	cmd, cleanup, err := s.newTTYSessionCommand(ctx, workspace, workdir, request, preparedRuntime)
+	cmd, cleanup, err := s.newTTYSessionCommand(
+		ctx,
+		workspace,
+		workdir,
+		request,
+		preparedRuntime,
+		runLogs,
+	)
 	if err != nil {
 		return 1, err
 	}
@@ -34,13 +42,22 @@ func (s *Server) newTTYSessionCommand(
 	workdir string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	if isOCIRuntime(request.Runtime) {
-		if err := s.prepareOCIContextSetup(ctx, workspace, request, preparedRuntime); err != nil {
+		if err := s.prepareOCIContextSetup(
+			ctx,
+			workspace,
+			request,
+			preparedRuntime,
+			runLogs,
+		); err != nil {
 			return nil, noopCommandCleanup, err
 		}
 
-		return s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime)
+		runLogs.Flush()
+
+		return s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime, runLogs)
 	}
 
 	return s.newSessionCommand(ctx, workspace, workdir, request), noopCommandCleanup, nil

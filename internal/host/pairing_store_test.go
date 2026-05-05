@@ -137,7 +137,7 @@ func TestHandlePairRequestKeepsCodeOnValidationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = server.handlePairRequest(nil, protocol.PairRequest{Code: record.Code})
+	err = server.handlePairRequest(nil, protocol.PairRequest{Code: record.Code}, nil)
 	if err == nil {
 		t.Fatal("expected pair request to fail without csr")
 	}
@@ -174,7 +174,7 @@ func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 		Code:        record.Code,
 		ClientLabel: "retry-client",
 		CSRPEM:      string(csrPEM),
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected pair response write to fail")
 	}

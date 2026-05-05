@@ -139,7 +139,7 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	}
 
 	go func() {
-		err := server.handleRunRequest(ctx, protocol.NewConn(serverConn), request)
+		err := server.handleRunRequest(ctx, protocol.NewConn(serverConn), request, nil)
 		done <- err
 	}()
 
