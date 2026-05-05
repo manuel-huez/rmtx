@@ -265,14 +265,14 @@ func TestRuntimeCacheKeyIncludesSetupRuntimeOptions(t *testing.T) {
 		Image:   "node:22",
 		Network: "host",
 		User:    "root",
-		GPU:     "none",
+		GPU:     noneValue,
 		Setup: protocol.RuntimeSetup{
 			ImageCommands: []string{"apt-get update"},
 		},
 	}
 
 	networkNone := base
-	networkNone.Network = "none"
+	networkNone.Network = noneValue
 
 	withGPU := base
 	withGPU.GPU = "nvidia"
@@ -318,7 +318,7 @@ func TestContextSetupKeyIncludesRuntimeIdentity(t *testing.T) {
 		WorkDir: "/workspace",
 		Network: "host",
 		User:    "root",
-		GPU:     "none",
+		GPU:     noneValue,
 		Setup: protocol.RuntimeSetup{
 			ContextCommands: []string{"npm ci"},
 			ContextInputs:   []string{"package-lock.json"},
@@ -356,7 +356,7 @@ func TestContextSetupKeyIncludesCommandWorkdir(t *testing.T) {
 		WorkDir: "/workspace",
 		Network: "host",
 		User:    "root",
-		GPU:     "none",
+		GPU:     noneValue,
 		Setup: protocol.RuntimeSetup{
 			ContextCommands: []string{"npm ci"},
 			ContextInputs:   []string{"package-lock.json"},

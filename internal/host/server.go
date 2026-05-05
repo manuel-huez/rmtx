@@ -33,6 +33,7 @@ const (
 	pipeCount          = 2
 	exitCodeNotFound   = 127
 	defaultFileMode    = 0o644
+	noneValue          = "none"
 	reverseDialTimeout = 5 * time.Second
 	progressEvery      = 3 * time.Second
 	blobUploadParallel = 4
@@ -568,6 +569,7 @@ func (s *Server) executeAndSyncRun(
 	if err != nil {
 		return err
 	}
+
 	defer func() {
 		if closeCompressed != nil {
 			_ = closeCompressed()
@@ -705,6 +707,7 @@ func (s *Server) sendWorkspaceChanges(
 	)
 
 	var closeCompressed func() error
+
 	if compression != "" {
 		if err := conn.WriteJSON(
 			protocol.MsgSyncCompressionStart,
@@ -714,6 +717,7 @@ func (s *Server) sendWorkspaceChanges(
 		}
 
 		var err error
+
 		closeCompressed, err = conn.EnableZstdWriter()
 		if err != nil {
 			return nil, err
@@ -781,7 +785,7 @@ func formatSyncBack(paths []string) string {
 	}
 
 	if len(paths) == 0 {
-		return "none"
+		return noneValue
 	}
 
 	return formatStrings(paths)
@@ -1249,19 +1253,9 @@ func (s *Server) runPipeExecCommand(
 	cancelRun := s.commandCancel(cmd, cancel)
 	defer cancelRun()
 
-	stdin, err := cmd.StdinPipe()
+	stdin, stdout, stderr, err := commandPipes(cmd)
 	if err != nil {
-		return 1, fmt.Errorf("open stdin pipe: %w", err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return 1, fmt.Errorf("open stdout pipe: %w", err)
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return 1, fmt.Errorf("open stderr pipe: %w", err)
+		return 1, err
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -1317,6 +1311,25 @@ func (s *Server) runPipeExecCommand(
 	}
 
 	return exitCode(waitErr), waitErr
+}
+
+func commandPipes(cmd *exec.Cmd) (io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open stdin pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open stdout pipe: %w", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open stderr pipe: %w", err)
+	}
+
+	return stdin, stdout, stderr, nil
 }
 
 func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) error {

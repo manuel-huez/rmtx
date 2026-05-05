@@ -40,6 +40,7 @@ func TestResolveOCICommandPathKeepsSlashCommand(t *testing.T) {
 
 func TestOCIChildCommandCleanupRemovesSpecFile(t *testing.T) {
 	s := &Server{}
+
 	cmd, cleanup, err := s.ociChildCommand(
 		context.Background(),
 		ociChildSpec{

@@ -132,45 +132,72 @@ func (s *Server) handleBlobUploadRequest(
 		return err
 	}
 
-	if req.Compression != "" {
-		switch req.Compression {
-		case protocol.CompressionZstd:
-			closeReader, err := conn.EnableZstdReader()
-			if err != nil {
-				return upload.fail(err)
-			}
-
-			defer closeReader()
-		default:
-			return upload.fail(fmt.Errorf("unsupported blob upload compression: %s", req.Compression))
-		}
+	closeReader, err := openBlobUploadReader(conn, req.Compression)
+	if err != nil {
+		return upload.fail(err)
 	}
+
+	defer closeReader()
 
 	for {
-		head, err := conn.ReadHeader()
+		keepReading, err := s.receiveBlobUploadFrame(conn, upload)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-
-			return upload.fail(fmt.Errorf("read blob upload frame: %w", err))
+			return upload.fail(err)
 		}
 
-		switch head.Type {
-		case protocol.MsgBlob:
-			if err := s.receiveUploadBlob(conn, head, upload); err != nil {
-				return upload.fail(err)
-			}
-		case protocol.MsgSyncComplete:
+		if !keepReading {
 			return nil
-		default:
-			if err := conn.DiscardPayload(head); err != nil {
-				return upload.fail(err)
-			}
-
-			return upload.fail(fmt.Errorf("unexpected blob upload frame: %s", head.Type))
 		}
 	}
+}
+
+func openBlobUploadReader(conn *protocol.Conn, compression string) (func(), error) {
+	if compression == "" {
+		return func() {}, nil
+	}
+
+	switch compression {
+	case protocol.CompressionZstd:
+		closeReader, err := conn.EnableZstdReader()
+		if err != nil {
+			return nil, err
+		}
+
+		return closeReader, nil
+	default:
+		return nil, fmt.Errorf("unsupported blob upload compression: %s", compression)
+	}
+}
+
+func (s *Server) receiveBlobUploadFrame(
+	conn *protocol.Conn,
+	upload *blobUploadSession,
+) (bool, error) {
+	head, err := conn.ReadHeader()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("read blob upload frame: %w", err)
+	}
+
+	switch head.Type {
+	case protocol.MsgBlob:
+		if err := s.receiveUploadBlob(conn, head, upload); err != nil {
+			return false, err
+		}
+	case protocol.MsgSyncComplete:
+		return false, nil
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, err
+		}
+
+		return false, fmt.Errorf("unexpected blob upload frame: %s", head.Type)
+	}
+
+	return true, nil
 }
 
 func (s *Server) receiveUploadBlob(

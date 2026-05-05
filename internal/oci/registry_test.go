@@ -18,11 +18,15 @@ import (
 	"testing"
 )
 
+const testManifestPath = "/v2/repo/manifests/latest"
+
 //nolint:cyclop // Test server branches model registry endpoints.
 func TestPullFetchesManifestAndBlobsWithBearerChallenge(t *testing.T) {
 	layer := testLayer(t, map[string]string{"hello.txt": "hello\n"})
 	layerDigest := digest(layer)
-	config := []byte(`{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/local/go/bin:/usr/bin","GOTOOLCHAIN=local"]}}`)
+	config := []byte(
+		`{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/local/go/bin:/usr/bin","GOTOOLCHAIN=local"]}}`,
+	)
 	configDigest := digest(config)
 	manifest := fmt.Appendf(nil, `{
   "schemaVersion": 2,
@@ -49,7 +53,7 @@ func TestPullFetchesManifestAndBlobsWithBearerChallenge(t *testing.T) {
 		}
 
 		switch r.URL.Path {
-		case "/v2/repo/manifests/latest":
+		case testManifestPath:
 			w.Header().Set("Content-Type", mediaOCIManifest)
 			w.Header().Set("Docker-Content-Digest", manifestDigest)
 			_, _ = w.Write(manifest)
@@ -112,7 +116,7 @@ func TestPullRejectsManifestDigestMismatch(t *testing.T) {
 }`)
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/repo/manifests/latest" {
+		if r.URL.Path != testManifestPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -170,7 +174,9 @@ func TestPullRejectsDigestTargetMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ref, err := ParseReference(strings.TrimPrefix(server.URL, "https://") + "/repo@" + requestedDigest)
+	ref, err := ParseReference(
+		strings.TrimPrefix(server.URL, "https://") + "/repo@" + requestedDigest,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +207,7 @@ func TestPullRejectsUnsafeDescriptorDigest(t *testing.T) {
 	manifestDigest := digest(manifest)
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/repo/manifests/latest" {
+		if r.URL.Path != testManifestPath {
 			http.NotFound(w, r)
 			return
 		}

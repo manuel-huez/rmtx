@@ -16,25 +16,20 @@ import (
 	"unicode"
 )
 
-func (s *Server) ociChildCommand(
+func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
-	spec ociChildSpec,
-	contextDir string,
+	run ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	if len(spec.Command) == 0 {
-		return nil, noopCommandCleanup, errors.New("OCI command is required")
-	}
-
-	if err := checkWSLAvailable(ctx, s.logger, spec.WSLDistro); err != nil {
+	if err := checkWSLAvailable(ctx, s.logger, run.spec.WSLDistro); err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
-	spec, err := wslChildSpec(ctx, spec)
+	spec, err := wslChildSpec(ctx, run.spec)
 	if err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
-	script, err := writeWSLChildScript(contextDir, spec)
+	script, err := writeWSLChildScript(run.contextDir, spec)
 	if err != nil {
 		return nil, noopCommandCleanup, err
 	}
@@ -105,6 +100,7 @@ func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro 
 			if logger != nil {
 				logger.Printf("using already installed WSL distro: %s", requestedDistro)
 			}
+
 			return nil
 		}
 	}
@@ -151,6 +147,7 @@ func windowsPathToWSL(ctx context.Context, distro string, path string) (string, 
 		((trimmed[0] >= 'A' && trimmed[0] <= 'Z') || (trimmed[0] >= 'a' && trimmed[0] <= 'z')) {
 		drive := unicode.ToLower(rune(trimmed[0]))
 		rest := filepath.ToSlash(trimmed[2:])
+
 		return "/mnt/" + string(drive) + "/" + strings.TrimPrefix(rest, "/"), nil
 	}
 
@@ -178,6 +175,7 @@ func wslPath(ctx context.Context, distro, path string) (string, error) {
 
 func wslInstalledDistros(ctx context.Context) ([]string, error) {
 	out, err := exec.CommandContext(ctx, "wsl.exe", "--list", "--quiet").CombinedOutput()
+
 	trimmedOutput := strings.TrimSpace(string(out))
 	if err != nil {
 		if strings.Contains(strings.ToLower(trimmedOutput), "no installed distributions") {
@@ -192,12 +190,14 @@ func wslInstalledDistros(ctx context.Context) ([]string, error) {
 	}
 
 	lines := strings.Split(trimmedOutput, "\n")
+
 	distros := make([]string, 0, len(lines))
 	for _, line := range lines {
 		name := strings.TrimSpace(line)
 		if name == "" {
 			continue
 		}
+
 		distros = append(distros, name)
 	}
 
@@ -224,7 +224,12 @@ func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) er
 
 	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro)
 	if err != nil {
-		return fmt.Errorf("install WSL distro %q: %s: %w", distro, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf(
+			"install WSL distro %q: %s: %w",
+			distro,
+			strings.TrimSpace(string(out)),
+			err,
+		)
 	}
 
 	return nil
@@ -287,7 +292,7 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	b.WriteString("if [ \"${1:-}\" != inner ]; then\n")
 	b.WriteString("  if command -v unshare >/dev/null 2>&1; then\n")
 
-	if strings.EqualFold(strings.TrimSpace(spec.Network), "none") {
+	if strings.EqualFold(strings.TrimSpace(spec.Network), noneValue) {
 		b.WriteString("    exec unshare -m -n --fork \"$0\" inner\n")
 		b.WriteString("  fi\n")
 		b.WriteString(

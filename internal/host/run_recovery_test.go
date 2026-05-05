@@ -42,6 +42,7 @@ func TestRunPipeExecCommandDisconnectCancelsAfterStdinClose(t *testing.T) {
 	client := protocol.NewConn(clientConn)
 
 	time.Sleep(40 * time.Millisecond)
+
 	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
 		t.Fatalf("send stdin close: %v", err)
 	}
@@ -49,6 +50,7 @@ func TestRunPipeExecCommandDisconnectCancelsAfterStdinClose(t *testing.T) {
 	_ = clientConn.Close()
 
 	start := time.Now()
+
 	select {
 	case result := <-resultCh:
 		if time.Since(start) > 2*time.Second {
@@ -59,7 +61,8 @@ func TestRunPipeExecCommandDisconnectCancelsAfterStdinClose(t *testing.T) {
 			t.Fatalf("expected run error from disconnect, got code=%d", result.code)
 		}
 
-		if !errors.Is(result.err, context.Canceled) && !strings.Contains(result.err.Error(), "killed") {
+		if !errors.Is(result.err, context.Canceled) &&
+			!strings.Contains(result.err.Error(), "killed") {
 			t.Fatalf("expected cancel/kill error, got %v", result.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -93,6 +96,7 @@ func TestRunPipeExecCommandDisconnectCancelsProcessTree(t *testing.T) {
 	client := protocol.NewConn(clientConn)
 
 	time.Sleep(40 * time.Millisecond)
+
 	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
 		t.Fatalf("send stdin close: %v", err)
 	}
@@ -111,6 +115,7 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	t.Helper()
 
 	stateDir := t.TempDir()
+
 	server, err := New(Options{
 		StateDir: stateDir,
 		Logger:   log.New(io.Discard, "", 0),
@@ -144,6 +149,7 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read NeedBlobs: %v", err)
 	}
+
 	if needBlobs.Type != protocol.MsgNeedBlobs {
 		t.Fatalf("need blobs request type %q", needBlobs.Type)
 	}
@@ -156,12 +162,14 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read workspace ready: %v", err)
 	}
+
 	if ws.Type != protocol.MsgWorkspaceReady {
 		t.Fatalf("workspace ready type %q", ws.Type)
 	}
 
 	_ = client.WriteJSON(protocol.MsgStdinClose, nil)
 	_ = clientConn.Close()
+
 	cancel()
 
 	select {

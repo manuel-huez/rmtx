@@ -32,6 +32,7 @@ const (
 	artifactStateFile    = "artifacts.json"
 	defaultOCIPathEnv    = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	defaultOCIWorkdir    = "/workspace"
+	pullProgressFields   = 2
 )
 
 type preparedRuntime struct {
@@ -240,7 +241,7 @@ func (s *Server) pullOCIImage(
 		PlatformOS:   "linux",
 		Architecture: runtime.GOARCH,
 		Progress: func(format string, args ...any) {
-			fields := make([]any, 0, len(args)+2)
+			fields := make([]any, 0, len(args)+pullProgressFields)
 			fields = append(fields, contextID, ref.Normalized())
 			fields = append(fields, args...)
 			s.logger.Printf(
@@ -282,13 +283,13 @@ func (s *Server) runImageSetupCommands(
 		}
 
 		spec := ociChildSpec{
-			RootFS:  rootfs,
-			WorkDir: "/",
-			Command: []string{"/bin/sh", "-c", command},
-			Env:     env,
-			Binds:   gpuRuntime.Binds,
-			Network: runtimeSpec.Network,
-			GPU:     runtimeSpec.GPU,
+			RootFS:    rootfs,
+			WorkDir:   "/",
+			Command:   []string{"/bin/sh", "-c", command},
+			Env:       env,
+			Binds:     gpuRuntime.Binds,
+			Network:   runtimeSpec.Network,
+			GPU:       runtimeSpec.GPU,
 			WSLDistro: runtimeSpec.WSLDistro,
 		}
 
@@ -489,13 +490,13 @@ func (s *Server) newOCICommand(
 	env = append(env, gpuRuntime.Env...)
 
 	spec := ociChildSpec{
-		RootFS:  prepared.RootFS,
-		WorkDir: runtimeCommandWorkdir,
-		Command: append([]string(nil), request.Command...),
-		Env:     env,
-		Binds:   binds,
-		Network: request.Runtime.Network,
-		GPU:     request.Runtime.GPU,
+		RootFS:    prepared.RootFS,
+		WorkDir:   runtimeCommandWorkdir,
+		Command:   append([]string(nil), request.Command...),
+		Env:       env,
+		Binds:     binds,
+		Network:   request.Runtime.Network,
+		GPU:       request.Runtime.GPU,
 		WSLDistro: request.Runtime.WSLDistro,
 	}
 
@@ -596,7 +597,7 @@ func runtimeCacheKey(manifestDigest string, runtimeSpec protocol.RuntimeSpec) st
 
 	gpu := strings.TrimSpace(runtimeSpec.GPU)
 	if gpu == "" {
-		gpu = "none"
+		gpu = noneValue
 	}
 
 	payload, _ := json.Marshal(struct {

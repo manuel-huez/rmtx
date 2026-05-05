@@ -12,7 +12,7 @@ func TestWSLChildScriptUsesNetworkNamespaceForNone(t *testing.T) {
 		RootFS:  "/rootfs",
 		WorkDir: "/workspace",
 		Command: []string{"sh"},
-		Network: "none",
+		Network: noneValue,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -68,6 +68,7 @@ func (c *Conn) EnableZstdReader() (func(), error) {
 		}
 
 		closed = true
+
 		decoder.Close()
 	}
 

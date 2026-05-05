@@ -7,34 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"syscall"
-
-	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
-func (s *Server) runTTYExecCommand(
+func (s *Server) runPlatformTTYExecCommand(
 	ctx context.Context,
-	cancel context.CancelFunc,
-	conn *protocol.Conn,
-	cmd *exec.Cmd,
-	request protocol.RunRequest,
+	run ttyExecRequest,
 ) (int, error) {
-	cancelRun := s.commandCancel(cmd, cancel)
-	defer cancelRun()
-
-	master, slave, err := openPTY(request.TTYRows, request.TTYCols)
+	master, slave, err := openPTY(run.request.TTYRows, run.request.TTYCols)
 	if err != nil {
 		return 1, err
 	}
 
 	defer func() { _ = master.Close() }()
 
-	cmd.Stdin = slave
-	cmd.Stdout = slave
-	cmd.Stderr = slave
+	run.cmd.Stdin = slave
+	run.cmd.Stdout = slave
+	run.cmd.Stderr = slave
 
-	sysProcAttr := cmd.SysProcAttr
+	sysProcAttr := run.cmd.SysProcAttr
 	if sysProcAttr == nil {
 		sysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -42,27 +33,24 @@ func (s *Server) runTTYExecCommand(
 	sysProcAttr.Setsid = true
 	sysProcAttr.Setctty = true
 	sysProcAttr.Ctty = int(slave.Fd())
-	cmd.SysProcAttr = sysProcAttr
+	run.cmd.SysProcAttr = sysProcAttr
 
-	if err := cmd.Start(); err != nil {
+	if err := run.cmd.Start(); err != nil {
 		_ = slave.Close()
 		return exitCode(err), fmt.Errorf("start TTY command: %w", err)
 	}
 
 	_ = slave.Close()
 
-	go func() {
-		<-ctx.Done()
-		cancelRun()
-	}()
+	watchRunContext(ctx, run.cancelRun)
 
 	outputDone := make(chan error, 1)
 
-	go func() { outputDone <- streamPipe(conn, master, "stdout") }()
+	go func() { outputDone <- streamPipe(run.conn, master, "stdout") }()
 
 	go func() {
-		if err := s.consumeTTYInput(conn, master); err != nil {
-			cancelRun()
+		if err := s.consumeTTYInput(run.conn, master); err != nil {
+			run.cancelRun()
 
 			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
@@ -70,7 +58,7 @@ func (s *Server) runTTYExecCommand(
 		}
 	}()
 
-	waitErr := cmd.Wait()
+	waitErr := run.cmd.Wait()
 	_ = master.Close()
 
 	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
@@ -78,7 +66,8 @@ func (s *Server) runTTYExecCommand(
 			s.logger.Printf("TTY output forwarding ended: %v", err)
 		}
 
-		cancelRun()
+		run.cancelRun()
+
 		return exitCode(waitErr), err
 	}
 

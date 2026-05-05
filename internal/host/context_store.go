@@ -363,11 +363,13 @@ func (s *Server) deleteContexts(
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
 	}
+
 	if len(deleted) > 0 {
 		pruned, bytes, err := s.pruneUnreferencedOCICache()
 		if err != nil {
 			return protocol.DeleteContextsResponse{}, err
 		}
+
 		if len(pruned) > 0 {
 			s.logger.Printf(
 				"context delete pruned OCI cache: deleted=%d bytes=%d",

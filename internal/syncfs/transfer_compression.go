@@ -2,6 +2,7 @@ package syncfs
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -84,6 +85,7 @@ func ShouldCompressTransfer(candidates []CompressionCandidate) bool {
 	}
 
 	likelyBytes := int64(0)
+
 	for _, candidate := range candidates {
 		if candidate.Size <= 0 {
 			continue
@@ -97,6 +99,8 @@ func ShouldCompressTransfer(candidates []CompressionCandidate) bool {
 				sampleCompressesWell(candidate.Path, candidate.Size) {
 				likelyBytes += candidate.Size
 			}
+		case compressionSkip:
+			continue
 		}
 	}
 
@@ -106,6 +110,7 @@ func ShouldCompressTransfer(candidates []CompressionCandidate) bool {
 
 func compressionTotalBytes(candidates []CompressionCandidate) int64 {
 	var total int64
+
 	for _, candidate := range candidates {
 		if candidate.Size > 0 {
 			total += candidate.Size
@@ -145,26 +150,25 @@ func sampleCompressesWell(path string, size int64) bool {
 
 	defer func() { _ = f.Close() }()
 
-	limit := int64(compressionSampleBytes)
-	if size < limit {
-		limit = size
-	}
+	limit := min(size, int64(compressionSampleBytes))
 
 	if limit <= 0 {
 		return false
 	}
 
 	sample := make([]byte, limit)
+
 	n, err := io.ReadFull(f, sample)
 	if n <= 0 {
 		return false
 	}
 
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return false
 	}
 
 	var compressed bytes.Buffer
+
 	encoder, err := zstd.NewWriter(
 		&compressed,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),

@@ -75,7 +75,12 @@ func (c *Client) Pull(
 		}
 
 		if opts.Progress != nil {
-			opts.Progress("selected manifest %s for platform %s/%s", desc.Digest, opts.PlatformOS, opts.Architecture)
+			opts.Progress(
+				"selected manifest %s for platform %s/%s",
+				desc.Digest,
+				opts.PlatformOS,
+				opts.Architecture,
+			)
 		}
 
 		raw, digest, mediaType, err = c.fetchManifest(ctx, ref, desc.Digest)

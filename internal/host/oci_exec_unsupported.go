@@ -10,16 +10,14 @@ import (
 	"strings"
 )
 
-func (s *Server) ociChildCommand(
-	ctx context.Context,
-	spec ociChildSpec,
-	contextDir string,
+func (s *Server) platformOCIChildCommand(
+	context.Context,
+	ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	_ = ctx
-	_ = spec
-	_ = contextDir
-
-	return nil, noopCommandCleanup, fmt.Errorf("OCI runtime is not supported on %s hosts yet", runtime.GOOS)
+	return nil, noopCommandCleanup, fmt.Errorf(
+		"OCI runtime is not supported on %s hosts yet",
+		runtime.GOOS,
+	)
 }
 
 func nvidiaRuntime(mode string) (nvidiaRuntimeSpec, error) {

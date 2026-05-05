@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -421,10 +422,8 @@ func validRuntimeTarget(target string) bool {
 		return false
 	}
 
-	for _, part := range strings.Split(target, "/") {
-		if part == ".." {
-			return false
-		}
+	if slices.Contains(strings.Split(target, "/"), "..") {
+		return false
 	}
 
 	return path.Clean(target) != "."

@@ -7,14 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/UserExistsError/conpty"
-
-	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 type windowsTTY struct {
@@ -29,25 +26,19 @@ func (w *windowsTTY) ResizeTTY(rows, cols int) error {
 	return w.pty.Resize(cols, rows)
 }
 
-func (s *Server) runTTYExecCommand(
+func (s *Server) runPlatformTTYExecCommand(
 	ctx context.Context,
-	cancel context.CancelFunc,
-	conn *protocol.Conn,
-	cmd *exec.Cmd,
-	request protocol.RunRequest,
+	run ttyExecRequest,
 ) (int, error) {
-	cancelRun := s.commandCancel(cmd, cancel)
-	defer cancelRun()
-
 	options := []conpty.ConPtyOption{
-		conpty.ConPtyWorkDir(cmd.Dir),
-		conpty.ConPtyEnv(cmd.Env),
+		conpty.ConPtyWorkDir(run.cmd.Dir),
+		conpty.ConPtyEnv(run.cmd.Env),
 	}
-	if request.TTYCols > 0 && request.TTYRows > 0 {
-		options = append(options, conpty.ConPtyDimensions(request.TTYCols, request.TTYRows))
+	if run.request.TTYCols > 0 && run.request.TTYRows > 0 {
+		options = append(options, conpty.ConPtyDimensions(run.request.TTYCols, run.request.TTYRows))
 	}
 
-	pty, err := conpty.Start(windowsCommandLine(cmd.Args), options...)
+	pty, err := conpty.Start(windowsCommandLine(run.cmd.Args), options...)
 	if err != nil {
 		return 1, fmt.Errorf("start TTY command: %w", err)
 	}
@@ -63,14 +54,14 @@ func (s *Server) runTTYExecCommand(
 
 	outputDone := make(chan error, 1)
 
-	go func() { outputDone <- streamPipe(conn, pty, "stdout") }()
+	go func() { outputDone <- streamPipe(run.conn, pty, "stdout") }()
 
 	go func() {
 		if err := s.consumeTTYInput(
-			conn,
+			run.conn,
 			&windowsTTY{pty: pty},
 		); err != nil {
-			cancelRun()
+			run.cancelRun()
 
 			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 				s.logger.Printf("TTY input forwarding ended: %v", err)
@@ -78,10 +69,7 @@ func (s *Server) runTTYExecCommand(
 		}
 	}()
 
-	go func() {
-		<-ctx.Done()
-		cancelRun()
-	}()
+	watchRunContext(ctx, run.cancelRun)
 
 	exitCode, waitErr := pty.Wait(ctx)
 
@@ -92,12 +80,14 @@ func (s *Server) runTTYExecCommand(
 			s.logger.Printf("TTY output forwarding ended: %v", err)
 		}
 
-		cancelRun()
+		run.cancelRun()
+
 		return int(exitCode), err
 	}
 
 	return int(exitCode), waitErr
 }
+
 func windowsCommandLine(args []string) string {
 	escaped := make([]string, 0, len(args))
 	for _, arg := range args {

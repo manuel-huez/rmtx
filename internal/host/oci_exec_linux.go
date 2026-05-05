@@ -5,7 +5,6 @@ package host
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,16 +12,11 @@ import (
 	"syscall"
 )
 
-func (s *Server) ociChildCommand(
+func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
-	spec ociChildSpec,
-	contextDir string,
+	run ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	if len(spec.Command) == 0 {
-		return nil, noopCommandCleanup, errors.New("OCI command is required")
-	}
-
-	specDir := filepath.Join(contextDir, runtimeDirName, runtimeSpecDirName)
+	specDir := filepath.Join(run.contextDir, runtimeDirName, runtimeSpecDirName)
 	if err := os.MkdirAll(specDir, defaultDirMode); err != nil {
 		return nil, noopCommandCleanup, err
 	}
@@ -32,7 +26,7 @@ func (s *Server) ociChildCommand(
 		return nil, noopCommandCleanup, err
 	}
 
-	encErr := json.NewEncoder(specFile).Encode(spec)
+	encErr := json.NewEncoder(specFile).Encode(run.spec)
 
 	closeErr := specFile.Close()
 	if encErr != nil {
@@ -59,7 +53,7 @@ func (s *Server) ociChildCommand(
 		syscall.CLONE_NEWPID |
 		syscall.CLONE_NEWIPC |
 		syscall.CLONE_NEWUTS)
-	if strings.EqualFold(spec.Network, "none") {
+	if strings.EqualFold(run.spec.Network, noneValue) {
 		clone |= syscall.CLONE_NEWNET
 	}
 

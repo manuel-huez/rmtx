@@ -11,13 +11,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"runtime"
+	"slices"
 	"strings"
 )
 
 const rootfsMarker = ".rmtx-rootfs-ready"
 const defaultRootDirMode = 0o755
+const legacyTarRegularFile byte = 0
 
 func (s *Store) UnpackImage(target string, image Image) error {
 	if _, err := os.Stat(filepath.Join(target, rootfsMarker)); err == nil {
@@ -113,7 +114,7 @@ func applyTarEntry(root string, hdr *tar.Header, src io.Reader) error {
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		return os.MkdirAll(target, fileMode(hdr.FileInfo().Mode(), defaultRootDirMode))
-	case tar.TypeReg, tar.TypeRegA:
+	case tar.TypeReg, legacyTarRegularFile:
 		if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
 			return err
 		}

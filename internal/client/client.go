@@ -1425,6 +1425,7 @@ func uploadBlobWorker(
 		if err != nil {
 			return err
 		}
+
 		defer func() { _ = closeCompressed() }()
 	}
 

@@ -221,29 +221,14 @@ func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64,
 		store.BlobsDir(),
 		filepath.Join(store.Root(), "manifests"),
 	} {
-		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-			if err != nil || d == nil || d.IsDir() {
-				return err
-			}
-
+		if err := walkOCIArtifactFiles(root, func(path string, d os.DirEntry) error {
 			digest := digestFromCachePath(root, path)
 			if refs[digest] {
 				return nil
 			}
 
-			info, statErr := d.Info()
-			if statErr == nil {
-				bytes += info.Size()
-			}
-
-			deleted = append(deleted, protocol.ContextArtifact{
-				Kind: "cache",
-				Path: path,
-				Ref:  digest,
-			})
-
-			return os.Remove(path)
-		}); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removeCachedOCIArtifact(&deleted, &bytes, d, path, digest)
+		}); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -265,11 +250,7 @@ func pruneUnreferencedOCIRefs(
 	var bytes int64
 	root := filepath.Join(store.Root(), "refs")
 
-	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return err
-		}
-
+	if err := walkOCIArtifactFiles(root, func(path string, d os.DirEntry) error {
 		digest, readErr := readOCIRefManifestDigest(path)
 		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 			return readErr
@@ -278,23 +259,47 @@ func pruneUnreferencedOCIRefs(
 			return nil
 		}
 
-		info, statErr := d.Info()
-		if statErr == nil {
-			bytes += info.Size()
-		}
-
-		deleted = append(deleted, protocol.ContextArtifact{
-			Kind: "cache",
-			Path: path,
-			Ref:  digest,
-		})
-
-		return os.Remove(path)
-	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return removeCachedOCIArtifact(&deleted, &bytes, d, path, digest)
+	}); err != nil {
 		return nil, 0, err
 	}
 
 	return deleted, bytes, nil
+}
+
+func walkOCIArtifactFiles(root string, visit func(string, os.DirEntry) error) error {
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return err
+		}
+
+		return visit(path, d)
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
+}
+
+func removeCachedOCIArtifact(
+	deleted *[]protocol.ContextArtifact,
+	bytes *int64,
+	entry os.DirEntry,
+	path string,
+	digest string,
+) error {
+	info, statErr := entry.Info()
+	if statErr == nil {
+		*bytes += info.Size()
+	}
+
+	*deleted = append(*deleted, protocol.ContextArtifact{
+		Kind: "cache",
+		Path: path,
+		Ref:  digest,
+	})
+
+	return os.Remove(path)
 }
 
 func readOCIRefManifestDigest(path string) (string, error) {
@@ -305,7 +310,7 @@ func readOCIRefManifestDigest(path string) (string, error) {
 
 	var image oci.Image
 	if err := json.Unmarshal(content, &image); err != nil {
-		return "", nil
+		return "", err
 	}
 
 	return image.ManifestDigest, nil

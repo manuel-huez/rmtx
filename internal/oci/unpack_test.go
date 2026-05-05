@@ -71,7 +71,7 @@ func TestApplyTarEntryUnpacksLegacyRegularFile(t *testing.T) {
 	root := t.TempDir()
 	if err := applyTarEntry(root, &tar.Header{
 		Name:     "legacy.txt",
-		Typeflag: tar.TypeRegA,
+		Typeflag: legacyTarRegularFile,
 		Mode:     0o644,
 		Size:     int64(len("legacy")),
 	}, strings.NewReader("legacy")); err != nil {
