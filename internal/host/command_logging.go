@@ -2,6 +2,7 @@ package host
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"os/exec"
@@ -139,4 +140,12 @@ func runCommandWithLiveOutput(
 	stderr.Flush()
 
 	return output.Bytes(), nil
+}
+
+func writeRunLogLine(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "rmtx: "+format+"\n", args...)
 }

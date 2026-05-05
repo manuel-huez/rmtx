@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 
@@ -124,6 +125,10 @@ func (l *runLogger) Printf(format string, args ...any) {
 	_, _ = fmt.Fprintf(l.out, "rmtx: "+format+"\n", args...)
 }
 
+func (l *runLogger) Stage(format string, args ...any) {
+	l.Printf("=== "+format+" ===", args...)
+}
+
 func (l *runLogger) Every(id, format string, args ...any) {
 	if l == nil {
 		return
@@ -197,6 +202,37 @@ func closeQuietly(c io.Closer) {
 	}
 }
 
+func formatCommand(args []string) string {
+	if len(args) == 0 {
+		return "(none)"
+	}
+
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, quoteCommandArg(arg))
+	}
+
+	return strings.Join(quoted, " ")
+}
+
+func quoteCommandArg(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+
+	if !commandArgNeedsQuote(arg) {
+		return arg
+	}
+
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+}
+
+func commandArgNeedsQuote(arg string) bool {
+	return strings.IndexFunc(arg, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(`'"\\$&;()<>|*?[]{}!#~`, r)
+	}) >= 0
+}
+
 func startConnectionLiveness(
 	ctx context.Context,
 	conn *protocol.Conn,
@@ -242,12 +278,13 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	opts.Root = root
 
 	logger := newRunLogger(opts.Stderr)
+	logger.Stage("prepare remote run")
 	logger.Printf(
-		"preparing remote run: host=%s context=%s workdir=%s command=%q",
+		"preparing remote run: host=%s context=%s workdir=%s command=%s",
 		opts.Address,
 		opts.ContextID,
 		workdir,
-		strings.Join(opts.Command, " "),
+		formatCommand(opts.Command),
 	)
 
 	if err := ensureHostUpdatedForRun(ctx, opts, logger); err != nil {
@@ -295,7 +332,8 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		ready.ContextID,
 		ready.Workspace,
 	)
-	logger.Printf("running remote command now")
+	logger.Stage("execute remote command")
+	logger.Printf("command: %s", formatCommand(opts.Command))
 
 	code, err := processExecFrames(ctx, conn, root, opts, logger)
 	if err == nil {
@@ -750,6 +788,7 @@ func finishRunHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
+	logger.Stage("upload local files")
 	if err := sendMissingBlobs(ctx, conn, need, blobSources, opts, logger); err != nil {
 		return protocol.WorkspaceReady{}, err
 	}
@@ -956,7 +995,7 @@ func handleExecFrame(
 		code, err := decodeExitCode(head)
 		if err == nil {
 			logger.Printf("command exited: exit_code=%d", code)
-			logger.Printf("host-to-local sync started")
+			logger.Stage("download remote changes")
 		}
 
 		return false, code, err
@@ -1350,6 +1389,14 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f PiB", value/unit)
 }
 
+func formatCompression(compression string) string {
+	if compression == "" {
+		return "none"
+	}
+
+	return compression
+}
+
 func sendMissingBlobs(
 	ctx context.Context,
 	conn *protocol.Conn,
@@ -1385,7 +1432,7 @@ func sendMissingBlobs(
 		len(ordered),
 		formatBytes(totalBytes),
 		actualParallel,
-		actualCompression,
+		formatCompression(actualCompression),
 	)
 
 	if useUploadWorkers {
@@ -1506,7 +1553,7 @@ func sendMissingBlobsSequential(
 	logger *runLogger,
 ) error {
 	for _, item := range items {
-		if err := sendBlob(conn, item, progress, logger); err != nil {
+		if err := sendBlob(conn, item, "", progress, logger); err != nil {
 			return err
 		}
 
@@ -1637,7 +1684,7 @@ func uploadBlobWorker(
 			return err
 		}
 
-		if err := sendBlob(conn, item, progress, logger); err != nil {
+		if err := sendBlob(conn, item, compression, progress, logger); err != nil {
 			return err
 		}
 
@@ -1658,6 +1705,7 @@ func uploadBlobWorker(
 func sendBlob(
 	conn *protocol.Conn,
 	item blobUploadItem,
+	compression string,
 	progress *transferProgress,
 	logger *runLogger,
 ) error {
@@ -1674,9 +1722,10 @@ func sendBlob(
 	defer closeQuietly(f)
 
 	logger.Printf(
-		"upload file started: path=%s bytes=%s",
+		"upload file started: path=%s bytes=%s compression=%s",
 		displayPath,
 		formatBytes(item.size),
+		formatCompression(compression),
 	)
 
 	var uploaded int64
@@ -1688,10 +1737,11 @@ func sendBlob(
 			progress.AddBytes(n)
 			logger.Every(
 				"upload-file:"+item.hash,
-				"upload file: current_file=%s bytes=%s/%s",
+				"upload file: current_file=%s bytes=%s/%s compression=%s",
 				displayPath,
 				formatBytes(uploaded),
 				formatBytes(item.size),
+				formatCompression(compression),
 			)
 		},
 	}
@@ -1706,9 +1756,10 @@ func sendBlob(
 	}
 
 	logger.Printf(
-		"upload file done: path=%s bytes=%s",
+		"upload file done: path=%s bytes=%s compression=%s",
 		displayPath,
 		formatBytes(uploaded),
+		formatCompression(compression),
 	)
 
 	return nil

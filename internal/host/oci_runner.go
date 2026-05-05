@@ -330,6 +330,8 @@ func (s *Server) runImageSetupCommands(
 			continue
 		}
 
+		writeRunLogLine(runLogs, "=== runtime image setup ===")
+		writeRunLogLine(runLogs, "setup command: %s", command)
 		spec := ociChildSpec{
 			RootFS:    rootfs,
 			WorkDir:   "/",
@@ -456,6 +458,9 @@ func (s *Server) runOCIContextSetupCommands(
 			request.ContextID,
 			command,
 		)
+		writeRunLogLine(runLogs, "=== runtime context setup ===")
+		writeRunLogLine(runLogs, "setup command: %s", command)
+		writeRunLogLine(runLogs, "setup workdir: %s", request.WorkDir)
 
 		cmd, cleanup, err := s.newOCICommand(
 			ctx,

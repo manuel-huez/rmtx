@@ -48,6 +48,20 @@ func TestCommandOutputCollectorLogsCompleteLines(t *testing.T) {
 	}
 }
 
+func TestWriteRunLogLinePrefixesRmtx(t *testing.T) {
+	var out bytes.Buffer
+
+	writeRunLogLine(&out, "=== runtime context setup ===")
+	writeRunLogLine(&out, "setup command: %s", "uv sync")
+
+	want := "" +
+		"rmtx: === runtime context setup ===\n" +
+		"rmtx: setup command: uv sync\n"
+	if out.String() != want {
+		t.Fatalf("run log=%q want %q", out.String(), want)
+	}
+}
+
 func TestHostLogSubscriptionStreamsDirectWrites(t *testing.T) {
 	serverRaw, clientRaw := net.Pipe()
 

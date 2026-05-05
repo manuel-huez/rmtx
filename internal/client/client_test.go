@@ -51,6 +51,25 @@ func TestPrepareUploadItemsUsesRelativeDisplayPath(t *testing.T) {
 	}
 }
 
+func TestFormatCommandQuotesArgs(t *testing.T) {
+	got := formatCommand([]string{"sh", "-c", "echo 'hello world'", ""})
+	want := `sh -c 'echo '\''hello world'\''' ''`
+
+	if got != want {
+		t.Fatalf("command=%q want %q", got, want)
+	}
+}
+
+func TestRunLoggerStageUsesDelimiter(t *testing.T) {
+	var logs bytes.Buffer
+
+	newRunLogger(&logs).Stage("execute remote command")
+
+	if got, want := logs.String(), "rmtx: === execute remote command ===\n"; got != want {
+		t.Fatalf("stage log=%q want %q", got, want)
+	}
+}
+
 func TestSendMissingBlobsDoesNotLogFilesWhenNothingTransfers(t *testing.T) {
 	var logs bytes.Buffer
 
