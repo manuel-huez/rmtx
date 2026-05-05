@@ -37,7 +37,26 @@ const (
 	reverseDialTimeout = 5 * time.Second
 	progressEvery      = 3 * time.Second
 	blobUploadParallel = 4
+	hostUpdateTimeout  = 5 * time.Minute
+	restartPollEvery   = 100 * time.Millisecond
 )
+
+var (
+	ErrRestartRequested = errors.New("host restart requested")
+	errRestartPending   = errors.New("host restart in progress; retry shortly")
+)
+
+type RestartRequestedError struct {
+	Executable string
+}
+
+func (e *RestartRequestedError) Error() string {
+	return ErrRestartRequested.Error()
+}
+
+func (e *RestartRequestedError) Unwrap() error {
+	return ErrRestartRequested
+}
 
 type Options struct {
 	ListenAddr       string
@@ -59,6 +78,13 @@ type Server struct {
 	hostPKI     security.HostPKI
 	fingerprint string
 	listenerMu  sync.RWMutex
+	restartMu   sync.Mutex
+	restarting  bool
+
+	activeRuns           int
+	restartExecutable    string
+	restartVersion       string
+	restartInstallTarget string
 
 	contextLocksMu sync.Mutex
 	contextLocks   map[string]*sync.Mutex
@@ -67,6 +93,8 @@ type Server struct {
 	uploadsMu      sync.Mutex
 	uploads        map[string]*blobUploadSession
 	ociMu          sync.Mutex
+	updateMu       sync.Mutex
+	updateRunner   updateRunner
 }
 
 func New(opts Options) (*Server, error) {
@@ -121,6 +149,7 @@ func New(opts Options) (*Server, error) {
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
 		uploads:        map[string]*blobUploadSession{},
+		updateRunner:   defaultUpdateRunner,
 	}, nil
 }
 
@@ -166,6 +195,107 @@ func (s *Server) Addr() string {
 
 func (s *Server) Fingerprint() string {
 	return s.fingerprint
+}
+
+func (s *Server) acquireRun() (func(), error) {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+
+	if s.restarting {
+		return nil, errRestartPending
+	}
+
+	s.activeRuns++
+
+	return func() {
+		s.restartMu.Lock()
+		defer s.restartMu.Unlock()
+
+		if s.activeRuns > 0 {
+			s.activeRuns--
+		}
+	}, nil
+}
+
+type restartState struct {
+	Executable    string
+	Version       string
+	InstallTarget string
+}
+
+func (s *Server) beginRestart(executable, targetVersion, installTarget string) bool {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+
+	if s.restarting {
+		return false
+	}
+
+	s.restarting = true
+	s.restartExecutable = executable
+	s.restartVersion = targetVersion
+	s.restartInstallTarget = installTarget
+
+	return true
+}
+
+func (s *Server) cancelRestart() {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+
+	s.restarting = false
+	s.restartExecutable = ""
+	s.restartVersion = ""
+	s.restartInstallTarget = ""
+}
+
+func (s *Server) waitForActiveRuns(ctx context.Context) error {
+	ticker := time.NewTicker(restartPollEvery)
+	defer ticker.Stop()
+
+	for {
+		s.restartMu.Lock()
+		activeRuns := s.activeRuns
+		s.restartMu.Unlock()
+
+		if activeRuns == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for active runs before restart: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) finishRestart() {
+	s.listenerMu.RLock()
+	ln := s.listener
+	s.listenerMu.RUnlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+func (s *Server) restartRequest() (restartState, bool) {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+
+	return restartState{
+		Executable:    s.restartExecutable,
+		Version:       s.restartVersion,
+		InstallTarget: s.restartInstallTarget,
+	}, s.restarting
+}
+
+func (s *Server) restartWasRequested() bool {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+
+	return s.restarting
 }
 
 func (s *Server) hostName() string {
@@ -229,6 +359,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+
+			if restart, ok := s.restartRequest(); ok {
+				return &RestartRequestedError{Executable: restart.Executable}
 			}
 
 			var ne net.Error
@@ -331,6 +465,12 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
+	releaseRun, err := s.acquireRun()
+	if err != nil {
+		return err
+	}
+	defer releaseRun()
+
 	s.logger.Printf(
 		"run request received: context=%s session=%s workdir=%s command=%q mounts=%d entries=%d",
 		request.ContextID,
@@ -423,6 +563,8 @@ func (s *Server) dispatchSessionRequest(
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
 			return s.handlePing(conn, requestLogs)
 		})
+	case protocol.MsgHostUpdateRequest:
+		return s.dispatchHostUpdateRequest(parent, conn, head, requestLogs)
 	case protocol.MsgListContextsRequest:
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
 			return s.handleListContexts(conn, requestLogs)
@@ -491,6 +633,20 @@ func (s *Server) dispatchBlobUploadRequest(conn *protocol.Conn, head protocol.He
 	}
 
 	return s.handleBlobUploadRequest(conn, req)
+}
+
+func (s *Server) dispatchHostUpdateRequest(
+	parent context.Context,
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
+	req, err := protocol.DecodeData[protocol.HostUpdateRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleHostUpdateRequest(parent, conn, req, requestLogs)
 }
 
 func (s *Server) dispatchDeleteContexts(

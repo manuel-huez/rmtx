@@ -24,6 +24,32 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	)
 }
 
+func UpdateHost(
+	ctx context.Context,
+	opts RemoteOptions,
+	targetVersion string,
+) (HostUpdateResult, error) {
+	conn, err := dialRemote(ctx, opts)
+	if err != nil {
+		return HostUpdateResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	stopContextClose := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
+	defer stopContextClose()
+
+	req := protocol.HostUpdateRequest{Version: targetVersion}
+	if err := conn.WriteJSON(protocol.MsgHostUpdateRequest, req); err != nil {
+		return HostUpdateResult{}, err
+	}
+
+	return expectDataFrameWithOutput[protocol.HostUpdateResponse](
+		conn,
+		protocol.MsgHostUpdateResponse,
+		opts.Stderr,
+	)
+}
+
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
 	conn, err := dialRemote(ctx, opts)
 	if err != nil {

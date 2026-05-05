@@ -126,7 +126,24 @@ func runHost(ctx context.Context, args []string) int {
 			Logger:           logger,
 		},
 	); err != nil {
+		var restartRequest *host.RestartRequestedError
+		if errors.As(err, &restartRequest) || errors.Is(err, host.ErrRestartRequested) {
+			executable := ""
+			if restartRequest != nil {
+				executable = restartRequest.Executable
+			}
+
+			if restartErr := restartHostProcess(executable, args); restartErr != nil {
+				fmt.Fprintln(os.Stderr, "error: restart host:", restartErr)
+
+				return 1
+			}
+
+			return 0
+		}
+
 		fmt.Fprintln(os.Stderr, "error:", err)
+
 		return 1
 	}
 

@@ -62,6 +62,7 @@ type RemoteOptions struct {
 }
 
 type PingInfo = protocol.PingResponse
+type HostUpdateResult = protocol.HostUpdateResponse
 type ContextInfo = protocol.ContextSummary
 type DeleteContextsResult = protocol.DeleteContextsResponse
 type ContextArtifactsResult = protocol.ContextArtifactsResponse
@@ -204,6 +205,10 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		workdir,
 		strings.Join(opts.Command, " "),
 	)
+
+	if err := ensureHostUpdatedForRun(ctx, opts, logger); err != nil {
+		return 1, err
+	}
 
 	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts, logger)
 	if err != nil {

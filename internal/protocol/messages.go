@@ -30,6 +30,8 @@ const (
 	MsgSyncCompressionStart     = "sync_compression_start"
 	MsgPingRequest              = "ping_request"
 	MsgPingResponse             = "ping_response"
+	MsgHostUpdateRequest        = "host_update_request"
+	MsgHostUpdateResponse       = "host_update_response"
 	MsgListContextsRequest      = "list_contexts_request"
 	MsgListContextsResponse     = "list_contexts_response"
 	MsgDeleteContextsRequest    = "delete_contexts_request"
@@ -143,6 +145,17 @@ type PingResponse struct {
 	Fingerprint  string    `json:"fingerprint,omitempty"`
 	Now          time.Time `json:"now"`
 	ContextCount int       `json:"context_count,omitempty"`
+}
+
+type HostUpdateRequest struct {
+	Version string `json:"version"`
+}
+
+type HostUpdateResponse struct {
+	Updated       bool   `json:"updated"`
+	Restarting    bool   `json:"restarting,omitempty"`
+	Version       string `json:"version"`
+	InstallTarget string `json:"install_target,omitempty"`
 }
 
 type ListContextsRequest struct{}
