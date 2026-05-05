@@ -51,6 +51,40 @@ func TestWSLChildScriptRequiresMountNamespaceForHostNetwork(t *testing.T) {
 	}
 }
 
+func TestWSLChildScriptBindsHostNetworkFilesForHostNetwork(t *testing.T) {
+	script, err := wslChildScript(ociChildSpec{
+		RootFS:  "/rootfs",
+		WorkDir: "/workspace",
+		Command: []string{"sh"},
+		Network: "host",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/hostname"} {
+		if !strings.Contains(script, "mount --bind '"+file+"' \"$target\"") {
+			t.Fatalf("script does not bind %s:\n%s", file, script)
+		}
+	}
+}
+
+func TestWSLChildScriptSkipsHostNetworkFilesForNoNetwork(t *testing.T) {
+	script, err := wslChildScript(ociChildSpec{
+		RootFS:  "/rootfs",
+		WorkDir: "/workspace",
+		Command: []string{"sh"},
+		Network: noneValue,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(script, "mount --bind '/etc/resolv.conf' \"$target\"") {
+		t.Fatalf("script should not bind resolver without network:\n%s", script)
+	}
+}
+
 func TestWSLChildScriptRejectsEscapingBindTarget(t *testing.T) {
 	_, err := wslChildScript(ociChildSpec{
 		RootFS:  "/rootfs",

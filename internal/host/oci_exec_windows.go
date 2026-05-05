@@ -359,6 +359,10 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 		)
 	}
 
+	if !strings.EqualFold(strings.TrimSpace(spec.Network), noneValue) {
+		b.WriteString(wslHostNetworkFilesSnippet())
+	}
+
 	for _, bind := range spec.Binds {
 		snippet, err := wslBindSnippet(bind)
 		if err != nil {
@@ -384,6 +388,25 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	b.WriteByte('\n')
 
 	return b.String(), nil
+}
+
+func wslHostNetworkFilesSnippet() string {
+	var b strings.Builder
+
+	for _, file := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/hostname"} {
+		source := shellQuote(file)
+		target := `"$rootfs"` + shellQuote(file)
+		b.WriteString("if [ -e " + source + " ]; then\n")
+		b.WriteString("  target=" + target + "\n")
+		b.WriteString("  mkdir -p \"$(dirname \"$target\")\"\n")
+		b.WriteString("  if [ -L \"$target\" ]; then rm -f \"$target\"; fi\n")
+		b.WriteString("  touch \"$target\" 2>/dev/null || true\n")
+		b.WriteString("  mount --bind " + source + " \"$target\"\n")
+		b.WriteString("  mount -o remount,bind,ro \"$target\" 2>/dev/null || true\n")
+		b.WriteString("fi\n")
+	}
+
+	return b.String()
 }
 
 func wslBindSnippet(bind ociBind) (string, error) {

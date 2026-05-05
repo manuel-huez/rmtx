@@ -50,7 +50,7 @@ func runOCIChild(spec ociChildSpec) error {
 		return err
 	}
 
-	if err := prepareOCIChildRoot(rootfs, spec.Binds); err != nil {
+	if err := prepareOCIChildRoot(rootfs, spec.Network, spec.Binds); err != nil {
 		return err
 	}
 
@@ -87,7 +87,7 @@ func validateOCIChildSpec(spec ociChildSpec) error {
 	return nil
 }
 
-func prepareOCIChildRoot(rootfs string, binds []ociBind) error {
+func prepareOCIChildRoot(rootfs string, network string, binds []ociBind) error {
 	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
@@ -96,9 +96,40 @@ func prepareOCIChildRoot(rootfs string, binds []ociBind) error {
 		return err
 	}
 
+	if err := mountHostNetworkFiles(rootfs, network); err != nil {
+		return err
+	}
+
 	for _, bind := range binds {
 		if err := mountBind(rootfs, bind); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func mountHostNetworkFiles(rootfs string, network string) error {
+	if strings.EqualFold(strings.TrimSpace(network), noneValue) {
+		return nil
+	}
+
+	for _, source := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/hostname"} {
+		if _, err := os.Stat(source); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
+			return fmt.Errorf("stat host network file %s: %w", source, err)
+		}
+
+		target, err := childTarget(rootfs, source)
+		if err != nil {
+			return err
+		}
+
+		if err := bindFileReplacingTargetSymlink(source, target, true); err != nil {
+			return fmt.Errorf("bind host network file %s: %w", source, err)
 		}
 	}
 
@@ -250,6 +281,18 @@ func bindFile(source, target string, readOnly bool) error {
 	}
 
 	return nil
+}
+
+func bindFileReplacingTargetSymlink(source, target string, readOnly bool) error {
+	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(target); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return bindFile(source, target, readOnly)
 }
 
 func childTarget(rootfs, target string) (string, error) {
