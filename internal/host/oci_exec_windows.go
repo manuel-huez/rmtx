@@ -14,7 +14,11 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"golang.org/x/sys/windows/registry"
 )
+
+const wslDistroRegistryKey = `Software\Microsoft\Windows\CurrentVersion\Lxss`
 
 func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
@@ -87,7 +91,7 @@ func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro 
 		return errors.New("runtime.wsl_distro is required for OCI runtime on Windows")
 	}
 
-	installedDistros, err := wslInstalledDistros(ctx)
+	installedDistros, err := wslInstalledDistros()
 	if err != nil {
 		return fmt.Errorf(
 			"WSL2 is required for OCI runtime on Windows: cannot list installed distros: %w",
@@ -173,33 +177,54 @@ func wslPath(ctx context.Context, distro, path string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func wslInstalledDistros(ctx context.Context) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "wsl.exe", "--list", "--quiet").CombinedOutput()
-
-	trimmedOutput := strings.TrimSpace(string(out))
+func wslInstalledDistros() ([]string, error) {
+	key, err := registry.OpenKey(
+		registry.CURRENT_USER,
+		wslDistroRegistryKey,
+		registry.ENUMERATE_SUB_KEYS,
+	)
 	if err != nil {
-		if strings.Contains(strings.ToLower(trimmedOutput), "no installed distributions") {
+		if errors.Is(err, registry.ErrNotExist) {
 			return nil, nil
 		}
 
-		return nil, fmt.Errorf("list installed WSL distributions: %s: %w", trimmedOutput, err)
+		return nil, fmt.Errorf("open WSL distro registry key: %w", err)
+	}
+	defer key.Close()
+
+	subkeys, err := key.ReadSubKeyNames(-1)
+	if err != nil {
+		return nil, fmt.Errorf("list WSL distro registry keys: %w", err)
 	}
 
-	if trimmedOutput == "" {
-		return nil, nil
-	}
+	distros := make([]string, 0, len(subkeys))
+	for _, subkey := range subkeys {
+		distroKey, err := registry.OpenKey(key, subkey, registry.QUERY_VALUE)
+		if err != nil {
+			if errors.Is(err, registry.ErrNotExist) {
+				continue
+			}
 
-	lines := strings.Split(trimmedOutput, "\n")
-
-	distros := make([]string, 0, len(lines))
-	for _, line := range lines {
-		name := strings.TrimSpace(line)
-		if name == "" {
-			continue
+			return nil, fmt.Errorf("open WSL distro registry key %q: %w", subkey, err)
 		}
 
-		distros = append(distros, name)
+		name, _, err := distroKey.GetStringValue("DistributionName")
+		_ = distroKey.Close()
+		if err != nil {
+			if errors.Is(err, registry.ErrNotExist) {
+				continue
+			}
+
+			return nil, fmt.Errorf("read WSL distro name from registry key %q: %w", subkey, err)
+		}
+
+		name = strings.TrimSpace(name)
+		if name != "" {
+			distros = append(distros, name)
+		}
 	}
+
+	slices.Sort(distros)
 
 	return distros, nil
 }
