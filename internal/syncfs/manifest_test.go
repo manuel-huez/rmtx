@@ -446,6 +446,126 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 	}
 }
 
+func TestBlobStoreMaterializeWithProgressReportsCopiedBytes(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+
+	content := strings.Repeat("x", 64*1024)
+	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	var copied int64
+
+	dest := filepath.Join(t.TempDir(), "file.txt")
+	modTime := time.Unix(100, 0).UnixNano()
+	err := store.MaterializeWithProgress(hash, dest, 0o644, modTime, func(n int) {
+		copied += int64(n)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if copied != int64(len(content)) {
+		t.Fatalf("copied bytes mismatch: got %d want %d", copied, len(content))
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != content {
+		t.Fatal("materialized content mismatch")
+	}
+}
+
+func TestBlobStoreMaterializeDoesNotClobberTempNameNeighbor(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+
+	content := "materialized content"
+	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	dest := filepath.Join(root, "file.txt")
+	neighbor := dest + ".rmtx-tmp"
+	neighborContent := "tracked neighbor"
+	mustWrite(t, neighbor, neighborContent)
+
+	if err := store.Materialize(hash, dest, 0o644, time.Unix(100, 0).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != content {
+		t.Fatal("materialized content mismatch")
+	}
+
+	neighborGot, err := os.ReadFile(neighbor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(neighborGot) != neighborContent {
+		t.Fatalf("neighbor content mismatch: got %q want %q", neighborGot, neighborContent)
+	}
+}
+
+func TestBlobStoreMaterializeHandlesLongDestinationName(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+
+	content := "materialized content"
+	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	dest := filepath.Join(root, strings.Repeat("x", 240)+".txt")
+	probe, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Skipf("long destination names unsupported: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dest); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Materialize(hash, dest, 0o644, time.Unix(100, 0).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != content {
+		t.Fatal("materialized content mismatch")
+	}
+}
+
 func mustWrite(t *testing.T, path, content string) {
 	t.Helper()
 

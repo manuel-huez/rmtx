@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
@@ -69,12 +68,7 @@ func updateInstallDir(stateDir, targetVersion string) (string, error) {
 }
 
 func updateExecutablePath(installDir string) string {
-	name := path.Base(version.CommandPackage)
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-
-	return filepath.Join(installDir, name)
+	return filepath.Join(installDir, path.Base(version.CommandPackage)+updateExecutableSuffix)
 }
 
 func environWith(key, value string) []string {

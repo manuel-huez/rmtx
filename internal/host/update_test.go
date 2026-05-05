@@ -19,7 +19,7 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 
 	client := protocol.NewConn(clientConn)
 
-	var gotVersion string
+	gotVersionCh := make(chan string, 1)
 
 	s := &Server{
 		logger: log.New(io.Discard, "", 0),
@@ -30,7 +30,7 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 			_ string,
 			_ io.Writer,
 		) (updateResult, error) {
-			gotVersion = targetVersion
+			gotVersionCh <- targetVersion
 
 			return updateResult{
 				InstallTarget: updateInstallTarget(targetVersion),
@@ -74,10 +74,6 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 		t.Fatalf("restart version=%s want v9.8.7", resp.Version)
 	}
 
-	if gotVersion != "v9.8.7" {
-		t.Fatalf("runner version=%s want v9.8.7", gotVersion)
-	}
-
 	wantTarget := "github.com/manuel-huez/rmtx/cmd/rmtx@v9.8.7"
 	if resp.InstallTarget != wantTarget {
 		t.Fatalf("install target=%s want %s", resp.InstallTarget, wantTarget)
@@ -85,6 +81,11 @@ func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
+	}
+
+	gotVersion := <-gotVersionCh
+	if gotVersion != "v9.8.7" {
+		t.Fatalf("runner version=%s want v9.8.7", gotVersion)
 	}
 
 	if !s.restartWasRequested() {
@@ -146,10 +147,9 @@ func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gotInstallerLog := false
-	gotResponse := false
+	var updateLogs strings.Builder
 
-	for !gotInstallerLog || !gotResponse {
+	for {
 		head, err := client.ReadHeader()
 		if err != nil {
 			t.Fatal(err)
@@ -166,9 +166,7 @@ func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if strings.Contains(string(payload), "downloaded module") {
-				gotInstallerLog = true
-			}
+			updateLogs.Write(payload)
 		case protocol.MsgHostUpdateResponse:
 			resp, err := protocol.DecodeData[protocol.HostUpdateResponse](head)
 			if err != nil {
@@ -179,7 +177,19 @@ func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
 				t.Fatalf("unexpected update response: %#v", resp)
 			}
 
-			gotResponse = true
+			if !strings.Contains(updateLogs.String(), "downloaded module") {
+				t.Fatalf("update logs missing installer output: %q", updateLogs.String())
+			}
+
+			if err := <-errCh; err != nil {
+				t.Fatal(err)
+			}
+
+			if !strings.Contains(hostLogs.String(), "host update installed") {
+				t.Fatalf("host logs missing update progress: %q", hostLogs.String())
+			}
+
+			return
 		case protocol.MsgError:
 			errMsg, err := protocol.DecodeData[protocol.ErrorMessage](head)
 			if err != nil {
@@ -191,14 +201,6 @@ func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
 			t.Fatalf("unexpected frame type: %s", head.Type)
 		}
 	}
-
-	if err := <-errCh; err != nil {
-		t.Fatal(err)
-	}
-
-	if !strings.Contains(hostLogs.String(), "host update installed") {
-		t.Fatalf("host logs missing update progress: %q", hostLogs.String())
-	}
 }
 
 func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *testing.T) {
@@ -207,7 +209,7 @@ func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *tes
 	defer func() { _ = clientConn.Close() }()
 
 	client := protocol.NewConn(clientConn)
-	runnerCalled := false
+	runnerCalled := make(chan struct{}, 1)
 
 	s := &Server{
 		logger: log.New(io.Discard, "", 0),
@@ -218,7 +220,7 @@ func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *tes
 			_ string,
 			_ io.Writer,
 		) (updateResult, error) {
-			runnerCalled = true
+			runnerCalled <- struct{}{}
 
 			return updateResult{}, nil
 		},
@@ -276,8 +278,10 @@ func TestHandleHostUpdateRequestReturnsRestartingWhenUpdateAlreadyPending(t *tes
 		t.Fatal(err)
 	}
 
-	if runnerCalled {
+	select {
+	case <-runnerCalled:
 		t.Fatal("runner should not be called while restart is already pending")
+	default:
 	}
 }
 
@@ -343,24 +347,24 @@ func TestHandleHostUpdateRequestWaitsForActiveRunBeforeRestart(t *testing.T) {
 
 	releaseRun()
 
-	gotResponse := false
-	gotDone := false
 	deadline := time.After(2 * time.Second)
+	waitHeadCh := headCh
+	waitErrCh := errCh
 
-	for !gotResponse || !gotDone {
+	for range 2 {
 		select {
-		case head := <-headCh:
+		case head := <-waitHeadCh:
 			if head.Type != protocol.MsgHostUpdateResponse {
 				t.Fatalf("response type=%s want %s", head.Type, protocol.MsgHostUpdateResponse)
 			}
 
-			gotResponse = true
-		case err := <-errCh:
+			waitHeadCh = nil
+		case err := <-waitErrCh:
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			gotDone = true
+			waitErrCh = nil
 		case <-deadline:
 			t.Fatal("timed out waiting for update response")
 		}

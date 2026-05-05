@@ -27,19 +27,20 @@ import (
 )
 
 const (
-	defaultDirMode     = 0o755
-	streamBufferSize   = 32 * 1024
-	splitNEquals       = 2
-	pipeCount          = 2
-	exitCodeNotFound   = 127
-	defaultFileMode    = 0o644
-	noneValue          = "none"
-	reverseDialTimeout = 5 * time.Second
-	progressEvery      = 3 * time.Second
-	blobUploadParallel = 4
-	hostUpdateTimeout  = 5 * time.Minute
-	restartPollEvery   = 100 * time.Millisecond
-	tcpKeepAliveEvery  = 15 * time.Second
+	defaultDirMode      = 0o755
+	streamBufferSize    = 32 * 1024
+	splitNEquals        = 2
+	pipeCount           = 2
+	exitCodeNotFound    = 127
+	defaultFileMode     = 0o644
+	noneValue           = "none"
+	reverseDialTimeout  = 5 * time.Second
+	progressEvery       = 3 * time.Second
+	blobUploadParallel  = 4
+	materializeParallel = 4
+	hostUpdateTimeout   = 5 * time.Minute
+	restartPollEvery    = 100 * time.Millisecond
+	tcpKeepAliveEvery   = 15 * time.Second
 )
 
 var (

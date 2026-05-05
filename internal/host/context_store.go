@@ -585,12 +585,16 @@ func (s *Server) syncContextFromClient(
 		return err
 	}
 
+	fileTotal, fileBytes := syncFileTotals(changed)
+
 	s.logger.Printf(
-		"applying client sync to workspace: context=%s session=%s deleted=%d changed=%d",
+		"applying client sync to workspace: context=%s session=%s deleted=%d changed=%d files=%d file_bytes=%d",
 		contextID,
 		session,
 		len(deleted),
 		len(changed),
+		fileTotal,
+		fileBytes,
 	)
 
 	if err := syncfs.DeletePaths(workspace, deleted); err != nil {
@@ -604,34 +608,227 @@ func (s *Server) syncContextFromClient(
 		return fmt.Errorf("apply non-file entries in context %s: %w", contextID, err)
 	}
 
-	for _, entry := range changed {
-		if entry.Kind != syncfs.KindFile {
-			continue
-		}
-
-		targetPath, err := pathutil.SecureJoin(workspace, filepath.FromSlash(entry.Path))
-		if err != nil {
-			return err
-		}
-
-		mode := os.FileMode(entry.Mode)
-		if mode == 0 {
-			mode = defaultFileMode
-		}
-
-		if err := s.blobStore.Materialize(
-			entry.Hash,
-			targetPath,
-			mode,
-			entry.ModTime,
-		); err != nil {
-			return fmt.Errorf("materialize %s in context %s: %w", entry.Path, contextID, err)
-		}
+	if err := s.applyClientFiles(
+		ctx,
+		contextID,
+		session,
+		workspace,
+		changed,
+		fileTotal,
+		fileBytes,
+	); err != nil {
+		return err
 	}
 
 	s.logger.Printf("sync from client complete: context=%s session=%s", contextID, session)
 
 	return nil
+}
+
+func (s *Server) applyClientFiles(
+	parent context.Context,
+	contextID,
+	session,
+	workspace string,
+	changed []syncfs.Entry,
+	fileTotal int,
+	fileBytes int64,
+) error {
+	if fileTotal == 0 {
+		return nil
+	}
+
+	workers := materializeWorkerCount(fileTotal)
+	s.logger.Printf(
+		"apply client files started: context=%s session=%s workers=%d",
+		contextID,
+		session,
+		workers,
+	)
+
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	jobs := make(chan syncfs.Entry)
+	errCh := make(chan error, 1)
+
+	var progressMu sync.Mutex
+	materialized := 0
+	var bytesApplied int64
+	lastProgress := time.Time{}
+
+	reportLocked := func() {
+		now := time.Now()
+		if !lastProgress.IsZero() && now.Sub(lastProgress) < progressEvery {
+			return
+		}
+
+		lastProgress = now
+		s.logger.Printf(
+			"apply client file progress: context=%s session=%s files=%d/%d bytes=%d/%d",
+			contextID,
+			session,
+			materialized,
+			fileTotal,
+			bytesApplied,
+			fileBytes,
+		)
+	}
+
+	addBytes := func(n int) {
+		progressMu.Lock()
+		bytesApplied += int64(n)
+		reportLocked()
+		progressMu.Unlock()
+	}
+
+	finishEntry := func(copied, size int64) {
+		progressMu.Lock()
+		if copied < size {
+			bytesApplied += size - copied
+		}
+		materialized++
+		reportLocked()
+		progressMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case entry, ok := <-jobs:
+					if !ok {
+						return
+					}
+
+					copied, err := s.materializeClientFile(workspace, entry, addBytes)
+					if err != nil {
+						select {
+						case errCh <- fmt.Errorf(
+							"materialize %s in context %s: %w",
+							entry.Path,
+							contextID,
+							err,
+						):
+						default:
+						}
+						cancel()
+
+						return
+					}
+
+					finishEntry(copied, entry.Size)
+				}
+			}
+		}()
+	}
+
+sendJobs:
+	for _, entry := range changed {
+		if entry.Kind != syncfs.KindFile {
+			continue
+		}
+
+		select {
+		case jobs <- entry:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	progressMu.Lock()
+	s.logger.Printf(
+		"apply client file done: context=%s session=%s files=%d/%d bytes=%d/%d",
+		contextID,
+		session,
+		materialized,
+		fileTotal,
+		bytesApplied,
+		fileBytes,
+	)
+	progressMu.Unlock()
+
+	return nil
+}
+
+func (s *Server) materializeClientFile(
+	workspace string,
+	entry syncfs.Entry,
+	onWrite func(int),
+) (int64, error) {
+	targetPath, err := pathutil.SecureJoin(workspace, filepath.FromSlash(entry.Path))
+	if err != nil {
+		return 0, err
+	}
+
+	mode := os.FileMode(entry.Mode)
+	if mode == 0 {
+		mode = defaultFileMode
+	}
+
+	var copied int64
+	err = s.blobStore.MaterializeWithProgress(
+		entry.Hash,
+		targetPath,
+		mode,
+		entry.ModTime,
+		func(n int) {
+			copied += int64(n)
+			onWrite(n)
+		},
+	)
+	if err != nil {
+		return copied, err
+	}
+
+	return copied, nil
+}
+
+func materializeWorkerCount(files int) int {
+	if files <= 1 {
+		return 1
+	}
+
+	if files < materializeParallel {
+		return files
+	}
+
+	return materializeParallel
+}
+
+func syncFileTotals(entries []syncfs.Entry) (int, int64) {
+	files := 0
+	var bytes int64
+
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile {
+			continue
+		}
+
+		files++
+		bytes += entry.Size
+	}
+
+	return files, bytes
 }
 
 func (s *Server) prepareBlobUploadSession(
