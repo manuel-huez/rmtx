@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -24,6 +25,23 @@ func TestResolveTTYModeDefaultsToDisabled(t *testing.T) {
 func TestResolveTTYModeForceAndDisableConflict(t *testing.T) {
 	if _, err := resolveTTYMode(true, true); err == nil {
 		t.Fatal("expected conflict error")
+	}
+}
+
+func TestCRLFLineFeedWriterConvertsLoneLineFeeds(t *testing.T) {
+	var out bytes.Buffer
+	writer := &crlfLineFeedWriter{w: &out}
+
+	if _, err := writer.Write([]byte("one\ntwo\r\nthree\r")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("\nfour\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "one\r\ntwo\r\nthree\r\nfour\r\n"
+	if out.String() != want {
+		t.Fatalf("output=%q want %q", out.String(), want)
 	}
 }
 

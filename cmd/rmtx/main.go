@@ -125,7 +125,7 @@ func runHost(ctx context.Context, args []string) int {
 		return exitUsage
 	}
 
-	logger := log.New(os.Stderr, "rmtx: ", log.LstdFlags)
+	logger := log.New(hostLogWriter(os.Stderr), "rmtx: ", log.LstdFlags)
 	if err := app.RunHost(
 		ctx,
 		app.HostParams{
