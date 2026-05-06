@@ -51,10 +51,14 @@ func main() {
 		os.Exit(host.RunOCIChild(os.Args[2:]))
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stopSignals()
+	}()
 	code := run(ctx, os.Args[1:])
 
-	cancel()
+	stopSignals()
 	os.Exit(code)
 }
 
@@ -1041,6 +1045,8 @@ How rmtx works:
   3. Run "rmtx <command> [args...]" or "rmtx exec -- <command> [args...]".
      rmtx syncs configured mounts to a persistent host context, runs the command
      in that context, streams stdin/stdout/stderr, then syncs changed files back.
+     Ctrl+C asks the host command to stop, then still syncs touched files back.
+     AI agents can interrupt a run without losing host-side edits.
 
 Config lookup:
   Remote commands search upward from the current directory for .rmtx.json, then
@@ -1072,7 +1078,8 @@ Command reference:
   rmtx exec [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
             [--tty|--no-tty] -- <command> [args...]
       Run command remotely. "rmtx <command> [args...]" is shorthand for exec
-      with TTY disabled. Use --tty for interactive shells/programs.
+      with TTY disabled. Use --tty for interactive shells/programs. Ctrl+C
+      cancels the remote command but keeps the connection open for sync-back.
 
   rmtx ping [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Verify host reachability, TLS fingerprint, and pairing.

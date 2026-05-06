@@ -108,6 +108,9 @@ func (s *Server) runOCIPipeCommand(
 	preparedRuntime *preparedRuntime,
 	runLogs *hostLogSubscription,
 ) (int, error) {
+	cancelRun := newRunCancelHandle(cancel)
+	input := s.startPipeInputForwarding(conn, cancelRun.Cancel)
+
 	if err := s.prepareOCIContextSetup(
 		ctx,
 		workspace,
@@ -115,16 +118,18 @@ func (s *Server) runOCIPipeCommand(
 		preparedRuntime,
 		runLogs,
 	); err != nil {
+		input.Stop()
 		return 1, err
 	}
 	runLogs.Flush()
 
 	cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime, runLogs)
 	if err != nil {
+		input.Stop()
 		return 1, err
 	}
 
-	code, runErr := s.runPipeExecCommand(ctx, cancel, conn, cmd)
+	code, runErr := s.runPipeExecCommandWithInput(ctx, cancel, conn, cmd, input, cancelRun)
 
 	return finishCommandWithCleanup(code, runErr, cleanup)
 }
@@ -361,7 +366,7 @@ func (s *Server) runImageSetupCommands(
 			WSLDistro: runtimeSpec.WSLDistro,
 		}
 
-		cmd, cleanup, err := s.ociChildCommand(ctx, spec, rootfs)
+		cmd, cleanup, err := s.ociChildCommand(ctx, spec, rootfs, runLogs)
 		if err != nil {
 			return err
 		}
@@ -369,7 +374,7 @@ func (s *Server) runImageSetupCommands(
 		s.logRun(runLogs, "runtime image setup command start: command=%q", command)
 
 		out, err := runCommandWithLiveOutput(
-			s.logger,
+			s.hostOnlyLogger(),
 			cmd,
 			"runtime image setup command",
 			runLogs,
@@ -494,7 +499,7 @@ func (s *Server) runOCIContextSetupCommands(
 		}
 
 		out, err := runCommandWithLiveOutput(
-			s.logger,
+			s.hostOnlyLogger(),
 			cmd,
 			"runtime context setup command",
 			runLogs,
@@ -597,7 +602,7 @@ func (s *Server) newOCICommand(
 		WSLDistro: request.Runtime.WSLDistro,
 	}
 
-	return s.ociChildCommand(ctx, spec, handle.dir)
+	return s.ociChildCommand(ctx, spec, handle.dir, runLogs)
 }
 
 func finishCommandWithCleanup(code int, runErr error, cleanup commandCleanup) (int, error) {

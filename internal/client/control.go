@@ -7,6 +7,14 @@ import (
 )
 
 func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
+	if err := ensureHostUpdated(ctx, opts, newRunLogger(opts.Stderr)); err != nil {
+		return PingInfo{}, err
+	}
+
+	return pingHost(ctx, opts)
+}
+
+func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	conn, err := dialRemote(ctx, opts)
 	if err != nil {
 		return PingInfo{}, err
@@ -54,7 +62,7 @@ func UpdateHost(
 }
 
 func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
-	conn, err := dialRemote(ctx, opts)
+	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +88,7 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 }
 
 func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteContextsResult, error) {
-	conn, err := dialRemote(ctx, opts.Remote)
+	conn, err := updatedRemoteConn(ctx, opts.Remote)
 	if err != nil {
 		return DeleteContextsResult{}, err
 	}
@@ -109,7 +117,7 @@ func ContextArtifacts(
 	ctx context.Context,
 	opts ContextArtifactsOptions,
 ) (ContextArtifactsResult, error) {
-	conn, err := dialRemote(ctx, opts.Remote)
+	conn, err := updatedRemoteConn(ctx, opts.Remote)
 	if err != nil {
 		return ContextArtifactsResult{}, err
 	}
@@ -136,7 +144,7 @@ func ContextArtifacts(
 }
 
 func CachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, error) {
-	conn, err := dialRemote(ctx, opts)
+	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
 		return CachePruneResult{}, err
 	}
@@ -173,4 +181,12 @@ func dialRemote(ctx context.Context, opts RemoteOptions) (*protocol.Conn, error)
 	}
 
 	return conn, nil
+}
+
+func updatedRemoteConn(ctx context.Context, opts RemoteOptions) (*protocol.Conn, error) {
+	if err := ensureHostUpdated(ctx, opts, newRunLogger(opts.Stderr)); err != nil {
+		return nil, err
+	}
+
+	return dialRemote(ctx, opts)
 }

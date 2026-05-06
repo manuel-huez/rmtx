@@ -254,7 +254,7 @@ func (s *Server) handleHostUpdateRequest(
 		installDir,
 	)
 
-	result, err := runner(ctx, s.logger, targetVersion, installDir, requestLogs)
+	result, err := runner(ctx, s.hostOnlyLogger(), targetVersion, installDir, requestLogs)
 	if err != nil {
 		return fmt.Errorf("update host to %s: %w", targetVersion, err)
 	}
@@ -311,8 +311,4 @@ func (s *Server) logHostUpdateProgress(
 	args ...any,
 ) {
 	s.logger.Printf(format, args...)
-
-	if requestLogs != nil {
-		_, _ = fmt.Fprintf(requestLogs, "rmtx: "+format+"\n", args...)
-	}
 }

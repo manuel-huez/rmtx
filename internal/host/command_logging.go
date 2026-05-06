@@ -150,7 +150,21 @@ func writeRunLogLine(w io.Writer, format string, args ...any) {
 	_, _ = fmt.Fprintf(w, "rmtx: "+format+"\n", args...)
 }
 
+func (s *Server) hostOnlyLogger() *log.Logger {
+	if s != nil && s.opts.Logger != nil {
+		return s.opts.Logger
+	}
+	if s != nil {
+		return s.logger
+	}
+
+	return nil
+}
+
 func (s *Server) logRun(runLogs io.Writer, format string, args ...any) {
 	s.logger.Printf(format, args...)
+	if _, streamedByHostLogger := runLogs.(*hostLogSubscription); streamedByHostLogger {
+		return
+	}
 	writeRunLogLine(runLogs, format, args...)
 }

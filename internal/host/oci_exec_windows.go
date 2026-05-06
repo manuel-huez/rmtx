@@ -27,7 +27,7 @@ func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
 	run ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	if err := checkWSLAvailable(ctx, s.logger, run.spec.WSLDistro); err != nil {
+	if err := checkWSLAvailable(ctx, s.hostOnlyLogger(), run.spec.WSLDistro, run.runLogs); err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
@@ -88,7 +88,12 @@ func nvidiaUnavailableError(err error) error {
 	)
 }
 
-func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro string) error {
+func checkWSLAvailable(
+	ctx context.Context,
+	logger *log.Logger,
+	requestedDistro string,
+	runLogs *hostLogSubscription,
+) error {
 	requestedDistro = strings.TrimSpace(requestedDistro)
 	if requestedDistro == "" {
 		return errors.New("runtime.wsl_distro is required for OCI runtime on Windows")
@@ -107,12 +112,13 @@ func checkWSLAvailable(ctx context.Context, logger *log.Logger, requestedDistro 
 			if logger != nil {
 				logger.Printf("using already installed WSL distro: %s", requestedDistro)
 			}
+			writeRunLogLine(runLogs, "using already installed WSL distro: %s", requestedDistro)
 
 			return nil
 		}
 	}
 
-	if err := installWSLDistro(ctx, logger, requestedDistro); err != nil {
+	if err := installWSLDistro(ctx, logger, requestedDistro, runLogs); err != nil {
 		return fmt.Errorf(
 			"requested WSL distro %q is not installed and auto-install failed: %w",
 			requestedDistro,
@@ -414,7 +420,12 @@ func wslInstalledDistros() ([]string, error) {
 	return distros, nil
 }
 
-func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) error {
+func installWSLDistro(
+	ctx context.Context,
+	logger *log.Logger,
+	distro string,
+	runLogs *hostLogSubscription,
+) error {
 	if strings.TrimSpace(distro) == "" {
 		return errors.New("requested WSL distro is empty")
 	}
@@ -422,6 +433,7 @@ func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) er
 	if logger != nil {
 		logger.Printf("installing WSL distro: %s", distro)
 	}
+	writeRunLogLine(runLogs, "installing WSL distro: %s", distro)
 
 	cmd := exec.CommandContext(
 		ctx,
@@ -432,7 +444,7 @@ func installWSLDistro(ctx context.Context, logger *log.Logger, distro string) er
 	)
 	cmd.Env = os.Environ()
 
-	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro, nil, nil)
+	out, err := runCommandWithLiveOutput(logger, cmd, "wsl install "+distro, runLogs, runLogs)
 	if err != nil {
 		return fmt.Errorf(
 			"install WSL distro %q: %s: %w",

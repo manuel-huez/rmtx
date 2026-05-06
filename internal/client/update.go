@@ -15,25 +15,6 @@ const (
 
 var clientVersion = version.String
 
-func ensureHostUpdatedForRun(
-	ctx context.Context,
-	opts ExecOptions,
-	logger *runLogger,
-) error {
-	return ensureHostUpdated(
-		ctx,
-		RemoteOptions{
-			Address:          opts.Address,
-			DiscoveryService: opts.DiscoveryService,
-			Host:             opts.Host,
-			ClientCertPEM:    opts.ClientCertPEM,
-			ClientKeyPEM:     opts.ClientKeyPEM,
-			Stderr:           opts.Stderr,
-		},
-		logger,
-	)
-}
-
 func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogger) error {
 	targetVersion := clientVersion()
 	if !version.ValidRelease(targetVersion) {
@@ -41,7 +22,7 @@ func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogge
 	}
 
 	for {
-		info, err := Ping(ctx, opts)
+		info, err := pingHost(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -109,7 +90,7 @@ func waitForHostUpdate(
 	var lastErr error
 
 	for {
-		info, err := Ping(waitCtx, opts)
+		info, err := pingHost(waitCtx, opts)
 		if err == nil {
 			cmp, ok := version.CompareRelease(info.Version, targetVersion)
 			if ok && cmp >= 0 {

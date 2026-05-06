@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,6 +334,178 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
 	}
+}
+
+func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	hostCtx, stopHost := context.WithCancel(context.Background())
+	defer stopHost()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(hostCtx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	writeTestFile(t, configPath, `{
+  "version": 1,
+  "context": {"name": "interrupt-sync"},
+  "host": "`+addr+`",
+  "tls": {"host_fingerprint": "`+server.Fingerprint()+`"},
+  "mounts": [{"path": "."}],
+  "discovery": {"enabled": false}
+}`)
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(hostCtx, project, PairParams{
+		ConfigPath:  configPath,
+		Code:        pairCode.Code,
+		ClientLabel: "interrupt-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	stdin := newCloseBlockReader()
+	stdoutReader, stdoutWriter := io.Pipe()
+	runDone := make(chan struct {
+		code int
+		err  error
+	}, 1)
+
+	go func() {
+		code, err := RunExec(runCtx, project, ExecParams{
+			ConfigPath: configPath,
+			Command: []string{
+				"sh",
+				"-c",
+				`printf "host edit\n" > interrupted.txt; printf "ready\n"; sleep 60`,
+			},
+			Stdout:       stdoutWriter,
+			Stderr:       io.Discard,
+			Stdin:        stdin,
+			ForwardStdin: true,
+		})
+		_ = stdoutWriter.Close()
+		runDone <- struct {
+			code int
+			err  error
+		}{code, err}
+	}()
+
+	ready := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len("ready\n"))
+		_, err := io.ReadFull(stdoutReader, buf)
+		if err == nil && string(buf) != "ready\n" {
+			err = errors.New("unexpected stdout before interrupt")
+		}
+		ready <- err
+	}()
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote command did not become ready")
+	}
+
+	cancelRun()
+
+	select {
+	case result := <-runDone:
+		if result.err != nil {
+			t.Fatalf("interrupted run returned error before sync-back: code=%d err=%v", result.code, result.err)
+		}
+		if result.code == 0 {
+			t.Fatal("interrupted run should return non-zero exit code")
+		}
+	case <-time.After(10 * time.Second):
+		stdin.Close()
+		t.Fatal("interrupted run did not finish")
+	}
+	stdin.Close()
+
+	got, err := os.ReadFile(filepath.Join(project, "interrupted.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "host edit\n" {
+		t.Fatalf("interrupted.txt=%q want host edit", string(got))
+	}
+
+	var rerunStdout, rerunStderr bytes.Buffer
+	code, err := RunExec(context.Background(), project, ExecParams{
+		ConfigPath: configPath,
+		Command:    []string{"cat", "interrupted.txt"},
+		Stdout:     &rerunStdout,
+		Stderr:     &rerunStderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("rerun exit code=%d stderr=%s", code, rerunStderr.String())
+	}
+	if rerunStdout.String() != "host edit\n" {
+		t.Fatalf("rerun stdout=%q want host edit", rerunStdout.String())
+	}
+	if !strings.Contains(rerunStderr.String(), "host already has all file blobs") {
+		t.Fatalf("rerun reuploaded interrupted file: stderr=%s", rerunStderr.String())
+	}
+
+	stopHost()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+type closeBlockReader struct {
+	once sync.Once
+	done chan struct{}
+}
+
+func newCloseBlockReader() *closeBlockReader {
+	return &closeBlockReader{done: make(chan struct{})}
+}
+
+func (r *closeBlockReader) Read([]byte) (int, error) {
+	<-r.done
+
+	return 0, io.EOF
+}
+
+func (r *closeBlockReader) Close() {
+	r.once.Do(func() { close(r.done) })
 }
 
 func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {

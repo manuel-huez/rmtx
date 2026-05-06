@@ -19,6 +19,9 @@ func (s *Server) runTTYCommand(
 	preparedRuntime *preparedRuntime,
 	runLogs *hostLogSubscription,
 ) (int, error) {
+	cancelRun := newRunCancelHandle(cancel)
+	input := s.startTTYInputForwarding(conn, cancelRun.Cancel)
+
 	cmd, cleanup, err := s.newTTYSessionCommand(
 		ctx,
 		workspace,
@@ -28,10 +31,11 @@ func (s *Server) runTTYCommand(
 		runLogs,
 	)
 	if err != nil {
+		cancelRun.Cancel()
 		return 1, err
 	}
 
-	code, runErr := s.runTTYExecCommand(ctx, cancel, conn, cmd, request)
+	code, runErr := s.runTTYExecCommand(ctx, cancel, conn, cmd, request, input, cancelRun)
 
 	return finishCommandWithCleanup(code, runErr, cleanup)
 }

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -218,6 +219,77 @@ func TestRunPipeExecCommandHeartbeatsKeepIdleClientAlive(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("command did not finish while client heartbeats were flowing")
+	}
+}
+
+func TestPipeInputForwardingReadsCancelAfterQueuedStdin(t *testing.T) {
+	t.Helper()
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	cancelled := make(chan struct{})
+	server := &Server{logger: log.New(io.Discard, "", 0)}
+	input := server.startPipeInputForwarding(protocol.NewConn(serverConn), func() {
+		select {
+		case <-cancelled:
+		default:
+			close(cancelled)
+		}
+	})
+	defer input.Stop()
+
+	client := protocol.NewConn(clientConn)
+	if err := client.WriteBytes(protocol.MsgStdinData, nil, []byte("queued before command")); err != nil {
+		t.Fatalf("send stdin data: %v", err)
+	}
+	if err := client.WriteJSON(protocol.MsgRunCancel, nil); err != nil {
+		t.Fatalf("send run cancel: %v", err)
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel frame blocked behind queued stdin")
+	}
+}
+
+func TestPipeInputForwardingBackpressuresQueuedStdin(t *testing.T) {
+	t.Helper()
+
+	input := &pipeInputForwarding{done: make(chan error, 1)}
+	input.cond = sync.NewCond(&sync.Mutex{})
+	defer input.Stop()
+
+	if _, err := input.Write(make([]byte, maxQueuedPipeInputBytes)); err != nil {
+		t.Fatalf("fill input queue: %v", err)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := input.Write([]byte("blocked"))
+		writeDone <- err
+	}()
+
+	select {
+	case err := <-writeDone:
+		t.Fatalf("write finished before reader drained queue: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	buf := make([]byte, len("blocked"))
+	if _, err := input.Read(buf); err != nil {
+		t.Fatalf("drain input queue: %v", err)
+	}
+
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write after drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("write stayed blocked after reader drained queue")
 	}
 }
 

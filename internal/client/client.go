@@ -287,7 +287,18 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		formatCommand(opts.Command),
 	)
 
-	if err := ensureHostUpdatedForRun(ctx, opts, logger); err != nil {
+	if err := ensureHostUpdated(
+		ctx,
+		RemoteOptions{
+			Address:          opts.Address,
+			DiscoveryService: opts.DiscoveryService,
+			Host:             opts.Host,
+			ClientCertPEM:    opts.ClientCertPEM,
+			ClientKeyPEM:     opts.ClientKeyPEM,
+			Stderr:           opts.Stderr,
+		},
+		logger,
+	); err != nil {
 		return 1, err
 	}
 
@@ -311,10 +322,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	}
 	defer closeQuietly(conn.Raw())
 
-	stopContextClose := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
-	defer stopContextClose()
-
-	ready, stopLiveness, err := runHandshakeWithLiveness(
+	ready, stopRunSession, err := runHandshakeWithLiveness(
 		ctx,
 		conn,
 		request,
@@ -325,7 +333,7 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	defer stopLiveness()
+	defer stopRunSession()
 
 	logger.Printf(
 		"remote workspace ready: context=%s workspace=%s",
@@ -748,7 +756,19 @@ func runHandshake(
 		return protocol.WorkspaceReady{}, err
 	}
 
-	return finishRunHandshake(ctx, conn, blobSources, opts, logger)
+	ready, stopCancelForwarder, err := finishRunHandshake(
+		ctx,
+		conn,
+		blobSources,
+		opts,
+		logger,
+		nil,
+	)
+	if stopCancelForwarder != nil {
+		stopCancelForwarder()
+	}
+
+	return ready, err
 }
 
 func runHandshakeWithLiveness(
@@ -765,15 +785,34 @@ func runHandshakeWithLiveness(
 		return protocol.WorkspaceReady{}, nil, err
 	}
 
+	// Before sync_complete, run_cancel would collide with blob/sync frames.
+	stopPreSyncCancel := context.AfterFunc(ctx, func() { closeQuietly(conn.Raw()) })
 	stopLiveness := startConnectionLiveness(ctx, conn, true)
 
-	ready, err := finishRunHandshake(ctx, conn, blobSources, opts, logger)
+	ready, stopCancelForwarder, err := finishRunHandshake(
+		ctx,
+		conn,
+		blobSources,
+		opts,
+		logger,
+		func() { stopPreSyncCancel() },
+	)
 	if err != nil {
+		stopPreSyncCancel()
 		stopLiveness()
+		if stopCancelForwarder != nil {
+			stopCancelForwarder()
+		}
 		return protocol.WorkspaceReady{}, nil, err
 	}
 
-	return ready, stopLiveness, nil
+	return ready, func() {
+		stopPreSyncCancel()
+		stopLiveness()
+		if stopCancelForwarder != nil {
+			stopCancelForwarder()
+		}
+	}, nil
 }
 
 func finishRunHandshake(
@@ -782,24 +821,32 @@ func finishRunHandshake(
 	blobSources map[string]string,
 	opts ExecOptions,
 	logger *runLogger,
-) (protocol.WorkspaceReady, error) {
+	onSyncComplete func(),
+) (protocol.WorkspaceReady, func(), error) {
 	need, err := expectDataFrameWithOutput[protocol.NeedBlobs](
 		conn,
 		protocol.MsgNeedBlobs,
 		opts.Stderr,
 	)
 	if err != nil {
-		return protocol.WorkspaceReady{}, err
+		return protocol.WorkspaceReady{}, nil, err
 	}
 
 	logger.Stage("upload local files")
 	if err := sendMissingBlobs(ctx, conn, need, blobSources, opts, logger); err != nil {
-		return protocol.WorkspaceReady{}, err
+		return protocol.WorkspaceReady{}, nil, err
 	}
 
 	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
-		return protocol.WorkspaceReady{}, err
+		return protocol.WorkspaceReady{}, nil, err
 	}
+
+	if onSyncComplete != nil {
+		onSyncComplete()
+	}
+
+	// After sync_complete, the host can queue run_cancel while still streaming logs.
+	stopCancelForwarder := startRunCancelForwarder(ctx, conn, logger)
 
 	ready, err := expectDataFrameWithOutput[protocol.WorkspaceReady](
 		conn,
@@ -807,12 +854,13 @@ func finishRunHandshake(
 		opts.Stderr,
 	)
 	if err != nil {
-		return protocol.WorkspaceReady{}, err
+		stopCancelForwarder()
+		return protocol.WorkspaceReady{}, nil, err
 	}
 
 	logger.Printf("local-to-host sync complete")
 
-	return ready, nil
+	return ready, stopCancelForwarder, nil
 }
 
 func expectDataFrameWithOutput[T any](
@@ -897,13 +945,47 @@ func processExecFrames(
 		exitCode = updatedExitCode
 
 		if done {
-			if err := <-stdinErrCh; err != nil {
+			if err := waitForStdinForwarding(ctx, stdinErrCh); err != nil {
 				return exitCode, err
 			}
 
 			return exitCode, nil
 		}
 	}
+}
+
+func waitForStdinForwarding(ctx context.Context, stdinErrCh <-chan error) error {
+	select {
+	case err := <-stdinErrCh:
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		return err
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+func startRunCancelForwarder(
+	ctx context.Context,
+	conn *protocol.Conn,
+	logger *runLogger,
+) func() {
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			logger.Printf("interrupt received; requesting remote command cancel before sync-back")
+			if err := conn.WriteJSON(protocol.MsgRunCancel, nil); err != nil {
+				logger.Printf("remote cancel request failed: %v", err)
+			}
+		case <-done:
+		}
+	}()
+
+	return func() { close(done) }
 }
 
 func processTTYExecFrames(

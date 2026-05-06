@@ -50,6 +50,7 @@ func TestOCIChildCommandCleanupRemovesSpecFile(t *testing.T) {
 			Env:     []string{"SECRET_TOKEN=token"},
 		},
 		t.TempDir(),
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)

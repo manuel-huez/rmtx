@@ -128,7 +128,7 @@ func TestHostLogHubDoesNotStreamGeneralLogs(t *testing.T) {
 	defer sub.Close()
 
 	logger := log.New(hub, "", 0)
-	logger.Printf("pair request from 127.0.0.1 client=%q code=%s", "client", "123456")
+	logger.Printf("request received: remote=%s type=%s", "127.0.0.1", protocol.MsgRunRequest)
 
 	if err := clientRaw.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestHostLogHubDoesNotStreamGeneralLogs(t *testing.T) {
 		}
 	}
 
-	want := "pair request from 127.0.0.1 client=\"client\" code=123456\n"
+	want := "request received: remote=127.0.0.1 type=run_request\n"
 	if hostLogs.String() != want {
 		t.Fatalf("host logs=%q want %q", hostLogs.String(), want)
 	}

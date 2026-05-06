@@ -216,6 +216,50 @@ func TestRunHandshakeStreamsSetupOutput(t *testing.T) {
 	}
 }
 
+func TestRunHandshakeCancelAfterSyncCompleteStreamsOutputAndSendsCancel(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverErr := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		serverErr <- serveCancellableHandshake(protocol.NewConn(serverConn), cancel)
+	}()
+
+	var stderr bytes.Buffer
+
+	ready, stopSession, err := runHandshakeWithLiveness(
+		ctx,
+		protocol.NewConn(clientConn),
+		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{"true"}},
+		nil,
+		ExecOptions{Stderr: &stderr},
+		newRunLogger(&bytes.Buffer{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopSession()
+
+	if ready.ContextID != "ctx" {
+		t.Fatalf("ready context=%s want ctx", ready.ContextID)
+	}
+
+	if !strings.Contains(stderr.String(), "setup after cancel\n") {
+		t.Fatalf("missing setup output after cancel in %q", stderr.String())
+	}
+
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func serveHandshakeSetupOutput(conn *protocol.Conn) error {
 	if err := expectDiscardedClientFrame(conn, protocol.MsgRunRequest); err != nil {
 		return err
@@ -247,6 +291,36 @@ func serveHandshakeSetupOutput(conn *protocol.Conn) error {
 	)
 }
 
+func serveCancellableHandshake(conn *protocol.Conn, cancel context.CancelFunc) error {
+	if err := expectDiscardedClientFrame(conn, protocol.MsgRunRequest); err != nil {
+		return err
+	}
+
+	if err := conn.WriteJSON(protocol.MsgNeedBlobs, protocol.NeedBlobs{}); err != nil {
+		return err
+	}
+
+	if err := expectClientFrameSkippingHeartbeat(conn, protocol.MsgSyncComplete); err != nil {
+		return err
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	if err := writeSetupStderr(conn, "setup after cancel\n"); err != nil {
+		return err
+	}
+
+	if err := conn.WriteJSON(
+		protocol.MsgWorkspaceReady,
+		protocol.WorkspaceReady{ContextID: "ctx", Workspace: "/tmp/rmtx"},
+	); err != nil {
+		return err
+	}
+
+	return expectClientFrameSkippingHeartbeat(conn, protocol.MsgRunCancel)
+}
+
 func expectDiscardedClientFrame(conn *protocol.Conn, wantType string) error {
 	head, err := conn.ReadHeader()
 	if err != nil {
@@ -258,6 +332,29 @@ func expectDiscardedClientFrame(conn *protocol.Conn, wantType string) error {
 	}
 
 	return conn.DiscardPayload(head)
+}
+
+func expectClientFrameSkippingHeartbeat(conn *protocol.Conn, wantType string) error {
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return err
+		}
+
+		if err := conn.DiscardPayload(head); err != nil {
+			return err
+		}
+
+		if head.Type == protocol.MsgHeartbeat {
+			continue
+		}
+
+		if head.Type != wantType {
+			return fmt.Errorf("expected %s, got %s", wantType, head.Type)
+		}
+
+		return nil
+	}
 }
 
 func writeSetupStderr(conn *protocol.Conn, output string) error {

@@ -21,6 +21,7 @@ const (
 	MsgWorkspaceReady           = "workspace_ready"
 	MsgStdinData                = "stdin_data"
 	MsgStdinClose               = "stdin_close"
+	MsgRunCancel                = "run_cancel"
 	MsgResizeTTY                = "resize_tty"
 	MsgExecOutput               = "exec_output"
 	MsgExecExit                 = "exec_exit"

@@ -21,3 +21,11 @@ func (s *Server) runTTYCommand(
 ) (int, error) {
 	return 1, errors.New("interactive TTY is not supported on this platform")
 }
+
+func (s *Server) consumeQueuedTTYInput(
+	_ *protocol.Conn,
+	_ *ttyInputForwarding,
+	_ func(),
+) error {
+	return errors.New("interactive TTY is not supported on this platform")
+}

@@ -42,21 +42,18 @@ func (s *Server) runPlatformTTYExecCommand(
 
 	_ = slave.Close()
 
+	if run.input != nil {
+		if err := run.input.Attach(master); err != nil {
+			run.cancelRun()
+			return exitCode(run.cmd.Wait()), err
+		}
+	}
+
 	watchRunContext(ctx, run.cancelRun)
 
 	outputDone := make(chan error, 1)
 
 	go func() { outputDone <- streamPipe(run.conn, master, "stdout") }()
-
-	go func() {
-		if err := s.consumeTTYInput(run.conn, master); err != nil {
-			run.cancelRun()
-
-			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
-				s.logger.Printf("TTY input forwarding ended: %v", err)
-			}
-		}
-	}()
 
 	waitErr := run.cmd.Wait()
 	_ = master.Close()

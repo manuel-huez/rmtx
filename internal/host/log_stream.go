@@ -34,13 +34,14 @@ func (h *hostLogHub) Subscribe(conn *protocol.Conn) *hostLogSubscription {
 type hostLogSubscription struct {
 	conn *protocol.Conn
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	queue   [][]byte
-	writing bool
-	closed  bool
-	err     error
-	done    chan struct{}
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     [][]byte
+	writing   bool
+	closed    bool
+	err       error
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func newHostLogSubscription(conn *protocol.Conn) *hostLogSubscription {
@@ -101,19 +102,14 @@ func (s *hostLogSubscription) Close() {
 		return
 	}
 
-	s.mu.Lock()
-	if !s.closed {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
 		s.closed = true
-		s.queue = nil
 		s.cond.Broadcast()
-	}
+		s.mu.Unlock()
 
-	wait := !s.writing
-	s.mu.Unlock()
-
-	if wait {
 		<-s.done
-	}
+	})
 }
 
 func (s *hostLogSubscription) run() {

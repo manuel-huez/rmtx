@@ -608,7 +608,7 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	return s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs)
+	return nil
 }
 
 func (s *Server) cleanRunWorkspace(
@@ -961,6 +961,12 @@ func (s *Server) executeAndSyncRun(
 
 	handle.meta.UpdatedAt = time.Now().UTC()
 	if err := saveContextMetadata(handle.dir, handle.meta); err != nil {
+		return err
+	}
+
+	runLogs.Flush()
+
+	if err := s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs); err != nil {
 		return err
 	}
 
@@ -1335,7 +1341,7 @@ func (s *Server) sendChangedFileBlobs(
 			}
 		}
 
-		if err := sendChangedFileBlob(conn, workspace, entry, onRead); err != nil {
+		if err := s.sendChangedFileBlob(conn, workspace, entry, onRead); err != nil {
 			return err
 		}
 
@@ -1347,7 +1353,7 @@ func (s *Server) sendChangedFileBlobs(
 	return nil
 }
 
-func sendChangedFileBlob(
+func (s *Server) sendChangedFileBlob(
 	conn *protocol.Conn,
 	workspace string,
 	entry syncfs.Entry,
@@ -1362,7 +1368,7 @@ func sendChangedFileBlob(
 
 	defer func() { _ = f.Close() }()
 
-	return conn.WriteFrom(
+	if err := conn.WriteFrom(
 		protocol.MsgChangeBlob,
 		protocol.BlobInfo{
 			Path:    entry.Path,
@@ -1373,7 +1379,26 @@ func sendChangedFileBlob(
 		},
 		&logReader{src: f, onRead: onRead},
 		entry.Size,
-	)
+	); err != nil {
+		return err
+	}
+
+	if s.blobStore.Has(entry.Hash) {
+		return nil
+	}
+
+	blob, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open change blob for host store %s: %w", entry.Path, err)
+	}
+
+	defer func() { _ = blob.Close() }()
+
+	if err := s.blobStore.Store(entry.Hash, entry.Size, blob); err != nil {
+		return fmt.Errorf("store changed blob %s: %w", entry.Path, err)
+	}
+
+	return nil
 }
 
 func (s *Server) requireTrustedClient(conn *protocol.Conn) (*x509.Certificate, error) {
@@ -1723,13 +1748,32 @@ func (s *Server) runPipeExecCommand(
 	conn *protocol.Conn,
 	cmd *exec.Cmd,
 ) (int, error) {
-	cancelRun := s.commandCancel(cmd, cancel)
-	defer cancelRun()
+	cancelRun := newRunCancelHandle(cancel)
+	input := s.startPipeInputForwarding(conn, cancelRun.Cancel)
 
-	stdin, stdout, stderr, err := commandPipes(cmd)
+	return s.runPipeExecCommandWithInput(ctx, cancel, conn, cmd, input, cancelRun)
+}
+
+func (s *Server) runPipeExecCommandWithInput(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+	cmd *exec.Cmd,
+	input *pipeInputForwarding,
+	cancelRunHandle *runCancelHandle,
+) (int, error) {
+	cancelRun := s.commandCancel(cmd, cancel)
+	if cancelRunHandle != nil {
+		cancelRunHandle.Set(cancelRun)
+	}
+	defer cancelRun()
+	defer input.Stop()
+
+	stdout, stderr, err := commandOutputPipes(cmd)
 	if err != nil {
 		return 1, err
 	}
+	cmd.Stdin = input.Reader()
 
 	if err := cmd.Start(); err != nil {
 		return exitCode(err), fmt.Errorf("start command: %w", err)
@@ -1759,24 +1803,13 @@ func (s *Server) runPipeExecCommand(
 		}
 	}()
 
-	stdinDone := make(chan error, 1)
-
-	go func() {
-		err := s.consumePipeInput(conn, stdin)
-		if err != nil {
-			cancelRun()
-		}
-
-		stdinDone <- err
-	}()
-
 	waitErr := cmd.Wait()
-	_ = stdin.Close()
 
 	outWG.Wait()
+	input.Stop()
 
 	select {
-	case err := <-stdinDone:
+	case err := <-input.Done():
 		if err != nil && !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 			s.logger.Printf("stdin forwarding ended: %v", err)
 		}
@@ -1786,52 +1819,18 @@ func (s *Server) runPipeExecCommand(
 	return exitCode(waitErr), waitErr
 }
 
-func commandPipes(cmd *exec.Cmd) (io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open stdin pipe: %w", err)
-	}
-
+func commandOutputPipes(cmd *exec.Cmd) (io.ReadCloser, io.ReadCloser, error) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open stdout pipe: %w", err)
+		return nil, nil, fmt.Errorf("open stdout pipe: %w", err)
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open stderr pipe: %w", err)
+		return nil, nil, fmt.Errorf("open stderr pipe: %w", err)
 	}
 
-	return stdin, stdout, stderr, nil
-}
-
-func (s *Server) consumePipeInput(conn *protocol.Conn, stdin io.WriteCloser) error {
-	var stdinClosed bool
-
-	for {
-		head, err := conn.ReadHeader()
-		if err != nil {
-			return err
-		}
-
-		if stdinClosed {
-			if err := conn.DiscardPayload(head); err != nil {
-				return err
-			}
-
-			continue
-		}
-
-		done, err := s.handleInputFrame(conn, head, stdin, false)
-		if err != nil {
-			return err
-		}
-
-		if done {
-			stdinClosed = true
-			_ = stdin.Close()
-		}
-	}
+	return stdout, stderr, nil
 }
 
 func (s *Server) newSessionCommand(
@@ -1854,54 +1853,20 @@ func (s *Server) newSessionCommand(
 	return cmd
 }
 
-func (s *Server) handleInputFrame(
-	conn *protocol.Conn,
-	head protocol.Header,
-	writer io.Writer,
-	allowResize bool,
-) (bool, error) {
-	switch head.Type {
-	case protocol.MsgHeartbeat:
-		return false, conn.DiscardPayload(head)
-	case protocol.MsgStdinData:
-		_, err := io.Copy(writer, conn.PayloadReader(head))
-		return false, err
-	case protocol.MsgStdinClose:
-		return true, nil
-	case protocol.MsgResizeTTY:
-		if !allowResize {
-			if err := conn.DiscardPayload(head); err != nil {
-				return false, err
-			}
-
-			return false, fmt.Errorf("unexpected frame during stdin phase: %s", head.Type)
-		}
-
-		return false, handleTTYResize(head, writer)
-	default:
-		if err := conn.DiscardPayload(head); err != nil {
-			return false, err
-		}
-
-		phase := "stdin"
-		if allowResize {
-			phase = "TTY"
-		}
-
-		return false, fmt.Errorf("unexpected frame during %s phase: %s", phase, head.Type)
-	}
-}
-
 func handleTTYResize(head protocol.Header, writer io.Writer) error {
 	size, err := protocol.DecodeData[protocol.TTYSize](head)
 	if err != nil {
 		return err
 	}
 
+	return resizeTTYWriter(writer, size.Rows, size.Cols)
+}
+
+func resizeTTYWriter(writer io.Writer, rows, cols int) error {
 	if resizer, ok := writer.(interface {
 		ResizeTTY(rows, cols int) error
 	}); ok {
-		return resizer.ResizeTTY(size.Rows, size.Cols)
+		return resizer.ResizeTTY(rows, cols)
 	}
 
 	file, ok := writer.(*os.File)
@@ -1909,7 +1874,7 @@ func handleTTYResize(head protocol.Header, writer io.Writer) error {
 		return nil
 	}
 
-	return resizePTY(file, size.Rows, size.Cols)
+	return resizePTY(file, rows, cols)
 }
 
 func streamPipe(conn *protocol.Conn, src io.Reader, stream string) error {

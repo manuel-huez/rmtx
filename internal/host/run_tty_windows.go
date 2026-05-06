@@ -56,18 +56,12 @@ func (s *Server) runPlatformTTYExecCommand(
 
 	go func() { outputDone <- streamPipe(run.conn, pty, "stdout") }()
 
-	go func() {
-		if err := s.consumeTTYInput(
-			run.conn,
-			&windowsTTY{pty: pty},
-		); err != nil {
+	if run.input != nil {
+		if err := run.input.Attach(&windowsTTY{pty: pty}); err != nil {
 			run.cancelRun()
-
-			if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
-				s.logger.Printf("TTY input forwarding ended: %v", err)
-			}
+			return 1, err
 		}
-	}()
+	}
 
 	watchRunContext(ctx, run.cancelRun)
 
