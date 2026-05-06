@@ -16,6 +16,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
 func TestPrepareUploadItemsUsesRelativeDisplayPath(t *testing.T) {
@@ -67,6 +68,33 @@ func TestRunLoggerStageUsesDelimiter(t *testing.T) {
 
 	if got, want := logs.String(), "rmtx: === execute remote command ===\n"; got != want {
 		t.Fatalf("stage log=%q want %q", got, want)
+	}
+}
+
+func TestBuildRunRequestRejectsInvalidSyncBack(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	_, _, err := buildRunRequest(
+		context.Background(),
+		root,
+		".",
+		&ExecOptions{
+			Mounts:    []syncfs.MountSpec{{Path: "src"}},
+			SyncBack:  []string{"generated/"},
+			ContextID: "ctx",
+		},
+		newRunLogger(&logs),
+	)
+	if err == nil {
+		t.Fatal("expected invalid sync_back to fail")
+	}
+
+	if !strings.Contains(err.Error(), "sync_back path") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

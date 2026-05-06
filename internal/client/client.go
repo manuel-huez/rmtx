@@ -452,6 +452,10 @@ func buildRunRequest(
 ) (syncfs.BuildResult, protocol.RunRequest, error) {
 	logger.Printf("local-to-host sync started: root=%s mounts=%s", root, formatMounts(opts.Mounts))
 
+	if err := syncfs.ValidateSyncBack(root, opts.Mounts, opts.SyncBack); err != nil {
+		return syncfs.BuildResult{}, protocol.RunRequest{}, err
+	}
+
 	previous := loadManifestCache(root, opts.ContextID, logger)
 
 	manifest, err := syncfs.BuildManifestContextOptions(

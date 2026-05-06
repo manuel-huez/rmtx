@@ -227,6 +227,61 @@ func TestFilterEntriesByPathNilIncludesAllEmptyIncludesNone(t *testing.T) {
 	}
 }
 
+func TestValidateSyncBackRejectsUnmountedPaths(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "src", "main.go"), "package main\n")
+
+	err := ValidateSyncBack(root, []MountSpec{{Path: "src"}}, []string{"generated/"})
+	if err == nil {
+		t.Fatal("expected unmounted sync_back path to fail")
+	}
+
+	if !strings.Contains(err.Error(), "sync_back path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateSyncBackRejectsIgnoredPaths(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "ignored", "out.txt"), "ignored")
+
+	err := ValidateSyncBack(
+		root,
+		[]MountSpec{{Path: ".", Exclude: []string{"ignored/**"}}},
+		[]string{"ignored/"},
+	)
+	if err == nil {
+		t.Fatal("expected ignored sync_back path to fail")
+	}
+}
+
+func TestValidateSyncBackAllowsMountedGeneratedPaths(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "src", "main.go"), "package main\n")
+
+	if err := ValidateSyncBack(
+		root,
+		[]MountSpec{{Path: "."}},
+		[]string{"coverage/", "generated/report.json", "logs/*.txt"},
+	); err != nil {
+		t.Fatalf("expected mounted sync_back paths to pass: %v", err)
+	}
+}
+
+func TestValidateSyncBackUsesMountRelativeExcludes(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "src", "main.go"), "package main\n")
+
+	err := ValidateSyncBack(
+		root,
+		[]MountSpec{{Path: "src", Exclude: []string{"generated/**"}}},
+		[]string{"src/generated/"},
+	)
+	if err == nil {
+		t.Fatal("expected mount-relative exclude to fail")
+	}
+}
+
 func TestNormalizeModesUsesReferenceModeForEquivalentEntries(t *testing.T) {
 	reference := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o644}}
 	entries := []Entry{{Path: "file.txt", Kind: KindFile, Hash: "hash", Size: 4, Mode: 0o666}}

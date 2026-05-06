@@ -679,6 +679,165 @@ func FilterEntriesByPath(entries []Entry, includes []string) []Entry {
 	return out
 }
 
+func ValidateSyncBack(root string, mounts []MountSpec, syncBack []string) error {
+	if syncBack == nil || len(syncBack) == 0 {
+		return nil
+	}
+
+	root, mounts, err := normalizeBuildInputs(root, mounts)
+	if err != nil {
+		return err
+	}
+
+	for _, include := range syncBack {
+		normalized := normalizePattern(include)
+		if normalized == "" {
+			continue
+		}
+
+		if !syncBackPatternEligible(root, mounts, normalized) {
+			return fmt.Errorf("sync_back path %q is not covered by mounted, non-ignored files", include)
+		}
+	}
+
+	return nil
+}
+
+func syncBackPatternEligible(root string, mounts []MountSpec, pattern string) bool {
+	base := literalPatternPrefix(pattern)
+	sample := samplePatternPath(pattern)
+
+	for _, mount := range mounts {
+		mountPath, err := resolveMount(root, mount.Path)
+		if err != nil {
+			continue
+		}
+
+		mountRelRoot, err := filepath.Rel(root, mountPath)
+		if err != nil {
+			continue
+		}
+
+		mountRelRoot = normalizeRel(mountRelRoot)
+		if !pathUnderOrEqual(base, mountRelRoot) {
+			continue
+		}
+
+		matcher := newExcludeMatcher(mount.Exclude)
+		relMountBase := relFromMount(mountRelRoot, base)
+		relMountSample := relFromMount(mountRelRoot, sample)
+		if matcher.Match(base, relMountBase) || matcher.Match(sample, relMountSample) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func literalPatternPrefix(pattern string) string {
+	parts := splitPath(pattern)
+	prefix := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.ContainsAny(part, "*?[") {
+			break
+		}
+
+		prefix = append(prefix, part)
+	}
+
+	if len(prefix) == 0 {
+		return "."
+	}
+
+	return path.Join(prefix...)
+}
+
+func samplePatternPath(pattern string) string {
+	parts := splitPath(pattern)
+	for i, part := range parts {
+		switch {
+		case part == "**":
+			parts[i] = "x"
+		case strings.ContainsAny(part, "*?["):
+			parts[i] = samplePatternSegment(part)
+		}
+	}
+
+	if len(parts) == 0 {
+		return "."
+	}
+
+	return path.Join(parts...)
+}
+
+func samplePatternSegment(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '*', '?':
+			b.WriteByte('x')
+		case '[':
+			end := strings.IndexByte(pattern[i+1:], ']')
+			if end >= 0 {
+				b.WriteByte(sampleCharClass(pattern[i+1 : i+1+end]))
+				i += end + 1
+				continue
+			}
+
+			b.WriteByte('x')
+		default:
+			b.WriteByte(pattern[i])
+		}
+	}
+
+	if b.Len() == 0 {
+		return "x"
+	}
+
+	return b.String()
+}
+
+func sampleCharClass(class string) byte {
+	class = strings.TrimPrefix(class, "!")
+	class = strings.TrimPrefix(class, "^")
+	if class == "" {
+		return 'x'
+	}
+
+	if len(class) >= 3 && class[1] == '-' {
+		return class[0]
+	}
+
+	return class[0]
+}
+
+func pathUnderOrEqual(rel, base string) bool {
+	rel = normalizeRel(rel)
+	base = normalizeRel(base)
+
+	return base == "." || rel == base || strings.HasPrefix(rel, base+"/")
+}
+
+func relFromMount(mountRelRoot, rel string) string {
+	rel = normalizeRel(rel)
+	mountRelRoot = normalizeRel(mountRelRoot)
+	if mountRelRoot == "." {
+		return rel
+	}
+
+	if rel == mountRelRoot {
+		return "."
+	}
+
+	if strings.HasPrefix(rel, mountRelRoot+"/") {
+		return strings.TrimPrefix(rel, mountRelRoot+"/")
+	}
+
+	return rel
+}
+
 func DeletePaths(root string, paths []string) error {
 	sorted := append([]string(nil), paths...)
 	sort.Slice(sorted, func(i, j int) bool { return depth(sorted[i]) > depth(sorted[j]) })
