@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -18,6 +20,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/version"
+	"github.com/manuel-huez/rmtx/internal/wslconfig"
 )
 
 const exitUsage = 2
@@ -25,6 +28,8 @@ const tabWriterTabWidth = 8
 const tabWriterPadding = 2
 const defaultPairCodeTTL = 5 * time.Minute
 const commandPrune = "prune"
+
+var errSelectionCancelled = errors.New("selection cancelled")
 
 type remoteFlags struct {
 	hostAddr         *string
@@ -53,6 +58,7 @@ func main() {
 	os.Exit(code)
 }
 
+//nolint:cyclop // Top-level command dispatch is intentionally explicit.
 func run(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		printUsage(os.Stderr)
@@ -77,6 +83,8 @@ func run(ctx context.Context, args []string) int {
 		return runContext(ctx, args[1:])
 	case "cache":
 		return runCache(ctx, args[1:])
+	case "wsl":
+		return runWSL(ctx, args[1:])
 	case "help", "--help", "-h":
 		return runHelp(args[1:])
 	default:
@@ -706,6 +714,227 @@ func runCache(ctx context.Context, args []string) int {
 	return 0
 }
 
+//nolint:cyclop // Interactive command keeps validation and side effects in visible order.
+func runWSL(ctx context.Context, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "error: wsl requires config")
+		return exitUsage
+	}
+
+	if args[0] != "config" {
+		fmt.Fprintln(os.Stderr, "error: wsl supports only config")
+		return exitUsage
+	}
+
+	fs := flag.NewFlagSet("rmtx wsl config", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	profileFlag := fs.String("profile", "", "profile to apply: 50 or 100")
+	pathFlag := fs.String("path", "", "path to .wslconfig")
+	yes := fs.Bool("yes", false, "apply without confirmation")
+	noRestart := fs.Bool("no-restart", false, "do not run wsl --shutdown after writing")
+	dryRun := fs.Bool("dry-run", false, "print proposed settings without writing")
+	if err := fs.Parse(args[1:]); err != nil {
+		return exitUsage
+	}
+
+	specs, err := wslconfig.DetectSystemSpecs()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	path := *pathFlag
+	if strings.TrimSpace(path) == "" {
+		path, err = wslconfig.DefaultPath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+	}
+
+	file, err := wslconfig.Read(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	profiles, err := wslconfig.Profiles(specs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	printWSLConfigStatus(os.Stdout, path, specs, file, profiles)
+
+	input := bufio.NewReader(os.Stdin)
+	selected, err := selectWSLProfile(*profileFlag, profiles, input, os.Stdout)
+	if errors.Is(err, errSelectionCancelled) {
+		_, _ = fmt.Fprintln(os.Stdout, "cancelled")
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	next := wslconfig.Apply(file.Content, wslconfig.SectionWSL2, selected.Settings)
+	_, _ = fmt.Fprintf(
+		os.Stdout,
+		"proposed\tprocessors=%s\tmemory=%s\n",
+		selected.Settings["processors"],
+		selected.Settings["memory"],
+	)
+
+	if *dryRun {
+		return 0
+	}
+
+	if !*yes && !confirm(input, os.Stdout, "Apply changes to "+path+"? [y/N]: ") {
+		_, _ = fmt.Fprintln(os.Stdout, "cancelled")
+		return 0
+	}
+
+	if err := wslconfig.Write(path, next); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintln(os.Stdout, "updated\t"+path)
+
+	if *noRestart {
+		_, _ = fmt.Fprintln(os.Stdout, "restart\tskipped")
+		return 0
+	}
+
+	restart := *yes || confirm(input, os.Stdout, "Run wsl --shutdown now? [y/N]: ")
+	if !restart {
+		_, _ = fmt.Fprintln(os.Stdout, "restart\tskipped")
+		return 0
+	}
+
+	if err := wslconfig.Shutdown(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintln(os.Stdout, "restart\twsl shutdown complete")
+
+	return 0
+}
+
+func printWSLConfigStatus(
+	w io.Writer,
+	path string,
+	specs wslconfig.SystemSpecs,
+	file wslconfig.File,
+	profiles []wslconfig.Profile,
+) {
+	_, _ = fmt.Fprintf(
+		w,
+		"system\tprocessors=%d\tmemory=%s\n",
+		specs.LogicalProcessors,
+		formatGiB(specs.TotalMemoryBytes),
+	)
+	_, _ = fmt.Fprintf(w, "config\t%s\texists=%t\n", path, file.Exists)
+	_, _ = fmt.Fprintf(
+		w,
+		"current\tprocessors=%s\tmemory=%s\n",
+		settingOrDefault(file.Settings, "processors", fmt.Sprintf("default:%d", specs.LogicalProcessors)),
+		settingOrDefault(file.Settings, "memory", "default:50%"),
+	)
+
+	_, _ = fmt.Fprintln(
+		w,
+		"gpu\t.wslconfig has no global GPU key; WSL GPU defaults enabled, rmtx OCI uses runtime.gpu=nvidia",
+	)
+
+	for i, profile := range profiles {
+		_, _ = fmt.Fprintf(
+			w,
+			"option\t%d\t%s\tprocessors=%s\tmemory=%s\n",
+			i+1,
+			profile.Name,
+			profile.Settings["processors"],
+			profile.Settings["memory"],
+		)
+	}
+}
+
+func selectWSLProfile(
+	value string,
+	profiles []wslconfig.Profile,
+	in io.Reader,
+	out io.Writer,
+) (*wslconfig.Profile, error) {
+	value = strings.TrimSpace(value)
+	if value != "" {
+		for i := range profiles {
+			if strings.EqualFold(value, profiles[i].Name) || strings.TrimSuffix(profiles[i].Name, "%") == value {
+				return &profiles[i], nil
+			}
+		}
+
+		return nil, fmt.Errorf("unknown profile %q", value)
+	}
+
+	_, _ = fmt.Fprint(out, "Select profile [1-2, q]: ")
+	line, err := readLine(in)
+	if err != nil {
+		return nil, err
+	}
+
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "q", "quit", "cancel", "":
+		return nil, errSelectionCancelled
+	case "1":
+		return &profiles[0], nil
+	case "2":
+		return &profiles[1], nil
+	default:
+		return nil, fmt.Errorf("invalid selection %q", strings.TrimSpace(line))
+	}
+}
+
+func confirm(in io.Reader, out io.Writer, prompt string) bool {
+	_, _ = fmt.Fprint(out, prompt)
+	line, err := readLine(in)
+	if err != nil {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func readLine(in io.Reader) (string, error) {
+	reader, ok := in.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(in)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+
+	return strings.TrimSpace(line), nil
+}
+
+func settingOrDefault(settings map[string]string, key string, fallback string) string {
+	if value := strings.TrimSpace(settings[key]); value != "" {
+		return value
+	}
+
+	return fallback
+}
+
+func formatGiB(bytes uint64) string {
+	return fmt.Sprintf("%dGB", bytes/wslconfig.OneGiB)
+}
+
 func runExec(ctx context.Context, params app.ExecParams) int {
 	cwd, err := mustGetwd()
 	if err != nil {
@@ -779,6 +1008,7 @@ Usage:
   rmtx ping [flags]
   rmtx context [list|delete|prune|artifacts] [flags]
   rmtx cache prune [flags]
+  rmtx wsl config [flags]
   rmtx version
   rmtx <command> [args...]
 
@@ -797,6 +1027,7 @@ Examples:
   rmtx context delete --current
   rmtx context artifacts list --current
   rmtx cache prune
+  rmtx wsl config
 
 Help topics:
   rmtx help commands       full command reference
@@ -867,6 +1098,12 @@ Command reference:
 
   rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Delete host global OCI cache data with no remaining context refs.
+
+  rmtx wsl config [--profile 50|100] [--yes] [--no-restart]
+                  [--path PATH] [--dry-run]
+      Windows only. Show system CPU/RAM, show current user-profile .wslconfig
+      [wsl2] processors/memory settings, offer half and full profiles, write
+      selected settings, then optionally run "wsl --shutdown".
 
 Remote resolution order:
   --host ADDR, RMTX_HOST env var, config host, LAN discovery.
