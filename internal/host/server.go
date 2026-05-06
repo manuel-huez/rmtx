@@ -791,7 +791,8 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"scanning workspace changes after command: context=%s session=%s",
 		request.ContextID,
 		request.Session,
@@ -802,12 +803,13 @@ func (s *Server) executeAndSyncRun(
 		handle.workspace,
 		request.Mounts,
 		syncfs.BuildOptions{
-			Progress: s.logBuildProgress(request.ContextID, request.Session, "post-run"),
+			Progress: s.logBuildProgress(request.ContextID, request.Session, "post-run", runLogs),
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}
+	runLogs.Flush()
 
 	postEntries := post.Entries
 	ignoreMode := false
@@ -1072,12 +1074,18 @@ func formatSyncBack(paths []string) string {
 	return formatStrings(paths)
 }
 
-func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.BuildProgress) {
+func (s *Server) logBuildProgress(
+	contextID,
+	session,
+	label string,
+	runLogs io.Writer,
+) func(syncfs.BuildProgress) {
 	return func(progress syncfs.BuildProgress) {
 		switch progress.Phase {
 		case "walk":
 			if progress.Done {
-				s.logger.Printf(
+				s.logRun(
+					runLogs,
 					"%s scan done: context=%s session=%s mount=%s scanned=%d files=%d dirs=%d skipped=%d",
 					label,
 					contextID,
@@ -1092,7 +1100,8 @@ func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.
 				return
 			}
 
-			s.logger.Printf(
+			s.logRun(
+				runLogs,
 				"%s scan progress: context=%s session=%s mount=%s scanned=%d files=%d dirs=%d skipped=%d",
 				label,
 				contextID,
@@ -1105,7 +1114,8 @@ func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.
 			)
 		case "hash":
 			if progress.Done {
-				s.logger.Printf(
+				s.logRun(
+					runLogs,
 					"%s hash done: context=%s session=%s files=%d/%d bytes=%d",
 					label,
 					contextID,
@@ -1118,7 +1128,8 @@ func (s *Server) logBuildProgress(contextID, session, label string) func(syncfs.
 				return
 			}
 
-			s.logger.Printf(
+			s.logRun(
+				runLogs,
 				"%s hash progress: context=%s session=%s files=%d/%d bytes=%d",
 				label,
 				contextID,

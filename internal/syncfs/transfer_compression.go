@@ -171,7 +171,7 @@ func sampleCompressesWell(path string, size int64) bool {
 
 	encoder, err := zstd.NewWriter(
 		&compressed,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
 	)
 	if err != nil {
 		return false

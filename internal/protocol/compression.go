@@ -36,7 +36,7 @@ func (c *Conn) enableZstdWriterLocked() (func() error, error) {
 		return nil, fmt.Errorf("flush before zstd writer: %w", err)
 	}
 
-	encoder, err := zstd.NewWriter(c.conn, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	encoder, err := zstd.NewWriter(c.conn, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
 	if err != nil {
 		return nil, fmt.Errorf("create zstd writer: %w", err)
 	}

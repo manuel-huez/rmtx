@@ -149,3 +149,8 @@ func writeRunLogLine(w io.Writer, format string, args ...any) {
 
 	_, _ = fmt.Fprintf(w, "rmtx: "+format+"\n", args...)
 }
+
+func (s *Server) logRun(runLogs io.Writer, format string, args ...any) {
+	s.logger.Printf(format, args...)
+	writeRunLogLine(runLogs, format, args...)
+}

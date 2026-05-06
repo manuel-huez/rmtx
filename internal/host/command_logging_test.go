@@ -2,14 +2,18 @@ package host
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
 func TestCommandOutputCollectorLogsCompleteLines(t *testing.T) {
@@ -143,5 +147,84 @@ func TestHostLogHubDoesNotStreamGeneralLogs(t *testing.T) {
 	want := "pair request from 127.0.0.1 client=\"client\" code=123456\n"
 	if hostLogs.String() != want {
 		t.Fatalf("host logs=%q want %q", hostLogs.String(), want)
+	}
+}
+
+func TestPullOCIImageWritesRunLogs(t *testing.T) {
+	var (
+		hostLogs bytes.Buffer
+		runLogs  bytes.Buffer
+	)
+
+	server, err := New(Options{
+		StateDir: t.TempDir(),
+		Logger:   log.New(&hostLogs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := oci.NewStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	ref, err := oci.ParseReference("busybox:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = server.pullOCIImage(
+		context.Background(),
+		ref,
+		protocol.RuntimeSpec{PullPolicy: "never"},
+		store,
+		"ctx",
+		&runLogs,
+	)
+	if err == nil {
+		t.Fatal("expected missing image error")
+	}
+
+	want := "runtime image pull start: context=ctx image=docker.io/library/busybox:latest pull_policy=never"
+	if !strings.Contains(hostLogs.String(), want) {
+		t.Fatalf("host logs missing pull start: %q", hostLogs.String())
+	}
+
+	if !strings.Contains(runLogs.String(), "rmtx: "+want+"\n") {
+		t.Fatalf("run logs missing pull start: %q", runLogs.String())
+	}
+}
+
+func TestBuildProgressWritesRunLogs(t *testing.T) {
+	var (
+		hostLogs bytes.Buffer
+		runLogs  bytes.Buffer
+	)
+
+	server, err := New(Options{
+		StateDir: t.TempDir(),
+		Logger:   log.New(&hostLogs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	progress := server.logBuildProgress("ctx", "sess", "post-run", &runLogs)
+	progress(syncfs.BuildProgress{
+		Phase:      "hash",
+		Done:       true,
+		Hashed:     2,
+		TotalFiles: 3,
+		Bytes:      42,
+	})
+
+	want := "post-run hash done: context=ctx session=sess files=2/3 bytes=42"
+	if !strings.Contains(hostLogs.String(), want) {
+		t.Fatalf("host logs missing progress: %q", hostLogs.String())
+	}
+
+	if !strings.Contains(runLogs.String(), "rmtx: "+want+"\n") {
+		t.Fatalf("run logs missing progress: %q", runLogs.String())
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -147,7 +148,8 @@ func (s *Server) prepareOCIRuntimeLocked(
 	request protocol.RunRequest,
 	runLogs *hostLogSubscription,
 ) (preparedRuntime, error) {
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"preparing OCI runtime: context=%s image=%s",
 		request.ContextID,
 		request.Runtime.Image,
@@ -163,7 +165,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	image, err := s.pullOCIImage(ctx, ref, request.Runtime, store, request.ContextID)
+	image, err := s.pullOCIImage(ctx, ref, request.Runtime, store, request.ContextID, runLogs)
 	if err != nil {
 		return preparedRuntime{}, err
 	}
@@ -173,7 +175,8 @@ func (s *Server) prepareOCIRuntimeLocked(
 
 	setupMarker := filepath.Join(rootfs, runtimeSetupMarker)
 	if _, err := os.Stat(setupMarker); errors.Is(err, os.ErrNotExist) {
-		s.logger.Printf(
+		s.logRun(
+			runLogs,
 			"unpacking OCI image: context=%s rootfs=%s image=%s",
 			request.ContextID,
 			rootfs,
@@ -205,7 +208,8 @@ func (s *Server) prepareOCIRuntimeLocked(
 			return preparedRuntime{}, err
 		}
 	} else {
-		s.logger.Printf(
+		s.logRun(
+			runLogs,
 			"using existing OCI runtime setup marker: context=%s image=%s",
 			request.ContextID,
 			request.Runtime.Image,
@@ -233,13 +237,15 @@ func (s *Server) pullOCIImage(
 	runtimeSpec protocol.RuntimeSpec,
 	store *oci.Store,
 	contextID string,
+	runLogs io.Writer,
 ) (oci.Image, error) {
 	policy := strings.TrimSpace(runtimeSpec.PullPolicy)
 	if policy == "" {
 		policy = "if_missing"
 	}
 
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"runtime image pull start: context=%s image=%s pull_policy=%s",
 		contextID,
 		ref.Normalized(),
@@ -249,7 +255,8 @@ func (s *Server) pullOCIImage(
 	if !strings.EqualFold(policy, "always") {
 		image, err := store.LoadRef(ref)
 		if err == nil && store.ImageComplete(image) {
-			s.logger.Printf(
+			s.logRun(
+				runLogs,
 				"runtime image cache hit: context=%s image=%s digest=%s",
 				contextID,
 				ref.Normalized(),
@@ -271,7 +278,8 @@ func (s *Server) pullOCIImage(
 			fields := make([]any, 0, len(args)+pullProgressFields)
 			fields = append(fields, contextID, ref.Normalized())
 			fields = append(fields, args...)
-			s.logger.Printf(
+			s.logRun(
+				runLogs,
 				"runtime image pull: context=%s image=%s: "+format,
 				fields...,
 			)
@@ -281,7 +289,8 @@ func (s *Server) pullOCIImage(
 		return oci.Image{}, err
 	}
 
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"runtime image pull done: context=%s image=%s digest=%s",
 		contextID,
 		ref.Normalized(),
@@ -348,7 +357,7 @@ func (s *Server) runImageSetupCommands(
 			return err
 		}
 
-		s.logger.Printf("runtime image setup command start: command=%q", command)
+		s.logRun(runLogs, "runtime image setup command start: command=%q", command)
 
 		out, err := runCommandWithLiveOutput(
 			s.logger,
@@ -453,7 +462,8 @@ func (s *Server) runOCIContextSetupCommands(
 		setupReq := request
 		setupReq.Command = []string{"/bin/sh", "-c", command}
 		setupReq.WorkDir = request.WorkDir
-		s.logger.Printf(
+		s.logRun(
+			runLogs,
 			"runtime context setup command start: context=%s command=%q",
 			request.ContextID,
 			command,

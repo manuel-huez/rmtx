@@ -563,7 +563,8 @@ func (s *Server) syncContextFromClient(
 
 	defer s.unregisterBlobUploadSession(upload.token)
 
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"sync from client started: context=%s session=%s changed=%d deleted=%d missing_blobs=%d",
 		contextID,
 		session,
@@ -587,7 +588,8 @@ func (s *Server) syncContextFromClient(
 
 	fileTotal, fileBytes := syncFileTotals(changed)
 
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"applying client sync to workspace: context=%s session=%s deleted=%d changed=%d files=%d file_bytes=%d",
 		contextID,
 		session,
@@ -616,11 +618,12 @@ func (s *Server) syncContextFromClient(
 		changed,
 		fileTotal,
 		fileBytes,
+		runLogs,
 	); err != nil {
 		return err
 	}
 
-	s.logger.Printf("sync from client complete: context=%s session=%s", contextID, session)
+	s.logRun(runLogs, "sync from client complete: context=%s session=%s", contextID, session)
 
 	return nil
 }
@@ -633,13 +636,15 @@ func (s *Server) applyClientFiles(
 	changed []syncfs.Entry,
 	fileTotal int,
 	fileBytes int64,
+	runLogs *hostLogSubscription,
 ) error {
 	if fileTotal == 0 {
 		return nil
 	}
 
 	workers := materializeWorkerCount(fileTotal)
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"apply client files started: context=%s session=%s workers=%d",
 		contextID,
 		session,
@@ -664,7 +669,8 @@ func (s *Server) applyClientFiles(
 		}
 
 		lastProgress = now
-		s.logger.Printf(
+		s.logRun(
+			runLogs,
 			"apply client file progress: context=%s session=%s files=%d/%d bytes=%d/%d",
 			contextID,
 			session,
@@ -756,7 +762,8 @@ sendJobs:
 	}
 
 	progressMu.Lock()
-	s.logger.Printf(
+	s.logRun(
+		runLogs,
 		"apply client file done: context=%s session=%s files=%d/%d bytes=%d/%d",
 		contextID,
 		session,
