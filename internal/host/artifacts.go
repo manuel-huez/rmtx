@@ -2,6 +2,7 @@
 package host
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
 func (s *Server) handleContextArtifacts(
@@ -53,6 +55,12 @@ func (s *Server) handleContextArtifacts(
 		}
 
 		deleted = append(deleted, pruned...)
+
+		cachePruned, _, err := s.pruneUnreferencedOCICache()
+		if err != nil {
+			return err
+		}
+		deleted = append(deleted, cachePruned...)
 	}
 
 	artifacts, err := s.listContextArtifacts(contextID, contextDir)
@@ -110,8 +118,76 @@ func removeContextSetupCache(contextDir string) error {
 func (s *Server) pruneContextArtifacts(contextDir string) ([]protocol.ContextArtifact, error) {
 	var deleted []protocol.ContextArtifact
 
+	specs, err := pruneRuntimeSpecs(contextDir)
+	if err != nil {
+		return nil, err
+	}
+	deleted = append(deleted, specs...)
+
+	if err := compactArtifactState(contextDir); err != nil {
+		return nil, err
+	}
+
+	prepared, err := pruneStalePreparedRuntimes(contextDir)
+	if err != nil {
+		return nil, err
+	}
+	deleted = append(deleted, prepared...)
+
+	return deleted, nil
+}
+
+func compactArtifactState(contextDir string) error {
+	path := filepath.Join(contextDir, runtimeDirName, artifactStateFile)
+	state, err := loadArtifactState(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(state.Prepared) <= 1 && len(state.Images) <= 1 {
+		return nil
+	}
+	if len(state.Prepared) == 0 {
+		state.Images = nil
+
+		return writeIndentedJSON(path, state)
+	}
+
+	current := state.Prepared[len(state.Prepared)-1]
+	state.Prepared = []artifactPrepared{current}
+	state.Images = artifactImagesForDigest(state.Images, current.ImageDigest)
+	if len(state.Images) == 0 && current.ImageDigest != "" {
+		state.Images = []artifactImage{{
+			Reference: current.ImageReference,
+			Digest:    current.ImageDigest,
+		}}
+	}
+
+	return writeIndentedJSON(path, state)
+}
+
+func artifactImagesForDigest(images []artifactImage, digest string) []artifactImage {
+	var out []artifactImage
+	for _, image := range images {
+		if image.Digest == digest {
+			out = append(out, image)
+		}
+	}
+
+	if len(out) > 1 {
+		return out[len(out)-1:]
+	}
+
+	return out
+}
+
+func pruneRuntimeSpecs(contextDir string) ([]protocol.ContextArtifact, error) {
+	var deleted []protocol.ContextArtifact
 	specDir := filepath.Join(contextDir, runtimeDirName, runtimeSpecDirName)
-	if err := filepath.WalkDir(specDir, func(path string, d os.DirEntry, err error) error {
+
+	err := filepath.WalkDir(specDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
 			return err
 		}
@@ -119,8 +195,48 @@ func (s *Server) pruneContextArtifacts(contextDir string) ([]protocol.ContextArt
 		deleted = append(deleted, protocol.ContextArtifact{Kind: "spec", Path: path})
 
 		return os.Remove(path)
-	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+
+	return deleted, nil
+}
+
+func pruneStalePreparedRuntimes(contextDir string) ([]protocol.ContextArtifact, error) {
+	state, _ := loadArtifactState(filepath.Join(contextDir, runtimeDirName, artifactStateFile))
+	live := map[string]bool{}
+	for _, prepared := range state.Prepared {
+		live[prepared.Key] = true
+	}
+
+	root := filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName)
+	var deleted []protocol.ContextArtifact
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || live[entry.Name()] {
+			continue
+		}
+
+		path := filepath.Join(root, entry.Name())
+		size, _ := dirSize(path)
+		deleted = append(deleted, protocol.ContextArtifact{
+			Kind: "prepared-runtime",
+			Name: entry.Name(),
+			Path: path,
+			Size: size,
+		})
+
+		if err := os.RemoveAll(path); err != nil {
+			return deleted, err
+		}
 	}
 
 	return deleted, nil
@@ -198,10 +314,11 @@ func (s *Server) listContextArtifacts(
 }
 
 func (s *Server) handleCachePrune(
+	ctx context.Context,
 	conn *protocol.Conn,
 	requestLogs *hostLogSubscription,
 ) error {
-	deleted, bytes, err := s.pruneUnreferencedOCICache()
+	deleted, bytes, err := s.pruneAllCaches(ctx)
 	if err != nil {
 		return err
 	}
@@ -215,6 +332,36 @@ func (s *Server) handleCachePrune(
 			Bytes:   bytes,
 		},
 	)
+}
+
+func (s *Server) pruneAllCaches(ctx context.Context) ([]protocol.ContextArtifact, int64, error) {
+	deleted, bytes, err := s.pruneUnreferencedOCICache()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	blobDeleted, blobBytes, err := s.pruneUnreferencedBlobs()
+	if err != nil {
+		return nil, 0, err
+	}
+	deleted = append(deleted, blobDeleted...)
+	bytes += blobBytes
+
+	updateDeleted, updateBytes, err := s.pruneOldUpdateArtifacts()
+	if err != nil {
+		return nil, 0, err
+	}
+	deleted = append(deleted, updateDeleted...)
+	bytes += updateBytes
+
+	wslDeleted, wslBytes, err := pruneWSLStagedRootFS(ctx, s.opts.StateDir)
+	if err != nil {
+		return nil, 0, err
+	}
+	deleted = append(deleted, wslDeleted...)
+	bytes += wslBytes
+
+	return deleted, bytes, nil
 }
 
 func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64, error) {
@@ -354,6 +501,186 @@ func (s *Server) referencedOCIDigests() (map[string]bool, error) {
 	}
 
 	return refs, nil
+}
+
+func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, error) {
+	s.blobGCMu.Lock()
+	defer s.blobGCMu.Unlock()
+
+	refs, err := s.referencedBlobHashes()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	root := filepath.Join(s.opts.StateDir, "blobs")
+	var deleted []protocol.ContextArtifact
+	var bytes int64
+
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return err
+		}
+
+		hash := filepath.Base(path)
+		if refs[hash] {
+			return nil
+		}
+
+		info, statErr := d.Info()
+		if statErr == nil {
+			bytes += info.Size()
+		}
+
+		deleted = append(deleted, protocol.ContextArtifact{
+			Kind: "blob",
+			Path: path,
+			Ref:  hash,
+		})
+
+		return os.Remove(path)
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, 0, err
+	}
+
+	if err := removeEmptyBlobDirs(root); err != nil {
+		return nil, 0, err
+	}
+
+	return deleted, bytes, nil
+}
+
+func (s *Server) referencedBlobHashes() (map[string]bool, error) {
+	refs := map[string]bool{}
+	contexts, err := s.listContexts()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, context := range contexts {
+		entries, err := s.loadTrackedManifest(context.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, entry := range entries {
+			if entry.Kind == syncfs.KindFile && entry.Hash != "" {
+				refs[entry.Hash] = true
+			}
+		}
+	}
+
+	return refs, nil
+}
+
+func removeEmptyBlobDirs(root string) error {
+	dirs, err := blobDirs(root)
+	if err != nil {
+		return err
+	}
+
+	for _, dir := range dirs {
+		if err := removeDirIfEmpty(dir); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func blobDirs(root string) ([]string, error) {
+	var dirs []string
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || !d.IsDir() || path == root {
+			return err
+		}
+
+		dirs = append(dirs, path)
+
+		return nil
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+
+	return dirs, nil
+}
+
+func removeDirIfEmpty(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if len(entries) > 0 {
+		return nil
+	}
+
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
+}
+
+func pruneStartupTempFiles(stateDir string) ([]string, error) {
+	var removed []string
+	targets := []struct {
+		root  string
+		match func(string) bool
+	}{
+		{root: filepath.Join(stateDir, "blobs"), match: isSyncBlobTempFile},
+		{root: filepath.Join(stateDir, "cache", "oci"), match: isOCICacheTempFile},
+	}
+
+	for _, target := range targets {
+		pruned, err := pruneTempFilesInRoot(target.root, target.match)
+		if err != nil {
+			return nil, err
+		}
+
+		removed = append(removed, pruned...)
+	}
+
+	return removed, nil
+}
+
+func pruneTempFilesInRoot(root string, match func(string) bool) ([]string, error) {
+	var removed []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return err
+		}
+
+		if !match(d.Name()) {
+			return nil
+		}
+
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		removed = append(removed, path)
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	return removed, nil
+}
+
+func isSyncBlobTempFile(name string) bool {
+	return strings.HasSuffix(name, ".tmp")
+}
+
+func isOCICacheTempFile(name string) bool {
+	return strings.Contains(name, ".tmp-")
 }
 
 func (s *Server) ociBlobSize(digests []string) int64 {

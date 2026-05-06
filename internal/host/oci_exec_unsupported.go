@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func (s *Server) platformOCIChildCommand(
@@ -38,4 +40,8 @@ type nvidiaRuntimeSpec struct {
 
 func nvidiaUnavailableError(err error) error {
 	return err
+}
+
+func pruneWSLStagedRootFS(context.Context, string) ([]protocol.ContextArtifact, int64, error) {
+	return nil, 0, nil
 }

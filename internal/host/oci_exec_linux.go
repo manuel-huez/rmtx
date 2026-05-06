@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func (s *Server) platformOCIChildCommand(
@@ -69,4 +71,8 @@ func (s *Server) platformOCIChildCommand(
 	}
 
 	return cmd, cleanupTempFile(specFile.Name()), nil
+}
+
+func pruneWSLStagedRootFS(context.Context, string) ([]protocol.ContextArtifact, int64, error) {
+	return nil, 0, nil
 }

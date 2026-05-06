@@ -76,7 +76,7 @@ func TestBuildMountSpecsUsesGitignoreWhenEnabled(t *testing.T) {
 }
 
 //nolint:cyclop,gocognit,maintidx // integration setup/verification naturally has many branch checks.
-func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
+func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 	if testIsWindows() {
 		t.Skip("shell-based integration test")
 	}
@@ -202,7 +202,7 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 
 	code, err = RunExec(ctx, project, ExecParams{
 		AddressOverride: addr,
-		Command:         []string{"sh", "-c", `cat cache/marker`},
+		Command:         []string{"sh", "-c", `test ! -e cache/marker && cat hello.txt`},
 		Stdout:          &stdout2,
 		Stderr:          &stderr2,
 	})
@@ -214,8 +214,47 @@ func TestRunExecEndToEndSyncsBackChangesAndPersistsContexts(t *testing.T) {
 		t.Fatalf("unexpected second exit code: %d (stderr=%s)", code, stderr2.String())
 	}
 
-	if strings.TrimSpace(stdout2.String()) != "persisted" {
-		t.Fatalf("expected remote cache file to persist across runs, got %q", stdout2.String())
+	if strings.TrimSpace(stdout2.String()) != "changed" {
+		t.Fatalf("expected workspace to rehydrate without ignored cache file, got %q", stdout2.String())
+	}
+
+	var stdout3, stderr3 bytes.Buffer
+
+	code, err = RunExec(ctx, project, ExecParams{
+		AddressOverride: addr,
+		Command:         []string{"sh", "-c", `echo failed > fail.txt; exit 7`},
+		Stdout:          &stdout3,
+		Stderr:          &stderr3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 7 {
+		t.Fatalf("unexpected failing exit code: %d (stderr=%s)", code, stderr3.String())
+	}
+	if err := os.Remove(filepath.Join(project, "fail.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout4, stderr4 bytes.Buffer
+
+	code, err = RunExec(ctx, project, ExecParams{
+		AddressOverride: addr,
+		Command:         []string{"sh", "-c", `test ! -e fail.txt && cat hello.txt`},
+		Stdout:          &stdout4,
+		Stderr:          &stderr4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("unexpected post-failure exit code: %d (stderr=%s)", code, stderr4.String())
+	}
+
+	if strings.TrimSpace(stdout4.String()) != "changed" {
+		t.Fatalf("expected failed-run workspace to be cleaned, got %q", stdout4.String())
 	}
 
 	contexts, err := RunListContexts(ctx, project, RemoteParams{

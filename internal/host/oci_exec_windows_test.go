@@ -112,6 +112,23 @@ func TestWSLStagedRootFSPathUsesNativeWSLPath(t *testing.T) {
 	}
 }
 
+func TestWSLPruneRootFSScriptDeletesNonLiveRoots(t *testing.T) {
+	script := wslPruneRootFSScript()
+	for _, want := range []string{
+		"/var/lib/rmtx/rootfs",
+		"for live in \"$@\"",
+		"case \"$name\" in *.tmp.*) continue ;; esac",
+		"rm -rf \"$path\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("prune script missing %q:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "\"$root\"/*.tmp.*") {
+		t.Fatalf("prune script should not target active staging temps:\n%s", script)
+	}
+}
+
 func TestWSLChildScriptSkipsHostNetworkFilesForNoNetwork(t *testing.T) {
 	script, err := wslChildScript(ociChildSpec{
 		RootFS:  "/rootfs",

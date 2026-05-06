@@ -27,20 +27,21 @@ import (
 )
 
 const (
-	defaultDirMode      = 0o755
-	streamBufferSize    = 32 * 1024
-	splitNEquals        = 2
-	pipeCount           = 2
-	exitCodeNotFound    = 127
-	defaultFileMode     = 0o644
-	noneValue           = "none"
-	reverseDialTimeout  = 5 * time.Second
-	progressEvery       = 3 * time.Second
-	blobUploadParallel  = 4
-	materializeParallel = 4
-	hostUpdateTimeout   = 5 * time.Minute
-	restartPollEvery    = 100 * time.Millisecond
-	tcpKeepAliveEvery   = 15 * time.Second
+	defaultDirMode        = 0o755
+	streamBufferSize      = 32 * 1024
+	splitNEquals          = 2
+	pipeCount             = 2
+	exitCodeNotFound      = 127
+	defaultFileMode       = 0o644
+	noneValue             = "none"
+	reverseDialTimeout    = 5 * time.Second
+	progressEvery         = 3 * time.Second
+	blobUploadParallel    = 4
+	materializeParallel   = 4
+	hostUpdateTimeout     = 5 * time.Minute
+	startupCleanupTimeout = 15 * time.Second
+	restartPollEvery      = 100 * time.Millisecond
+	tcpKeepAliveEvery     = 15 * time.Second
 )
 
 var (
@@ -98,9 +99,11 @@ type Server struct {
 	activeContexts map[string]int
 	uploadsMu      sync.Mutex
 	uploads        map[string]*blobUploadSession
-	ociMu          sync.Mutex
-	updateMu       sync.Mutex
-	updateRunner   updateRunner
+	// Hold during pre-run sync so blob GC cannot remove hashes before manifest commit.
+	blobGCMu     sync.RWMutex
+	ociMu        sync.Mutex
+	updateMu     sync.Mutex
+	updateRunner updateRunner
 }
 
 func New(opts Options) (*Server, error) {
@@ -144,6 +147,8 @@ func New(opts Options) (*Server, error) {
 	logHub := newHostLogHub(opts.Logger.Writer())
 	logger := log.New(logHub, opts.Logger.Prefix(), opts.Logger.Flags())
 
+	cleanupStartupCaches(context.Background(), opts.StateDir, logger)
+
 	return &Server{
 		opts:           opts,
 		blobStore:      store,
@@ -157,6 +162,51 @@ func New(opts Options) (*Server, error) {
 		uploads:        map[string]*blobUploadSession{},
 		updateRunner:   defaultUpdateRunner,
 	}, nil
+}
+
+func cleanupStartupCaches(ctx context.Context, stateDir string, logger *log.Logger) {
+	updates, err := pruneOldUpdateDirs(stateDir)
+	logCleanupResult(logger, "update", "dirs", updates, err)
+
+	temps, err := pruneStartupTempFiles(stateDir)
+	logCleanupResult(logger, "temp", "files", temps, err)
+
+	// WSL can stall while distros initialize or update; startup cleanup is best-effort.
+	cleanupCtx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
+	defer cancel()
+
+	removed, _, err := pruneWSLStagedRootFS(cleanupCtx, stateDir)
+	logArtifactCleanupResult(logger, "WSL rootfs", "dirs", removed, err)
+}
+
+func logCleanupResult(logger *log.Logger, name string, unit string, removed []string, err error) {
+	if err != nil {
+		logger.Printf("%s cleanup failed: %v", name, err)
+
+		return
+	}
+
+	if len(removed) > 0 {
+		logger.Printf("%s cleanup removed: %s=%d", name, unit, len(removed))
+	}
+}
+
+func logArtifactCleanupResult(
+	logger *log.Logger,
+	name string,
+	unit string,
+	removed []protocol.ContextArtifact,
+	err error,
+) {
+	if err != nil {
+		logger.Printf("%s cleanup failed: %v", name, err)
+
+		return
+	}
+
+	if len(removed) > 0 {
+		logger.Printf("%s cleanup removed: %s=%d", name, unit, len(removed))
+	}
 }
 
 func withDefaultOptions(opts Options) Options {
@@ -542,9 +592,74 @@ func (s *Server) handleRunRequest(
 		preparedRuntimeRef = &runtimePrep
 	}
 
+	if err := s.syncClientManifestAndSave(parent, conn, request, handle, runLogs); err != nil {
+		return err
+	}
+
+	s.pruneUnreferencedBlobsAfterRunSave(request, "pre-run", runLogs)
+
+	runLogs.Flush()
+
+	if err := writeWorkspaceReady(conn, request.ContextID, handle); err != nil {
+		return err
+	}
+
+	if err := s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef, runLogs); err != nil {
+		return err
+	}
+
+	return s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs)
+}
+
+func (s *Server) cleanRunWorkspace(
+	contextID string,
+	workspace string,
+	runLogs *hostLogSubscription,
+) error {
+	// Marker first makes interrupted cleanup recoverable on the next sync.
+	if err := s.markWorkspaceCleaned(contextID); err != nil {
+		return err
+	}
+
+	if err := removeContextSetupCache(filepath.Dir(workspace)); err != nil {
+		return err
+	}
+
+	if err := cleanWorkspace(workspace); err != nil {
+		return err
+	}
+
+	s.logRun(runLogs, "workspace cleaned: context=%s", contextID)
+
+	return nil
+}
+
+func (s *Server) syncClientManifestAndSave(
+	parent context.Context,
+	conn *protocol.Conn,
+	request protocol.RunRequest,
+	handle contextHandle,
+	runLogs *hostLogSubscription,
+) error {
+	s.blobGCMu.RLock()
+	defer s.blobGCMu.RUnlock()
+
 	currentManifest, err := s.loadTrackedManifest(request.ContextID)
 	if err != nil {
 		return err
+	}
+
+	if s.workspaceWasCleaned(request.ContextID) {
+		// Cleanup marker may mean cleanup completed or was interrupted.
+		if err := removeContextSetupCache(handle.dir); err != nil {
+			return err
+		}
+
+		if err := cleanWorkspace(handle.workspace); err != nil {
+			return err
+		}
+
+		currentManifest = nil
 	}
 
 	if err := s.syncContextFromClient(
@@ -564,13 +679,7 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	runLogs.Flush()
-
-	if err := writeWorkspaceReady(conn, request.ContextID, handle); err != nil {
-		return err
-	}
-
-	return s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef, runLogs)
+	return s.clearWorkspaceCleaned(request.ContextID)
 }
 
 //nolint:cyclop // Protocol dispatch is deliberately centralized.
@@ -608,12 +717,12 @@ func (s *Server) dispatchSessionRequest(
 			return s.handleListContexts(conn, requestLogs)
 		})
 	case protocol.MsgDeleteContextsRequest:
-		return s.dispatchDeleteContexts(conn, head, requestLogs)
+		return s.dispatchDeleteContexts(parent, conn, head, requestLogs)
 	case protocol.MsgContextArtifactsRequest:
 		return s.dispatchContextArtifacts(conn, head, requestLogs)
 	case protocol.MsgCachePruneRequest:
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
-			return s.handleCachePrune(conn, requestLogs)
+			return s.handleCachePrune(parent, conn, requestLogs)
 		})
 	default:
 		if err := conn.DiscardPayload(head); err != nil {
@@ -688,6 +797,7 @@ func (s *Server) dispatchHostUpdateRequest(
 }
 
 func (s *Server) dispatchDeleteContexts(
+	parent context.Context,
 	conn *protocol.Conn,
 	head protocol.Header,
 	requestLogs *hostLogSubscription,
@@ -697,7 +807,7 @@ func (s *Server) dispatchDeleteContexts(
 		return err
 	}
 
-	return s.handleDeleteContexts(conn, req, requestLogs)
+	return s.handleDeleteContexts(parent, conn, req, requestLogs)
 }
 
 func (s *Server) dispatchContextArtifacts(
@@ -809,6 +919,7 @@ func (s *Server) executeAndSyncRun(
 	if err != nil {
 		return fmt.Errorf("scan workspace changes: %w", err)
 	}
+
 	runLogs.Flush()
 
 	postEntries := post.Entries
@@ -846,6 +957,8 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
+	s.pruneUnreferencedBlobsAfterRunSave(request, "post-run", runLogs)
+
 	handle.meta.UpdatedAt = time.Now().UTC()
 	if err := saveContextMetadata(handle.dir, handle.meta); err != nil {
 		return err
@@ -858,10 +971,47 @@ func (s *Server) executeAndSyncRun(
 	}
 
 	if closeCompressed != nil {
-		return closeCompressed()
+		if err := closeCompressed(); err != nil {
+			return err
+		}
+		closeCompressed = nil
 	}
 
 	return nil
+}
+
+func (s *Server) pruneUnreferencedBlobsAfterRunSave(
+	request protocol.RunRequest,
+	stage string,
+	runLogs *hostLogSubscription,
+) {
+	deleted, bytes, err := s.pruneUnreferencedBlobs()
+	if err != nil {
+		s.logRun(
+			runLogs,
+			"blob cache prune failed after %s manifest save: context=%s session=%s error=%v",
+			stage,
+			request.ContextID,
+			request.Session,
+			err,
+		)
+
+		return
+	}
+
+	if len(deleted) == 0 {
+		return
+	}
+
+	s.logRun(
+		runLogs,
+		"blob cache pruned after %s manifest save: context=%s session=%s deleted=%d bytes=%d",
+		stage,
+		request.ContextID,
+		request.Session,
+		len(deleted),
+		bytes,
+	)
 }
 
 func (s *Server) handlePing(
@@ -915,6 +1065,7 @@ func (s *Server) handleListContexts(
 }
 
 func (s *Server) handleDeleteContexts(
+	ctx context.Context,
 	conn *protocol.Conn,
 	req protocol.DeleteContextsRequest,
 	requestLogs *hostLogSubscription,
@@ -927,7 +1078,7 @@ func (s *Server) handleDeleteContexts(
 		req.OlderThan,
 	)
 
-	resp, err := s.deleteContexts(req)
+	resp, err := s.deleteContexts(ctx, req)
 	if err != nil {
 		return err
 	}

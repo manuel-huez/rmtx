@@ -17,6 +17,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -167,6 +168,159 @@ func wslStagedRootFSPath(rootfs string) string {
 	sum := sha256.Sum256([]byte(rootfs))
 
 	return "/var/lib/rmtx/rootfs/" + hex.EncodeToString(sum[:])
+}
+
+func pruneWSLStagedRootFS(ctx context.Context, stateDir string) ([]protocol.ContextArtifact, int64, error) {
+	live, err := liveWSLStagedRootFS(ctx, stateDir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	distros, err := wslInstalledDistros()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var deleted []protocol.ContextArtifact
+	for _, distro := range distros {
+		removed, err := pruneWSLStagedRootFSInDistro(ctx, distro, live[distro])
+		if err != nil {
+			return deleted, 0, err
+		}
+
+		deleted = append(deleted, removed...)
+	}
+
+	return deleted, 0, nil
+}
+
+func liveWSLStagedRootFS(ctx context.Context, stateDir string) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
+	distros, err := wslInstalledDistros()
+	if err != nil {
+		return nil, err
+	}
+
+	contextRoot := filepath.Join(stateDir, contextDirName)
+	contexts, err := os.ReadDir(contextRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	for _, contextEntry := range contexts {
+		if !contextEntry.IsDir() {
+			continue
+		}
+
+		contextDir := filepath.Join(contextRoot, contextEntry.Name())
+		state, err := loadArtifactState(
+			filepath.Join(contextDir, runtimeDirName, artifactStateFile),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				rootfsEntries, readErr := os.ReadDir(
+					filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName),
+				)
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				if readErr != nil {
+					return nil, fmt.Errorf(
+						"list context rootfs for WSL prune context %s: %w",
+						contextEntry.Name(),
+						readErr,
+					)
+				}
+
+				hasPrepared := false
+				for _, rootfsEntry := range rootfsEntries {
+					if rootfsEntry.IsDir() {
+						hasPrepared = true
+
+						break
+					}
+				}
+				if !hasPrepared {
+					continue
+				}
+			}
+
+			return nil, fmt.Errorf(
+				"read artifact state for WSL prune context %s: %w",
+				contextEntry.Name(),
+				err,
+			)
+		}
+
+		for _, prepared := range state.Prepared {
+			for _, distro := range distros {
+				rootfs, err := windowsPathToWSL(ctx, distro, prepared.Path)
+				if err != nil {
+					return nil, err
+				}
+
+				if out[distro] == nil {
+					out[distro] = map[string]bool{}
+				}
+				out[distro][wslStagedRootFSPath(rootfs)] = true
+			}
+		}
+	}
+
+	return out, nil
+}
+
+func pruneWSLStagedRootFSInDistro(
+	ctx context.Context,
+	distro string,
+	live map[string]bool,
+) ([]protocol.ContextArtifact, error) {
+	args := wslCommandArgs(distro, "--user", "root", "--exec", "sh", "-c", wslPruneRootFSScript(), "sh")
+	for path := range live {
+		args = append(args, path)
+	}
+
+	out, err := exec.CommandContext(ctx, "wsl.exe", args...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("prune WSL staged rootfs in %s: %w", distro, err)
+	}
+
+	var deleted []protocol.ContextArtifact
+	for _, line := range strings.Split(string(out), "\n") {
+		path := strings.TrimSpace(line)
+		if path == "" {
+			continue
+		}
+
+		deleted = append(deleted, protocol.ContextArtifact{
+			Kind:   "wsl-rootfs",
+			Name:   distro,
+			Path:   path,
+			Detail: distro,
+		})
+	}
+
+	return deleted, nil
+}
+
+func wslPruneRootFSScript() string {
+	return strings.Join([]string{
+		"root=/var/lib/rmtx/rootfs",
+		"[ -d \"$root\" ] || exit 0",
+		"for path in \"$root\"/*; do",
+		"  [ -e \"$path\" ] || continue",
+		"  name=${path##*/}",
+		"  case \"$name\" in *.tmp.*) continue ;; esac",
+		"  keep=0",
+		"  for live in \"$@\"; do [ \"$path\" = \"$live\" ] && keep=1; done",
+		"  [ \"$keep\" = 1 ] && continue",
+		"  echo \"$path\"",
+		"  rm -rf \"$path\"",
+		"done",
+	}, "\n")
 }
 
 func windowsPathToWSL(ctx context.Context, distro string, path string) (string, error) {

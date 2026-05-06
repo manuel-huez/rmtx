@@ -14,7 +14,7 @@
 - `rmtx ping`: verify host connectivity/auth.
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
-- `rmtx cache prune`: delete unreferenced host OCI cache data.
+- `rmtx cache prune`: delete unreferenced host cache data.
 
 ## Install
 
@@ -91,7 +91,9 @@ descendants, and glob patterns like `generated/**` are supported:
 ```
 
 When omitted, all mounted paths are eligible for sync-back. Only paths whose
-metadata or content changed are sent back to the client.
+metadata or content changed are sent back to the client. After each run, the
+host workspace is cleaned and rehydrated from synced blobs on the next run;
+use runtime volumes for state that should persist only on the host.
 
 ## Isolated runtimes
 
@@ -161,8 +163,8 @@ command. When `setup.context_inputs` is set, `rmtx` hashes those workspace files
 and reruns context setup only when they change. If `context_inputs` is omitted,
 context setup runs every command.
 
-OCI image blobs, manifests, and refs are stored once in a host global cache,
-while contexts keep references to the images and prepared runtimes they use.
+Synced file blobs, OCI image blobs, manifests, and refs are stored once in host
+global caches, while contexts keep references to the data they use.
 Context artifact commands show the project-owned view:
 
 ```bash
@@ -173,9 +175,12 @@ rmtx cache prune
 ```
 
 `rmtx context delete --current` removes that context workspace, volumes,
-prepared runtime references, and OCI cache data that has no remaining context
-references. `rmtx cache prune` can also remove global OCI cache data with no
-remaining context references.
+prepared runtime references, and global cache data that has no remaining context
+references. Prepared runtime metadata tracks the current runtime only, so older
+rootfs variants stop pinning OCI data when runtime config changes. `rmtx cache
+prune` can also remove global cache data with no remaining context references,
+old update installs, and stale Windows WSL staged rootfs copies. Runs prune
+unreferenced synced file blobs after tracked manifests change.
 
 Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI
@@ -215,7 +220,10 @@ rmtx cache prune
 
 ## Notes
 
-- Context workspaces are persistent on the host, so repeated runs are faster.
+- Contexts keep manifests and shared blobs on the host; workspaces are scratch
+  copies cleaned after each run.
+- OCI prepared rootfs data is a per-context runtime cache. Runtime config changes
+  replace older prepared rootfs refs; context delete removes the cache.
 - Discovery uses UDP broadcast on port `33222`; hosts also send outbound announcements so clients can discover Windows hosts even when inbound UDP is blocked.
 - If direct TCP to the host is blocked, `rmtx` can fall back to a reverse LAN connection where the host dials back to the client.
 - Client state is stored in `~/.rmtx/state.json`.

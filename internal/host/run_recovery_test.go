@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -292,4 +294,107 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 	if server.contextIsActive(request.ContextID) {
 		t.Fatalf("context lock still active after disconnect")
 	}
+}
+
+func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
+	t.Helper()
+
+	stateDir := t.TempDir()
+
+	server, err := New(Options{
+		StateDir: stateDir,
+		Logger:   log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("new host: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+
+	done := make(chan error, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	request := protocol.RunRequest{
+		ContextID: "ctx-sync-retry",
+		Session:   "session-sync-retry",
+		Command:   []string{"sh", "-c", "printf host > host.txt"},
+		Env:       map[string]string{},
+		Manifest:  nil,
+	}
+
+	go func() {
+		done <- server.handleRunRequest(ctx, protocol.NewConn(serverConn), request, nil)
+	}()
+
+	client := protocol.NewConn(clientConn)
+
+	needBlobs, err := client.ReadHeader()
+	if err != nil {
+		t.Fatalf("read NeedBlobs: %v", err)
+	}
+	if needBlobs.Type != protocol.MsgNeedBlobs {
+		t.Fatalf("need blobs request type %q", needBlobs.Type)
+	}
+	if err := client.DiscardPayload(needBlobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
+		t.Fatalf("send sync complete: %v", err)
+	}
+
+	ws, err := client.ReadHeader()
+	if err != nil {
+		t.Fatalf("read workspace ready: %v", err)
+	}
+	if ws.Type != protocol.MsgWorkspaceReady {
+		t.Fatalf("workspace ready type %q", ws.Type)
+	}
+	if err := client.DiscardPayload(ws); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
+		t.Fatalf("send stdin close: %v", err)
+	}
+
+	for {
+		head, err := client.ReadHeader()
+		if err != nil {
+			t.Fatalf("read run frame: %v", err)
+		}
+		if head.Type == protocol.MsgExecExit {
+			if err := client.DiscardPayload(head); err != nil {
+				t.Fatal(err)
+			}
+
+			break
+		}
+		if err := client.DiscardPayload(head); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = clientConn.Close()
+
+	select {
+	case err := <-done:
+		if err != nil && !isDisconnectError(err) {
+			t.Fatalf("run request finished with unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run request did not return after sync-back disconnect")
+	}
+
+	contextDir := filepath.Join(stateDir, contextDirName, request.ContextID)
+	workspaceFile := filepath.Join(contextDir, contextWorkspaceDir, "host.txt")
+	content, err := os.ReadFile(workspaceFile)
+	if err != nil {
+		t.Fatalf("read retained workspace file: %v", err)
+	}
+	if string(content) != "host" {
+		t.Fatalf("workspace file=%q want host", string(content))
+	}
+	assertPathMissing(t, filepath.Join(contextDir, contextCleanFile))
 }

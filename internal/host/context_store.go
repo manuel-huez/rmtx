@@ -22,6 +22,7 @@ const (
 	contextWorkspaceDir = "workspace"
 	contextMetaFile     = "context.json"
 	contextManifestFile = "tracked-manifest.json"
+	contextCleanFile    = "workspace-cleaned"
 	contextFileMode     = 0o644
 )
 
@@ -172,6 +173,38 @@ func (s *Server) loadTrackedManifest(id string) ([]syncfs.Entry, error) {
 
 func (s *Server) saveTrackedManifest(id string, entries []syncfs.Entry) error {
 	return writeJSONAtomically(filepath.Join(s.contextsRoot(), id, contextManifestFile), entries)
+}
+
+func (s *Server) workspaceWasCleaned(id string) bool {
+	path := filepath.Join(s.contextsRoot(), id, contextCleanFile)
+	_, err := os.Stat(path)
+
+	return err == nil
+}
+
+func (s *Server) markWorkspaceCleaned(id string) error {
+	return writeJSONAtomically(filepath.Join(s.contextsRoot(), id, contextCleanFile), true)
+}
+
+func (s *Server) clearWorkspaceCleaned(id string) error {
+	path := filepath.Join(s.contextsRoot(), id, contextCleanFile)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
+}
+
+func cleanWorkspace(path string) error {
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("delete workspace: %w", err)
+	}
+
+	if err := os.MkdirAll(path, defaultDirMode); err != nil {
+		return fmt.Errorf("recreate workspace: %w", err)
+	}
+
+	return nil
 }
 
 func writeJSONAtomically(path string, value any) error {
@@ -337,6 +370,7 @@ func (s *Server) listContexts() ([]protocol.ContextSummary, error) {
 }
 
 func (s *Server) deleteContexts(
+	ctx context.Context,
 	req protocol.DeleteContextsRequest,
 ) (protocol.DeleteContextsResponse, error) {
 	contexts, err := s.listContexts()
@@ -365,17 +399,8 @@ func (s *Server) deleteContexts(
 	}
 
 	if len(deleted) > 0 {
-		pruned, bytes, err := s.pruneUnreferencedOCICache()
-		if err != nil {
+		if err := s.pruneCachesAfterContextDelete(ctx); err != nil {
 			return protocol.DeleteContextsResponse{}, err
-		}
-
-		if len(pruned) > 0 {
-			s.logger.Printf(
-				"context delete pruned OCI cache: deleted=%d bytes=%d",
-				len(pruned),
-				bytes,
-			)
 		}
 	}
 
@@ -386,6 +411,56 @@ func (s *Server) deleteContexts(
 		Deleted:  deleted,
 		NotFound: notFound,
 	}, nil
+}
+
+func (s *Server) pruneCachesAfterContextDelete(ctx context.Context) error {
+	if err := s.pruneLoggedCache("OCI", s.pruneUnreferencedOCICache); err != nil {
+		return err
+	}
+
+	if err := s.pruneLoggedCache("blob", s.pruneUnreferencedBlobs); err != nil {
+		return err
+	}
+
+	pruned, bytes, err := pruneWSLStagedRootFS(ctx, s.opts.StateDir)
+	if err != nil {
+		return err
+	}
+
+	s.logContextDeletePrune("WSL rootfs", pruned, bytes)
+
+	return nil
+}
+
+func (s *Server) pruneLoggedCache(
+	name string,
+	prune func() ([]protocol.ContextArtifact, int64, error),
+) error {
+	pruned, bytes, err := prune()
+	if err != nil {
+		return err
+	}
+
+	s.logContextDeletePrune(name, pruned, bytes)
+
+	return nil
+}
+
+func (s *Server) logContextDeletePrune(
+	name string,
+	pruned []protocol.ContextArtifact,
+	bytes int64,
+) {
+	if len(pruned) == 0 {
+		return
+	}
+
+	s.logger.Printf(
+		"context delete pruned %s cache: deleted=%d bytes=%d",
+		name,
+		len(pruned),
+		bytes,
+	)
 }
 
 func selectDeleteTargets(

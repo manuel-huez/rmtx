@@ -5,12 +5,72 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
+
+func TestPruneOldUpdateDirsRemovesStaleInstalls(t *testing.T) {
+	stateDir := t.TempDir()
+
+	oldDir := filepath.Join(stateDir, "updates", "v0.0.1")
+
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(oldDir, "rmtx"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := pruneOldUpdateDirs(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != oldDir {
+		t.Fatalf("removed=%#v want %s", removed, oldDir)
+	}
+	assertPathMissing(t, oldDir)
+}
+
+func TestPruneOldUpdateArtifactsKeepsPendingRestartInstall(t *testing.T) {
+	stateDir := t.TempDir()
+	oldDir := filepath.Join(stateDir, "updates", "v0.0.1")
+	pendingDir := filepath.Join(stateDir, "updates", "v9.8.7")
+
+	for _, dir := range []string{oldDir, pendingDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rmtx"), []byte("bin"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := &Server{opts: Options{StateDir: stateDir}}
+	if !s.beginRestart(
+		filepath.Join(pendingDir, "rmtx"),
+		"v9.8.7",
+		"github.com/manuel-huez/rmtx/cmd/rmtx@v9.8.7",
+	) {
+		t.Fatal("expected restart setup to succeed")
+	}
+
+	deleted, _, err := s.pruneOldUpdateArtifacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 1 || deleted[0].Path != oldDir {
+		t.Fatalf("deleted=%#v want only %s", deleted, oldDir)
+	}
+
+	assertPathMissing(t, oldDir)
+	assertPathExists(t, pendingDir)
+}
 
 func TestHandleHostUpdateRequestRunsFixedInstallTarget(t *testing.T) {
 	serverConn, clientConn := net.Pipe()

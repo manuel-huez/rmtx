@@ -71,6 +71,112 @@ func updateExecutablePath(installDir string) string {
 	return filepath.Join(installDir, path.Base(version.CommandPackage)+updateExecutableSuffix)
 }
 
+func pruneOldUpdateDirs(stateDir string) ([]string, error) {
+	protected, err := protectedUpdateDirs("")
+	if err != nil {
+		return nil, err
+	}
+
+	deleted, _, err := pruneOldUpdateArtifacts(stateDir, protected)
+	if err != nil {
+		return nil, err
+	}
+
+	removed := make([]string, 0, len(deleted))
+	for _, artifact := range deleted {
+		removed = append(removed, artifact.Path)
+	}
+
+	return removed, nil
+}
+
+func (s *Server) pruneOldUpdateArtifacts() ([]protocol.ContextArtifact, int64, error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	pendingExecutable := ""
+	if restart, restarting := s.restartRequest(); restarting {
+		pendingExecutable = restart.Executable
+	}
+
+	protected, err := protectedUpdateDirs(pendingExecutable)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return pruneOldUpdateArtifacts(s.opts.StateDir, protected)
+}
+
+func protectedUpdateDirs(pendingExecutable string) (map[string]bool, error) {
+	currentExecutable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+
+	protected := map[string]bool{}
+	for _, executable := range []string{currentExecutable, pendingExecutable} {
+		if strings.TrimSpace(executable) == "" {
+			continue
+		}
+
+		dir, err := filepath.Abs(filepath.Dir(executable))
+		if err != nil {
+			return nil, err
+		}
+
+		protected[dir] = true
+	}
+
+	return protected, nil
+}
+
+func pruneOldUpdateArtifacts(
+	stateDir string,
+	protected map[string]bool,
+) ([]protocol.ContextArtifact, int64, error) {
+	root := filepath.Join(stateDir, "updates")
+
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, 0, nil
+	}
+
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var removed []protocol.ContextArtifact
+	var bytes int64
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		dir, err := filepath.Abs(filepath.Join(root, entry.Name()))
+		if err != nil {
+			return removed, bytes, err
+		}
+
+		if protected[dir] {
+			continue
+		}
+
+		size, _ := dirSize(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			return removed, bytes, err
+		}
+
+		bytes += size
+		removed = append(removed, protocol.ContextArtifact{
+			Kind: "update",
+			Path: dir,
+			Size: size,
+		})
+	}
+
+	return removed, bytes, nil
+}
+
 func environWith(key, value string) []string {
 	env := os.Environ()
 	out := make([]string, 0, len(env)+1)

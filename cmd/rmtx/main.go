@@ -1097,7 +1097,8 @@ Command reference:
       Delete named persistent runtime volume.
 
   rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
-      Delete host global OCI cache data with no remaining context refs.
+      Delete host global cache data with no remaining context refs, plus stale
+      update installs and WSL staged OCI rootfs data.
 
   rmtx wsl config [--profile 50|100] [--yes] [--no-restart]
                   [--path PATH] [--dry-run]
@@ -1218,6 +1219,7 @@ Runtime behavior:
   image_commands affect isolated rootfs, not host OS.
   context_commands run in synced workspace. If context_inputs omitted, they run
   before every command. If set, they rerun only when listed inputs change.
+  workspaces are cleaned after each run and rehydrated from synced blobs.
   volumes persist on host, do not sync, do not enter manifests, do not sync back.
 
 Validation:

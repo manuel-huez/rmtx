@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"time"
 
@@ -224,11 +223,21 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	if err := saveArtifactState(handle.dir, image, key, rootfs); err != nil {
+	if err := savePreparedRuntimeState(handle.dir, image, key, rootfs); err != nil {
 		return preparedRuntime{}, err
 	}
 
 	return preparedRuntime{RootFS: rootfs, Image: image, Key: key}, nil
+}
+
+func savePreparedRuntimeState(contextDir string, image oci.Image, key string, rootfs string) error {
+	if err := saveArtifactState(contextDir, image, key, rootfs); err != nil {
+		return err
+	}
+
+	_, err := pruneStalePreparedRuntimes(contextDir)
+
+	return err
 }
 
 func (s *Server) pullOCIImage(
@@ -812,17 +821,11 @@ func (s *Server) ensureOCIVolumes(contextDir string, volumes []protocol.RuntimeV
 
 func saveArtifactState(contextDir string, image oci.Image, key string, rootfs string) error {
 	path := filepath.Join(contextDir, runtimeDirName, artifactStateFile)
-	state, _ := loadArtifactState(path)
 
 	img := artifactImage{
 		Reference: image.Reference,
 		Digest:    image.ManifestDigest,
 		Blobs:     imageBlobDigests(image),
-	}
-	if !slices.ContainsFunc(state.Images, func(existing artifactImage) bool {
-		return existing.Digest == img.Digest && existing.Reference == img.Reference
-	}) {
-		state.Images = append(state.Images, img)
 	}
 
 	prepared := artifactPrepared{
@@ -831,13 +834,12 @@ func saveArtifactState(contextDir string, image oci.Image, key string, rootfs st
 		ImageDigest:    image.ManifestDigest,
 		ImageReference: image.Reference,
 	}
-	if !slices.ContainsFunc(state.Prepared, func(existing artifactPrepared) bool {
-		return existing.Key == prepared.Key
-	}) {
-		state.Prepared = append(state.Prepared, prepared)
-	}
 
-	state.UpdatedAt = time.Now().UTC()
+	state := artifactState{
+		Images:    []artifactImage{img},
+		Prepared:  []artifactPrepared{prepared},
+		UpdatedAt: time.Now().UTC(),
+	}
 
 	return writeIndentedJSON(path, state)
 }
