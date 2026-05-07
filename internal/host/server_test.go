@@ -24,20 +24,20 @@ func TestIsDisconnectErrorRecognizesTypedNetworkCloseErrors(t *testing.T) {
 		syscall.ECONNRESET,
 		syscall.ECONNABORTED,
 		syscall.EPIPE,
-		windowsConnectionReset,
+		syscall.Errno(10054),
 	} {
-		if !isDisconnectError(err) {
+		if !protocol.IsDisconnectError(err) {
 			t.Fatalf("expected disconnect error for %v", err)
 		}
 	}
 
-	if isDisconnectError(errors.New("apply non-file entries failed")) {
+	if protocol.IsDisconnectError(errors.New("apply non-file entries failed")) {
 		t.Fatal("non-disconnect error should not match")
 	}
 }
 
 func TestIsDisconnectErrorDistinguishesConnDeadlineFromContextDeadline(t *testing.T) {
-	if isDisconnectError(context.DeadlineExceeded) {
+	if protocol.IsDisconnectError(context.DeadlineExceeded) {
 		t.Fatal("context deadline should not be treated as a disconnect")
 	}
 
@@ -54,7 +54,7 @@ func TestIsDisconnectErrorDistinguishesConnDeadlineFromContextDeadline(t *testin
 		t.Fatal("expected read deadline error")
 	}
 
-	if !isDisconnectError(err) {
+	if !protocol.IsDisconnectError(err) {
 		t.Fatalf("read deadline should be treated as a disconnect: %v", err)
 	}
 }
@@ -81,12 +81,12 @@ func TestWaitForClientSyncCompleteKeepsFinishedTransferOpen(t *testing.T) {
 		"ctx",
 		"session",
 		"token",
-		make(chan blobSendJob),
+		map[string]downloadBlobItem{},
 		1,
 		protocol.DefaultBlobChunkSize,
 		1,
 	)
-	transfer.completeChunk()
+	transfer.completeChunk(protocol.BlobChunkInfo{Hash: "hash"})
 
 	done := make(chan error, 1)
 	go func() {

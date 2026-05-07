@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"syscall"
+
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func (s *Server) runPlatformTTYExecCommand(
@@ -59,7 +61,7 @@ func (s *Server) runPlatformTTYExecCommand(
 	_ = master.Close()
 
 	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
-		if !isDisconnectError(err) {
+		if !protocol.IsDisconnectError(err) {
 			s.logger.Printf("TTY output forwarding ended: %v", err)
 		}
 

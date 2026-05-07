@@ -200,7 +200,7 @@ func stopInputReader(conn *protocol.Conn, done <-chan error) error {
 
 	select {
 	case err := <-done:
-		if isDisconnectError(err) || errors.Is(err, os.ErrDeadlineExceeded) {
+		if protocol.IsDisconnectError(err) || errors.Is(err, os.ErrDeadlineExceeded) {
 			return nil
 		}
 		return err

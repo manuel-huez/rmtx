@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/UserExistsError/conpty"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 type windowsTTY struct {
@@ -70,7 +71,7 @@ func (s *Server) runPlatformTTYExecCommand(
 	closePTY()
 
 	if err := <-outputDone; err != nil && !errors.Is(err, io.EOF) {
-		if !isDisconnectError(err) {
+		if !protocol.IsDisconnectError(err) {
 			s.logger.Printf("TTY output forwarding ended: %v", err)
 		}
 

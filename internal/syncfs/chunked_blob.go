@@ -2,6 +2,7 @@ package syncfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,26 @@ type BlobChunkInfo struct {
 	Hash   string `json:"hash"`
 	Size   int64  `json:"size"`
 	Offset int64  `json:"offset"`
+}
+
+// ChunkReadError wraps a transport failure while reading a chunk payload.
+type ChunkReadError struct {
+	Hash string
+	Err  error
+}
+
+func (e *ChunkReadError) Error() string {
+	return fmt.Sprintf("read blob chunk %s: %v", e.Hash, e.Err)
+}
+
+func (e *ChunkReadError) Unwrap() error {
+	return e.Err
+}
+
+// IsChunkReadError reports transport read failures that leave receiver state retryable.
+func IsChunkReadError(err error) bool {
+	var chunkErr *ChunkReadError
+	return errors.As(err, &chunkErr)
 }
 
 func PlanBlobChunks(blobs []BlobDescriptor, chunkSize int64) []BlobChunkInfo {
@@ -83,6 +104,7 @@ type ChunkedBlobReceiver struct {
 	chunkSize int64
 
 	mu      sync.Mutex
+	blobs   map[string]BlobDescriptor
 	writers map[string]*chunkedBlobWriter
 	pending int
 	err     error
@@ -102,17 +124,19 @@ func NewChunkedBlobReceiver(
 	receiver := &ChunkedBlobReceiver{
 		store:     store,
 		chunkSize: chunkSize,
+		blobs:     make(map[string]BlobDescriptor, len(blobs)),
 		writers:   make(map[string]*chunkedBlobWriter, len(blobs)),
 		done:      make(chan struct{}),
 	}
 
 	for _, blob := range blobs {
 		if blob.Hash == "" {
-			return nil, fmt.Errorf("blob hash is required")
+			return nil, errors.New("blob hash is required")
 		}
 		if blob.Size < 0 {
 			return nil, fmt.Errorf("blob %s has negative size", blob.Hash)
 		}
+		receiver.blobs[blob.Hash] = blob
 		if store.Has(blob.Hash) {
 			continue
 		}
@@ -135,7 +159,11 @@ func NewChunkedBlobReceiver(
 	return receiver, nil
 }
 
-func (r *ChunkedBlobReceiver) ReceiveChunk(info BlobChunkInfo, src io.Reader, payloadLen int64) error {
+func (r *ChunkedBlobReceiver) ReceiveChunk(
+	info BlobChunkInfo,
+	src io.Reader,
+	payloadLen int64,
+) error {
 	if payloadLen < 0 {
 		return r.fail(fmt.Errorf("blob %s has negative chunk length", info.Hash))
 	}
@@ -147,8 +175,25 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(info BlobChunkInfo, src io.Reader, pa
 		return err
 	}
 
+	blob, known := r.blobs[info.Hash]
 	writer := r.writers[info.Hash]
 	if writer == nil {
+		// Retries can replay chunks after commit; validate metadata, drain payload, keep state done.
+		if known && r.store.Has(info.Hash) {
+			err := validateBlobChunkShape(
+				info,
+				blob.Hash,
+				blob.Size,
+				r.chunkSize,
+				payloadLen,
+			)
+			if err != nil {
+				r.mu.Unlock()
+				return r.fail(err)
+			}
+			r.mu.Unlock()
+			return discardChunkPayload(info, src, payloadLen)
+		}
 		r.mu.Unlock()
 		return r.fail(fmt.Errorf("unexpected blob chunk %s", info.Hash))
 	}
@@ -160,7 +205,7 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(info BlobChunkInfo, src io.Reader, pa
 
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(src, payload); err != nil {
-		return r.fail(fmt.Errorf("read blob chunk %s: %w", info.Hash, err))
+		return &ChunkReadError{Hash: info.Hash, Err: err}
 	}
 
 	complete, err := writer.writeChunk(info, payload)
@@ -180,6 +225,14 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(info BlobChunkInfo, src io.Reader, pa
 	r.pending--
 	r.closeDoneLocked()
 	r.mu.Unlock()
+
+	return nil
+}
+
+func discardChunkPayload(info BlobChunkInfo, src io.Reader, payloadLen int64) error {
+	if _, err := io.CopyN(io.Discard, src, payloadLen); err != nil {
+		return &ChunkReadError{Hash: info.Hash, Err: err}
+	}
 
 	return nil
 }
@@ -291,13 +344,17 @@ func (w *chunkedBlobWriter) writeChunk(info BlobChunkInfo, payload []byte) (bool
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.validateChunkLocked(info, int64(len(payload))); err != nil {
+	if err := validateBlobChunkShape(info, w.hash, w.size, w.chunkSize, int64(len(payload))); err != nil {
 		return false, err
 	}
 
 	index := 0
 	if w.size > 0 {
 		index = int(info.Offset / w.chunkSize)
+	}
+	// Lost acks can replay chunks; completed offsets are idempotent.
+	if w.committed || w.completed[index] {
+		return false, nil
 	}
 
 	if len(payload) > 0 {
@@ -316,40 +373,40 @@ func (w *chunkedBlobWriter) validateChunk(info BlobChunkInfo, payloadLen int64) 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return w.validateChunkLocked(info, payloadLen)
+	return validateBlobChunkShape(info, w.hash, w.size, w.chunkSize, payloadLen)
 }
 
-func (w *chunkedBlobWriter) validateChunkLocked(info BlobChunkInfo, payloadLen int64) error {
-	if w.committed {
-		return fmt.Errorf("blob %s already committed", w.hash)
+func validateBlobChunkShape(
+	info BlobChunkInfo,
+	hash string,
+	size int64,
+	chunkSize int64,
+	payloadLen int64,
+) error {
+	if info.Hash != hash {
+		return fmt.Errorf("blob chunk hash mismatch: %s != %s", info.Hash, hash)
 	}
-	if info.Hash != w.hash {
-		return fmt.Errorf("blob chunk hash mismatch: %s != %s", info.Hash, w.hash)
-	}
-	if info.Size != w.size {
-		return fmt.Errorf("blob %s size mismatch: %d != %d", w.hash, info.Size, w.size)
+	if info.Size != size {
+		return fmt.Errorf("blob %s size mismatch: %d != %d", hash, info.Size, size)
 	}
 
-	wantLen := BlobChunkPayloadLen(info, w.chunkSize)
+	wantLen := BlobChunkPayloadLen(info, chunkSize)
 	if payloadLen != wantLen {
-		return fmt.Errorf("blob %s chunk length mismatch: %d != %d", w.hash, payloadLen, wantLen)
+		return fmt.Errorf("blob %s chunk length mismatch: %d != %d", hash, payloadLen, wantLen)
 	}
-	if info.Offset < 0 || info.Offset > w.size {
-		return fmt.Errorf("blob %s invalid chunk offset %d", w.hash, info.Offset)
+	if info.Offset < 0 || info.Offset > size {
+		return fmt.Errorf("blob %s invalid chunk offset %d", hash, info.Offset)
 	}
-	if w.size > 0 && info.Offset%w.chunkSize != 0 {
-		return fmt.Errorf("blob %s unaligned chunk offset %d", w.hash, info.Offset)
+	if size > 0 && info.Offset%chunkSize != 0 {
+		return fmt.Errorf("blob %s unaligned chunk offset %d", hash, info.Offset)
 	}
 
 	index := 0
-	if w.size > 0 {
-		index = int(info.Offset / w.chunkSize)
+	if size > 0 {
+		index = int(info.Offset / chunkSize)
 	}
-	if index >= len(w.completed) {
-		return fmt.Errorf("blob %s chunk index out of range %d", w.hash, index)
-	}
-	if w.completed[index] {
-		return fmt.Errorf("blob %s duplicate chunk offset %d", w.hash, info.Offset)
+	if index >= BlobChunkCount(size, chunkSize) {
+		return fmt.Errorf("blob %s chunk index out of range %d", hash, index)
 	}
 
 	return nil

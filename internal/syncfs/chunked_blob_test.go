@@ -48,7 +48,11 @@ func TestChunkedBlobReceiverStoresVerifiedBlob(t *testing.T) {
 	for _, chunk := range PlanBlobChunks([]BlobDescriptor{{Hash: hash, Size: int64(len(content))}}, 4) {
 		start := chunk.Offset
 		end := start + BlobChunkPayloadLen(chunk, 4)
-		if err := receiver.ReceiveChunk(chunk, bytes.NewReader(content[int(start):int(end)]), end-start); err != nil {
+		if err := receiver.ReceiveChunk(
+			chunk,
+			bytes.NewReader(content[int(start):int(end)]),
+			end-start,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -66,7 +70,7 @@ func TestChunkedBlobReceiverStoresVerifiedBlob(t *testing.T) {
 	}
 }
 
-func TestChunkedBlobReceiverRejectsDuplicateChunk(t *testing.T) {
+func TestChunkedBlobReceiverAcceptsDuplicateChunk(t *testing.T) {
 	store := NewBlobStore(t.TempDir())
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
@@ -89,8 +93,51 @@ func TestChunkedBlobReceiverRejectsDuplicateChunk(t *testing.T) {
 	}
 
 	err = receiver.ReceiveChunk(chunk, bytes.NewReader(content[:4]), 4)
-	if err == nil {
-		t.Fatal("expected duplicate chunk error")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := BlobChunkInfo{Hash: hash, Size: int64(len(content)), Offset: 4}
+	if err := receiver.ReceiveChunk(second, bytes.NewReader(content[4:]), 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := receiver.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	err = receiver.ReceiveChunk(chunk, bytes.NewReader(content[:4]), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChunkedBlobReceiverCanRetryAfterChunkReadError(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("abcdefgh")
+	hash := sha256Hex(content)
+	receiver, err := NewChunkedBlobReceiver(
+		store,
+		[]BlobDescriptor{{Hash: hash, Size: int64(len(content))}},
+		4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chunk := BlobChunkInfo{Hash: hash, Size: int64(len(content))}
+	err = receiver.ReceiveChunk(chunk, readerFunc(func(p []byte) (int, error) {
+		copy(p, content[:2])
+		return 2, os.ErrDeadlineExceeded
+	}), 4)
+	if !IsChunkReadError(err) {
+		t.Fatalf("err=%v want chunk read error", err)
+	}
+
+	if err := receiver.ReceiveChunk(chunk, bytes.NewReader(content[:4]), 4); err != nil {
+		t.Fatal(err)
 	}
 }
 

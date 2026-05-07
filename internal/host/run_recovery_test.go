@@ -356,7 +356,7 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil && !isDisconnectError(err) {
+		if err != nil && !protocol.IsDisconnectError(err) {
 			t.Fatalf("run request finished with unexpected error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
@@ -452,7 +452,7 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil && !isDisconnectError(err) {
+		if err != nil && !protocol.IsDisconnectError(err) {
 			t.Fatalf("run request finished with unexpected error: %v", err)
 		}
 	case <-time.After(5 * time.Second):

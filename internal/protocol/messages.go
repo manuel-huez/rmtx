@@ -94,10 +94,11 @@ type NeedBlobs struct {
 }
 
 type BlobTransferRequest struct {
-	ContextID string `json:"context_id"`
-	Session   string `json:"session"`
-	Token     string `json:"token"`
-	Direction string `json:"direction"`
+	ContextID string         `json:"context_id"`
+	Session   string         `json:"session"`
+	Token     string         `json:"token"`
+	Direction string         `json:"direction"`
+	Chunk     *BlobChunkInfo `json:"chunk,omitempty"`
 }
 
 const (

@@ -1333,13 +1333,44 @@ func receiveMissingBlobsFromHost(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	jobs := make(chan protocol.BlobChunkInfo)
+	errCh, done := startDownloadBlobWorkers(
+		ctx,
+		cancel,
+		jobs,
+		parallel,
+		need.TransferToken,
+		chunkSize,
+		opts,
+		receiver,
+		chunkProgress,
+	)
+
+	go sendDownloadJobs(ctx, chunks, jobs)
+
+	return waitForBlobDownload(ctx, cancel, receiver, errCh, done)
+}
+
+func startDownloadBlobWorkers(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	jobs <-chan protocol.BlobChunkInfo,
+	parallel int,
+	token string,
+	chunkSize int64,
+	opts ExecOptions,
+	receiver *syncfs.ChunkedBlobReceiver,
+	chunkProgress *blobChunkProgress,
+) (<-chan error, <-chan struct{}) {
 	errCh := make(chan error, 1)
+	done := make(chan struct{})
+
 	var wg sync.WaitGroup
 	for range parallel {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := downloadBlobWorker(ctx, need.TransferToken, chunkSize, opts, receiver, chunkProgress); err != nil {
+			if err := downloadBlobWorker(ctx, jobs, token, chunkSize, opts, receiver, chunkProgress); err != nil {
 				select {
 				case errCh <- err:
 					cancel()
@@ -1349,12 +1380,21 @@ func receiveMissingBlobsFromHost(
 		}()
 	}
 
-	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
 
+	return errCh, done
+}
+
+func waitForBlobDownload(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	receiver *syncfs.ChunkedBlobReceiver,
+	errCh <-chan error,
+	done <-chan struct{},
+) error {
 	receiverDone := make(chan error, 1)
 	go func() { receiverDone <- receiver.Wait(ctx) }()
 
@@ -1377,6 +1417,22 @@ func receiveMissingBlobsFromHost(
 		case <-ctx.Done():
 			_ = receiver.Fail(ctx.Err())
 			return ctx.Err()
+		}
+	}
+}
+
+func sendDownloadJobs(
+	ctx context.Context,
+	chunks []protocol.BlobChunkInfo,
+	jobs chan<- protocol.BlobChunkInfo,
+) {
+	defer close(jobs)
+
+	for _, chunk := range chunks {
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- chunk:
 		}
 	}
 }
@@ -1427,70 +1483,140 @@ func downloadParallelism(need protocol.NeedBlobs, totalChunks int) int {
 
 func downloadBlobWorker(
 	ctx context.Context,
+	jobs <-chan protocol.BlobChunkInfo,
 	token string,
 	chunkSize int64,
 	opts ExecOptions,
 	receiver *syncfs.ChunkedBlobReceiver,
 	progress *blobChunkProgress,
 ) error {
-	conn, err := dialTLS(
-		ctx,
-		opts.Address,
-		opts.DiscoveryService,
-		opts.Host.Fingerprint,
-		opts.ClientCertPEM,
-		opts.ClientKeyPEM,
-	)
-	if err != nil {
-		return err
+	var conn *blobTransferConn
+	defer closeBlobTransferConn(conn)
+
+	for chunk := range jobs {
+		var err error
+		conn, err = retryBlobTransferChunk(
+			ctx,
+			conn,
+			"download",
+			chunk.Hash,
+			chunk.Offset,
+			blobProgressLogger(progress),
+			func(conn *blobTransferConn) (*blobTransferConn, error) {
+				return downloadBlobChunk(ctx, conn, token, chunkSize, opts, receiver, progress, chunk)
+			},
+		)
+		if err != nil {
+			return err
+		}
 	}
-	defer closeQuietly(conn.Raw())
+
+	if conn != nil {
+		_ = conn.conn.WriteJSON(protocol.MsgSyncComplete, nil)
+	}
+
+	return nil
+}
+
+func downloadBlobChunk(
+	ctx context.Context,
+	conn *blobTransferConn,
+	token string,
+	chunkSize int64,
+	opts ExecOptions,
+	receiver *syncfs.ChunkedBlobReceiver,
+	progress *blobChunkProgress,
+	chunk protocol.BlobChunkInfo,
+) (*blobTransferConn, error) {
+	if conn == nil {
+		var err error
+		conn, err = dialBlobTransferConn(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	req := protocol.BlobTransferRequest{
 		ContextID: opts.ContextID,
 		Session:   opts.Session,
 		Token:     token,
 		Direction: protocol.BlobTransferDownload,
+		Chunk:     &chunk,
 	}
-	if err := conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
-		return err
+	if err := conn.conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
+		return conn, err
 	}
-
-	stopLiveness := startConnectionLiveness(ctx, conn, false)
-	defer stopLiveness()
 
 	for {
-		head, err := conn.ReadHeader()
+		head, err := conn.conn.ReadHeader()
 		if err != nil {
-			return err
+			return conn, err
 		}
 
-		switch head.Type {
-		case protocol.MsgHeartbeat:
-			if err := conn.DiscardPayload(head); err != nil {
-				return err
-			}
-		case protocol.MsgError:
-			return decodeServerError(head)
-		case protocol.MsgBlobChunk:
-			info, err := protocol.DecodeData[protocol.BlobChunkInfo](head)
-			if err != nil {
-				return err
-			}
-			if err := receiver.ReceiveChunk(info, conn.PayloadReader(head), head.PayloadLen); err != nil {
-				return err
-			}
-			progress.AddBytes(int(head.PayloadLen))
-			progress.CompleteChunk(info.Hash)
-		case protocol.MsgSyncComplete:
-			return nil
-		default:
-			if err := conn.DiscardPayload(head); err != nil {
-				return err
-			}
-			return fmt.Errorf("unexpected blob transfer frame: %s", head.Type)
+		done, err := handleDownloadBlobTransferFrame(conn.conn, receiver, progress, chunk, head)
+		if err != nil {
+			return conn, err
+		}
+		if done {
+			return conn, nil
 		}
 	}
+}
+
+func handleDownloadBlobTransferFrame(
+	conn *protocol.Conn,
+	receiver *syncfs.ChunkedBlobReceiver,
+	progress *blobChunkProgress,
+	chunk protocol.BlobChunkInfo,
+	head protocol.Header,
+) (bool, error) {
+	switch head.Type {
+	case protocol.MsgHeartbeat:
+		return false, conn.DiscardPayload(head)
+	case protocol.MsgError:
+		return false, decodeServerError(head)
+	case protocol.MsgBlobChunk:
+		return receiveDownloadBlobChunk(conn, receiver, progress, chunk, head)
+	default:
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, err
+		}
+
+		return false, fmt.Errorf("unexpected blob transfer frame: %s", head.Type)
+	}
+}
+
+func receiveDownloadBlobChunk(
+	conn *protocol.Conn,
+	receiver *syncfs.ChunkedBlobReceiver,
+	progress *blobChunkProgress,
+	chunk protocol.BlobChunkInfo,
+	head protocol.Header,
+) (bool, error) {
+	info, err := protocol.DecodeData[protocol.BlobChunkInfo](head)
+	if err != nil {
+		return false, err
+	}
+	if info.Hash != chunk.Hash || info.Offset != chunk.Offset {
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, err
+		}
+
+		return false, fmt.Errorf(
+			"unexpected blob chunk %s offset %d; want %s offset %d",
+			info.Hash,
+			info.Offset,
+			chunk.Hash,
+			chunk.Offset,
+		)
+	}
+	if err := receiver.ReceiveChunk(info, conn.PayloadReader(head), head.PayloadLen); err != nil {
+		return false, err
+	}
+	progress.AddBytes(int(head.PayloadLen))
+	progress.CompleteChunk(info.Hash)
+
+	return true, nil
 }
 
 func materializeDownloadedChanges(
@@ -2014,6 +2140,7 @@ func sendMissingBlobsParallel(
 				chunkSize,
 				opts,
 				chunkProgress,
+				logger,
 			); err != nil {
 				select {
 				case errCh <- err:
@@ -2082,50 +2209,73 @@ func uploadBlobWorker(
 	chunkSize int64,
 	opts ExecOptions,
 	progress *blobChunkProgress,
+	logger *runLogger,
 ) error {
-	conn, err := dialTLS(
-		ctx,
-		opts.Address,
-		opts.DiscoveryService,
-		opts.Host.Fingerprint,
-		opts.ClientCertPEM,
-		opts.ClientKeyPEM,
-	)
-	if err != nil {
-		return err
-	}
+	var conn *blobTransferConn
+	defer closeBlobTransferConn(conn)
 
-	defer closeQuietly(conn.Raw())
-
-	req := protocol.BlobTransferRequest{
-		ContextID: opts.ContextID,
-		Session:   opts.Session,
-		Token:     token,
-		Direction: protocol.BlobTransferUpload,
-	}
-
-	if err := conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
-		return err
-	}
-
-	stopLiveness := startConnectionLiveness(ctx, conn, false)
-	defer stopLiveness()
 	for job := range jobs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		if err := sendUploadChunk(conn, job, chunkSize, progress); err != nil {
+		var err error
+		conn, err = retryBlobTransferChunk(
+			ctx,
+			conn,
+			"upload",
+			job.info.Hash,
+			job.info.Offset,
+			logger,
+			func(conn *blobTransferConn) (*blobTransferConn, error) {
+				return uploadBlobChunk(ctx, conn, token, opts, job, chunkSize, progress)
+			},
+		)
+		if err != nil {
 			return err
 		}
 		progress.CompleteChunk(job.info.Hash)
 	}
 
-	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
-		return err
+	if conn != nil {
+		_ = conn.conn.WriteJSON(protocol.MsgSyncComplete, nil)
 	}
 
 	return nil
+}
+
+func uploadBlobChunk(
+	ctx context.Context,
+	conn *blobTransferConn,
+	token string,
+	opts ExecOptions,
+	job blobUploadChunk,
+	chunkSize int64,
+	progress *blobChunkProgress,
+) (*blobTransferConn, error) {
+	if conn == nil {
+		var err error
+		conn, err = dialBlobTransferConn(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		req := protocol.BlobTransferRequest{
+			ContextID: opts.ContextID,
+			Session:   opts.Session,
+			Token:     token,
+			Direction: protocol.BlobTransferUpload,
+		}
+		if err := conn.conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
+			return conn, err
+		}
+	}
+
+	if err := sendUploadChunk(conn.conn, job, chunkSize, progress); err != nil {
+		return conn, err
+	}
+
+	return conn, nil
 }
 
 func sendUploadChunk(
@@ -2142,21 +2292,16 @@ func sendUploadChunk(
 
 	defer closeQuietly(f)
 
-	reader := &progressReader{
-		src: io.NewSectionReader(f, job.info.Offset, payloadLen),
-		onRead: func(n int) {
-			progress.AddBytes(n)
-		},
-	}
-
 	if err := conn.WriteFrom(
 		protocol.MsgBlobChunk,
 		job.info,
-		reader,
+		io.NewSectionReader(f, job.info.Offset, payloadLen),
 		payloadLen,
 	); err != nil {
 		return err
 	}
+
+	progress.AddBytes(int(payloadLen))
 
 	return nil
 }
@@ -2179,6 +2324,14 @@ func newBlobChunkProgress(
 	return &blobChunkProgress{progress: progress, remaining: remaining}
 }
 
+func blobProgressLogger(progress *blobChunkProgress) *runLogger {
+	if progress == nil || progress.progress == nil {
+		return nil
+	}
+
+	return progress.progress.logger
+}
+
 func (p *blobChunkProgress) AddBytes(n int) {
 	if p != nil && p.progress != nil {
 		p.progress.AddBytes(n)
@@ -2198,20 +2351,6 @@ func (p *blobChunkProgress) CompleteChunk(hash string) {
 	if remaining == 0 {
 		p.progress.CompleteFile()
 	}
-}
-
-type progressReader struct {
-	src    io.Reader
-	onRead func(int)
-}
-
-func (r *progressReader) Read(p []byte) (int, error) {
-	n, err := r.src.Read(p)
-	if n > 0 && r.onRead != nil {
-		r.onRead(n)
-	}
-
-	return n, err
 }
 
 func formatMounts(mounts []syncfs.MountSpec) string {

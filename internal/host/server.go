@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
@@ -465,30 +464,6 @@ func (s *Server) handleConn(parent context.Context, raw net.Conn) {
 	}
 }
 
-func isDisconnectError(err error) bool {
-	var errno syscall.Errno
-
-	return errors.Is(err, io.EOF) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, os.ErrDeadlineExceeded) ||
-		errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, windowsConnectionReset) ||
-		(errors.As(err, &errno) && isDisconnectErrno(errno))
-}
-
-const windowsConnectionReset syscall.Errno = 10054
-
-func isDisconnectErrno(errno syscall.Errno) bool {
-	return errno == syscall.ECONNABORTED ||
-		errno == syscall.ECONNRESET ||
-		errno == syscall.EPIPE ||
-		errno == windowsConnectionReset
-}
-
 func transferParallelism(totalChunks int) int {
 	if totalChunks <= 1 {
 		return 1
@@ -520,7 +495,7 @@ func (s *Server) handleConnSession(
 
 	head, err := conn.ReadHeader()
 	if err != nil {
-		if isDisconnectError(err) {
+		if protocol.IsDisconnectError(err) {
 			return nil
 		}
 
@@ -547,7 +522,7 @@ func (s *Server) handleConnSession(
 	defer stopLiveness()
 
 	if err := s.dispatchSessionRequest(parent, conn, head, requestLogs); err != nil {
-		if isDisconnectError(err) {
+		if protocol.IsDisconnectError(err) {
 			return nil
 		}
 
@@ -1184,7 +1159,6 @@ func (s *Server) sendWorkspaceChanges(
 	}
 
 	transfer, err := s.sendChangedFileBlobs(
-		ctx,
 		conn,
 		contextID,
 		session,
@@ -1305,7 +1279,6 @@ func (s *Server) logBuildProgress(
 }
 
 func (s *Server) sendChangedFileBlobs(
-	ctx context.Context,
 	conn *protocol.Conn,
 	contextID string,
 	session string,
@@ -1339,12 +1312,11 @@ func (s *Server) sendChangedFileBlobs(
 		return nil, err
 	}
 
-	jobs := make(chan blobSendJob)
 	transfer := newBlobSendSession(
 		contextID,
 		session,
 		token,
-		jobs,
+		items,
 		len(chunks),
 		chunkSize,
 		parallel,
@@ -1360,11 +1332,8 @@ func (s *Server) sendChangedFileBlobs(
 			ChunkSize:     chunkSize,
 		},
 	); err != nil {
-		close(jobs)
 		return transfer, err
 	}
-
-	go feedBlobSendJobs(ctx, chunks, items, jobs)
 
 	return transfer, nil
 }
@@ -1409,24 +1378,6 @@ func prepareDownloadBlobItems(
 	}
 
 	return items, descriptors, nil
-}
-
-func feedBlobSendJobs(
-	ctx context.Context,
-	chunks []protocol.BlobChunkInfo,
-	items map[string]downloadBlobItem,
-	jobs chan<- blobSendJob,
-) {
-	defer close(jobs)
-
-	for _, chunk := range chunks {
-		item := items[chunk.Hash]
-		select {
-		case <-ctx.Done():
-			return
-		case jobs <- blobSendJob{info: chunk, path: item.path}:
-		}
-	}
 }
 
 func (s *Server) storeChangedFileBlobs(
@@ -1685,12 +1636,18 @@ func (s *Server) waitForClientBlobTransfer(
 	for {
 		head, err := conn.ReadHeader()
 		if err != nil {
+			if transfer != nil {
+				_ = transfer.fail(err)
+			}
 			return fmt.Errorf("read sync frame: %w", err)
 		}
 
 		switch head.Type {
 		case protocol.MsgHeartbeat:
 			if err := conn.DiscardPayload(head); err != nil {
+				if transfer != nil {
+					_ = transfer.fail(err)
+				}
 				return err
 			}
 		case protocol.MsgSyncComplete:
@@ -1710,10 +1667,17 @@ func (s *Server) waitForClientBlobTransfer(
 			return nil
 		default:
 			if err := conn.DiscardPayload(head); err != nil {
+				if transfer != nil {
+					_ = transfer.fail(err)
+				}
 				return err
 			}
 
-			return fmt.Errorf("unexpected sync frame: %s", head.Type)
+			err := fmt.Errorf("unexpected sync frame: %s", head.Type)
+			if transfer != nil {
+				_ = transfer.fail(err)
+			}
+			return err
 		}
 	}
 }
