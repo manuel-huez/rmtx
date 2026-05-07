@@ -1240,6 +1240,22 @@ func hashFileContext(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func HashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open file %s: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hash file %s: %w", path, err)
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func sameEntry(a, b Entry, ignoreMode bool) bool {
 	return sameEntryExceptMode(a, b) && (ignoreMode || a.Mode == b.Mode)
 }

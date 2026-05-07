@@ -631,12 +631,14 @@ func (s *Server) syncContextFromClient(
 
 	missing := s.blobStore.MissingHashes(changed)
 
-	upload, err := s.prepareBlobUploadSession(contextID, session, missing)
+	transfer, err := s.prepareBlobReceiveSession(contextID, session, changed, missing)
 	if err != nil {
 		return err
 	}
 
-	defer s.unregisterBlobUploadSession(upload.token)
+	if transfer != nil {
+		defer s.unregisterBlobTransferSession(transfer.token)
+	}
 
 	s.logRun(
 		runLogs,
@@ -652,12 +654,12 @@ func (s *Server) syncContextFromClient(
 
 	if err := conn.WriteJSON(
 		protocol.MsgNeedBlobs,
-		needBlobsMessage(missing, upload),
+		needBlobsMessage(missing, transfer),
 	); err != nil {
 		return err
 	}
 
-	if err := s.receiveBlobs(ctx, conn, contextID, session, len(missing), upload); err != nil {
+	if err := s.waitForClientBlobTransfer(ctx, conn, contextID, session, len(missing), transfer); err != nil {
 		return err
 	}
 
@@ -913,27 +915,79 @@ func syncFileTotals(entries []syncfs.Entry) (int, int64) {
 	return files, bytes
 }
 
-func (s *Server) prepareBlobUploadSession(
+func blobDescriptorsForHashes(
+	entries []syncfs.Entry,
+	hashes []string,
+) ([]protocol.BlobDescriptor, error) {
+	byHash := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
+			continue
+		}
+		if _, ok := byHash[entry.Hash]; !ok {
+			byHash[entry.Hash] = entry.Size
+		}
+	}
+
+	descriptors := make([]protocol.BlobDescriptor, 0, len(hashes))
+	for _, hash := range hashes {
+		size, ok := byHash[hash]
+		if !ok {
+			return nil, fmt.Errorf("unknown blob hash %s", hash)
+		}
+		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: hash, Size: size})
+	}
+
+	return descriptors, nil
+}
+
+func (s *Server) prepareBlobReceiveSession(
 	contextID string,
 	session string,
+	changed []syncfs.Entry,
 	missing []string,
-) (*blobUploadSession, error) {
+) (*blobTransferSession, error) {
+	if len(missing) == 0 {
+		return nil, nil
+	}
+
 	token, err := protocol.RandomNonce()
 	if err != nil {
 		return nil, err
 	}
 
-	upload := newBlobUploadSession(contextID, session, token, missing)
-	s.registerBlobUploadSession(upload)
+	descriptors, err := blobDescriptorsForHashes(changed, missing)
+	if err != nil {
+		return nil, err
+	}
 
-	return upload, nil
+	chunkSize := protocol.DefaultBlobChunkSize
+	chunks := len(protocol.PlanBlobChunks(descriptors, chunkSize))
+	parallel := transferParallelism(chunks)
+	transfer, err := newBlobReceiveSession(
+		contextID,
+		session,
+		token,
+		s.blobStore,
+		descriptors,
+		chunkSize,
+		parallel,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	s.registerBlobTransferSession(transfer)
+
+	return transfer, nil
 }
 
-func needBlobsMessage(missing []string, upload *blobUploadSession) protocol.NeedBlobs {
+func needBlobsMessage(missing []string, transfer *blobTransferSession) protocol.NeedBlobs {
 	msg := protocol.NeedBlobs{Hashes: missing}
-	if upload != nil {
-		msg.UploadToken = upload.token
-		msg.Parallel = blobUploadParallel
+	if transfer != nil {
+		msg.TransferToken = transfer.token
+		msg.Parallel = transfer.parallel
+		msg.ChunkSize = transfer.chunkSize
 	}
 
 	return msg

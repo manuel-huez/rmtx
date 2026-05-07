@@ -32,6 +32,7 @@ func (s *Server) runTTYCommand(
 	)
 	if err != nil {
 		cancelRun.Cancel()
+		_ = stopTTYInputReader(conn, input)
 		return 1, err
 	}
 

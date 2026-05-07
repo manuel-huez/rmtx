@@ -1,9 +1,12 @@
 package host
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
@@ -14,11 +17,12 @@ type runCancelHandle struct {
 }
 
 type ttyInputForwarding struct {
-	mu     sync.Mutex
-	writer io.Writer
-	queue  [][]byte
-	resize *protocol.TTYSize
-	done   chan error
+	mu      sync.Mutex
+	writer  io.Writer
+	queue   [][]byte
+	resize  *protocol.TTYSize
+	stopped bool
+	done    chan error
 }
 
 func (s *Server) startTTYInputForwarding(
@@ -83,6 +87,23 @@ func (i *ttyInputForwarding) ResizeTTY(rows, cols int) error {
 	}
 
 	return resizeTTYWriter(i.writer, rows, cols)
+}
+
+func (i *ttyInputForwarding) Stop() {
+	i.mu.Lock()
+	i.stopped = true
+	i.mu.Unlock()
+}
+
+func (i *ttyInputForwarding) Stopped() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	return i.stopped
+}
+
+func (i *ttyInputForwarding) Done() <-chan error {
+	return i.done
 }
 
 func newRunCancelHandle(cancel func()) *runCancelHandle {
@@ -155,6 +176,37 @@ func (i *pipeInputForwarding) Stop() {
 		i.cond.Broadcast()
 		i.cond.L.Unlock()
 	})
+}
+
+func stopPipeInputReader(conn *protocol.Conn, input *pipeInputForwarding) error {
+	input.Stop()
+	return stopInputReader(conn, input.Done())
+}
+
+func stopTTYInputReader(conn *protocol.Conn, input *ttyInputForwarding) error {
+	if input == nil {
+		return nil
+	}
+
+	input.Stop()
+	return stopInputReader(conn, input.Done())
+}
+
+func stopInputReader(conn *protocol.Conn, done <-chan error) error {
+	if conn != nil && conn.Raw() != nil {
+		_ = conn.Raw().SetReadDeadline(time.Now())
+		defer func() { _ = conn.Raw().SetReadDeadline(time.Time{}) }()
+	}
+
+	select {
+	case err := <-done:
+		if isDisconnectError(err) || errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		return err
+	case <-time.After(time.Second):
+		return nil
+	}
 }
 
 func (i *pipeInputForwarding) Stopped() bool {
@@ -235,6 +287,10 @@ func (s *Server) consumePipeInput(
 	var stdinClosed bool
 
 	for {
+		if stopped, ok := stdin.(interface{ Stopped() bool }); ok && stopped.Stopped() {
+			return nil
+		}
+
 		head, err := conn.ReadHeader()
 		if err != nil {
 			return err

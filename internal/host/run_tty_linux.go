@@ -68,5 +68,9 @@ func (s *Server) runPlatformTTYExecCommand(
 		return exitCode(waitErr), err
 	}
 
+	if err := stopTTYInputReader(run.conn, run.input); err != nil && !errors.Is(err, io.EOF) {
+		s.logger.Printf("TTY input forwarding ended: %v", err)
+	}
+
 	return exitCode(waitErr), waitErr
 }

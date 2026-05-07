@@ -501,6 +501,62 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 	}
 }
 
+func TestBlobStoreStorePathKeepsBlobIndependentFromSource(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+	const original = "original content"
+
+	src := filepath.Join(t.TempDir(), "source.txt")
+	mustWrite(t, src, original)
+
+	if err := store.StorePath(hash, int64(len(original)), src); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite(t, src, "mutated content")
+
+	got, err := os.ReadFile(store.Path(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("stored blob changed with source mutation: got %q want %q", got, original)
+	}
+}
+
+func TestBlobStoreMaterializeKeepsBlobIndependentFromDest(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+	const original = "original content"
+
+	if err := store.Store(hash, int64(len(original)), strings.NewReader(original)); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "dest.txt")
+	if err := store.Materialize(hash, dest, 0o644, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite(t, dest, "mutated content")
+
+	got, err := os.ReadFile(store.Path(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("stored blob changed with destination mutation: got %q want %q", got, original)
+	}
+}
+
 func TestBlobStoreMaterializeWithProgressReportsCopiedBytes(t *testing.T) {
 	store := NewBlobStore(t.TempDir())
 	if err := store.Ensure(); err != nil {

@@ -24,7 +24,7 @@ func setConnectionIdleTimeout(conn *protocol.Conn, timeout time.Duration) {
 func requestUsesSessionLiveness(messageType string) bool {
 	switch messageType {
 	case protocol.MsgRunRequest,
-		protocol.MsgBlobUploadRequest,
+		protocol.MsgBlobTransferRequest,
 		protocol.MsgHostUpdateRequest,
 		protocol.MsgDeleteContextsRequest,
 		protocol.MsgContextArtifactsRequest,
@@ -36,7 +36,7 @@ func requestUsesSessionLiveness(messageType string) bool {
 }
 
 func requestUsesOutboundHeartbeat(messageType string) bool {
-	return messageType != protocol.MsgBlobUploadRequest
+	return messageType != protocol.MsgBlobTransferRequest
 }
 
 func startSessionLiveness(

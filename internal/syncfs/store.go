@@ -98,6 +98,62 @@ func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
 	return nil
 }
 
+func (s *BlobStore) StorePath(hash string, size int64, src string) error {
+	path := s.Path(hash)
+	if err := os.MkdirAll(filepath.Dir(path), blobDefaultDirPerm); err != nil {
+		return fmt.Errorf("create blob dir: %w", err)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create blob temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close blob temp: %w", err)
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return fmt.Errorf("remove blob temp placeholder: %w", err)
+	}
+
+	mode := fs.FileMode(blobDefaultFileMode)
+	if cloned, err := cloneFile(src, tmpPath, mode); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	} else if cloned {
+		return renameStoredBlob(tmpPath, path)
+	}
+	_ = os.Remove(tmpPath)
+
+	in, err := os.Open(src)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("open blob source: %w", err)
+	}
+	defer func() { _ = in.Close() }()
+
+	if err := s.Store(hash, size, in); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	return nil
+}
+
+func renameStoredBlob(tmp, path string) error {
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("move blob file: %w", err)
+	}
+
+	return nil
+}
+
 func (s *BlobStore) Materialize(hash, dest string, mode fs.FileMode, modTime int64) error {
 	return s.MaterializeWithProgress(hash, dest, mode, modTime, nil)
 }
@@ -113,12 +169,6 @@ func (s *BlobStore) MaterializeWithProgress(
 
 	if err := os.MkdirAll(filepath.Dir(dest), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create destination dir: %w", err)
-	}
-
-	if modTime == 0 {
-		if err := os.Link(src, dest); err == nil {
-			return os.Chmod(dest, mode)
-		}
 	}
 
 	if cloned, err := cloneBlobToFile(src, dest, mode, modTime); err != nil {

@@ -15,8 +15,8 @@ const (
 	MsgPairResponse             = "pair_response"
 	MsgRunRequest               = "run_request"
 	MsgNeedBlobs                = "need_blobs"
-	MsgBlobUploadRequest        = "blob_upload_request"
-	MsgBlob                     = "blob"
+	MsgBlobTransferRequest      = "blob_transfer_request"
+	MsgBlobChunk                = "blob_chunk"
 	MsgSyncComplete             = "sync_complete"
 	MsgWorkspaceReady           = "workspace_ready"
 	MsgStdinData                = "stdin_data"
@@ -26,9 +26,7 @@ const (
 	MsgExecOutput               = "exec_output"
 	MsgExecExit                 = "exec_exit"
 	MsgChangeSet                = "change_set"
-	MsgChangeBlob               = "change_blob"
 	MsgChangesDone              = "changes_done"
-	MsgSyncCompressionStart     = "sync_compression_start"
 	MsgHeartbeat                = "heartbeat"
 	MsgPingRequest              = "ping_request"
 	MsgPingResponse             = "ping_response"
@@ -87,17 +85,26 @@ type ExitInfo struct {
 }
 
 type NeedBlobs struct {
-	Hashes      []string `json:"hashes"`
-	UploadToken string   `json:"upload_token,omitempty"`
-	Parallel    int      `json:"parallel,omitempty"`
+	Hashes        []string `json:"hashes"`
+	TransferToken string   `json:"transfer_token,omitempty"`
+	Parallel      int      `json:"parallel,omitempty"`
+	ChunkSize     int64    `json:"chunk_size,omitempty"`
 }
 
-type BlobUploadRequest struct {
-	ContextID   string `json:"context_id"`
-	Session     string `json:"session"`
-	Token       string `json:"token"`
-	Compression string `json:"compression,omitempty"`
+type BlobTransferRequest struct {
+	ContextID string `json:"context_id"`
+	Session   string `json:"session"`
+	Token     string `json:"token"`
+	Direction string `json:"direction"`
 }
+
+const (
+	BlobTransferUpload   = "upload"
+	BlobTransferDownload = "download"
+)
+
+type BlobDescriptor = syncfs.BlobDescriptor
+type BlobChunkInfo = syncfs.BlobChunkInfo
 
 type ChangeSet struct {
 	Entries []syncfs.Entry `json:"entries"`

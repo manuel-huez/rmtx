@@ -78,3 +78,17 @@ func manifestCachePath(root, contextID string) (string, error) {
 
 	return filepath.Join(dir, "manifests", name), nil
 }
+
+func clientBlobStore() (*syncfs.BlobStore, error) {
+	dir, err := clientstate.DefaultDir()
+	if err != nil {
+		return nil, err
+	}
+
+	store := syncfs.NewBlobStore(filepath.Join(dir, "blobs"))
+	if err := store.Ensure(); err != nil {
+		return nil, err
+	}
+
+	return store, nil
+}

@@ -59,6 +59,52 @@ func TestIsDisconnectErrorDistinguishesConnDeadlineFromContextDeadline(t *testin
 	}
 }
 
+func TestWaitForClientSyncCompleteKeepsFinishedTransferOpen(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	s := &Server{logger: log.New(io.Discard, "", 0)}
+	transfer := newBlobSendSession(
+		"ctx",
+		"session",
+		"token",
+		make(chan blobSendJob),
+		1,
+		protocol.DefaultBlobChunkSize,
+		1,
+	)
+	transfer.completeChunk()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.waitForClientSyncCompleteAndBlobTransfer(
+			context.Background(),
+			protocol.NewConn(serverConn),
+			transfer,
+		)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("wait returned before client sync_complete: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := protocol.NewConn(clientConn).WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not finish after sync_complete")
+	}
+}
+
 func TestHandleConnIgnoresDisconnectBeforeRequestHeader(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()

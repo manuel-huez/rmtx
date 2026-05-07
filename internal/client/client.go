@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 
 	"github.com/manuel-huez/rmtx/internal/discovery"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
@@ -87,12 +89,12 @@ type ContextArtifactsOptions struct {
 
 const stdinBufferSize = 32 * 1024
 const (
-	directDialTimeout   = 1500 * time.Millisecond
-	reverseDialTimeout  = 5 * time.Second
-	defaultDiscoverySvc = "rmtx"
-	progressEvery       = 3 * time.Second
-	parallelBlobUploads = 4
-	tcpKeepAliveEvery   = 15 * time.Second
+	directDialTimeout       = 1500 * time.Millisecond
+	reverseDialTimeout      = 5 * time.Second
+	defaultDiscoverySvc     = "rmtx"
+	progressEvery           = 3 * time.Second
+	maxBlobTransferParallel = 16
+	tcpKeepAliveEvery       = 15 * time.Second
 )
 
 var (
@@ -101,9 +103,11 @@ var (
 )
 
 type runLogger struct {
-	out      io.Writer
-	mu       sync.Mutex
-	lastByID map[string]time.Time
+	out       io.Writer
+	mu        sync.Mutex
+	lastByID  map[string]time.Time
+	started   time.Time
+	lastStage time.Time
 }
 
 func newRunLogger(out io.Writer) *runLogger {
@@ -111,7 +115,13 @@ func newRunLogger(out io.Writer) *runLogger {
 		out = io.Discard
 	}
 
-	return &runLogger{out: out, lastByID: map[string]time.Time{}}
+	now := time.Now()
+	return &runLogger{
+		out:       out,
+		lastByID:  map[string]time.Time{},
+		started:   now,
+		lastStage: now,
+	}
 }
 
 func (l *runLogger) Printf(format string, args ...any) {
@@ -126,7 +136,25 @@ func (l *runLogger) Printf(format string, args ...any) {
 }
 
 func (l *runLogger) Stage(format string, args ...any) {
-	l.Printf("=== "+format+" ===", args...)
+	if l == nil || l.out == nil {
+		return
+	}
+
+	now := time.Now()
+	message := fmt.Sprintf(format, args...)
+
+	l.mu.Lock()
+	elapsed := now.Sub(l.lastStage).Round(time.Millisecond)
+	total := now.Sub(l.started).Round(time.Millisecond)
+	l.lastStage = now
+	_, _ = fmt.Fprintf(
+		l.out,
+		"rmtx: === %s === elapsed=%s total=%s\n",
+		message,
+		elapsed,
+		total,
+	)
+	l.mu.Unlock()
 }
 
 func (l *runLogger) Every(id, format string, args ...any) {
@@ -930,6 +958,7 @@ func processExecFrames(
 		}
 
 		done, updatedExitCode, err := handleExecFrame(
+			ctx,
 			conn,
 			head,
 			root,
@@ -1021,6 +1050,7 @@ func processTTYExecFrames(
 		}
 
 		done, updatedExitCode, err := handleExecFrame(
+			ctx,
 			conn,
 			head,
 			root,
@@ -1062,6 +1092,7 @@ func consumeTTYInputErr(inputErrCh <-chan error) error {
 }
 
 func handleExecFrame(
+	ctx context.Context,
 	conn *protocol.Conn,
 	head protocol.Header,
 	root string,
@@ -1085,15 +1116,11 @@ func handleExecFrame(
 		}
 
 		return false, code, err
-	case protocol.MsgSyncCompressionStart:
-		return false, exitCode, enableSyncCompression(conn, head)
 	case protocol.MsgChangeSet:
-		progress, err := applyChangeSet(conn, head, root, logger)
-		*downloadProgress = progress
+		err := syncWorkspaceChangesFromHost(context.WithoutCancel(ctx), conn, head, root, opts, logger)
+		*downloadProgress = nil
 
 		return false, exitCode, err
-	case protocol.MsgChangeBlob:
-		return false, exitCode, applyChangeBlob(conn, head, root, logger, *downloadProgress)
 	case protocol.MsgChangesDone:
 		if *downloadProgress != nil {
 			(*downloadProgress).Done()
@@ -1156,30 +1183,17 @@ func decodeExitCode(head protocol.Header) (int, error) {
 	return info.Code, nil
 }
 
-func enableSyncCompression(conn *protocol.Conn, head protocol.Header) error {
-	info, err := protocol.DecodeData[protocol.CompressionInfo](head)
-	if err != nil {
-		return err
-	}
-
-	switch info.Algorithm {
-	case protocol.CompressionZstd:
-		_, err := conn.EnableZstdReader()
-		return err
-	default:
-		return fmt.Errorf("unsupported sync compression: %s", info.Algorithm)
-	}
-}
-
-func applyChangeSet(
+func syncWorkspaceChangesFromHost(
+	ctx context.Context,
 	conn *protocol.Conn,
 	head protocol.Header,
 	root string,
+	opts ExecOptions,
 	logger *runLogger,
-) (*transferProgress, error) {
+) error {
 	changes, err := protocol.DecodeData[protocol.ChangeSet](head)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	files, bytes := changeSetFileTotals(changes.Entries)
@@ -1191,78 +1205,52 @@ func applyChangeSet(
 	)
 
 	if err := syncfs.DeletePaths(root, changes.Deleted); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := syncfs.ApplyNonFileEntries(root, syncfs.NonFileEntries(changes.Entries)); err != nil {
-		return nil, err
+		return err
 	}
 
-	return newTransferProgress("download", logger, files, bytes), nil
-}
-
-func applyChangeBlob(
-	conn *protocol.Conn,
-	head protocol.Header,
-	root string,
-	logger *runLogger,
-	progress *transferProgress,
-) error {
-	info, err := protocol.DecodeData[protocol.BlobInfo](head)
+	store, err := clientBlobStore()
 	if err != nil {
 		return err
 	}
 
-	entry := syncfs.Entry{
-		Path:    info.Path,
-		Kind:    syncfs.KindFile,
-		Hash:    info.Hash,
-		Size:    head.PayloadLen,
-		Mode:    info.Mode,
-		ModTime: info.ModTime,
-	}
+	missing := store.MissingHashes(changes.Entries)
+	sort.Strings(missing)
 
-	logger.Printf(
-		"download file started: path=%s bytes=%s",
-		info.Path,
-		formatBytes(head.PayloadLen),
-	)
-
-	var received int64
-
-	reader := &progressReader{
-		src: conn.PayloadReader(head),
-		onRead: func(n int) {
-			received += int64(n)
-			if progress != nil {
-				progress.AddBytes(n)
-			}
-
-			logger.Every(
-				"download-file:"+info.Path,
-				"download file: current_file=%s bytes=%s/%s",
-				info.Path,
-				formatBytes(received),
-				formatBytes(head.PayloadLen),
-			)
-		},
-	}
-
-	if err := syncfs.WriteFile(root, entry, reader); err != nil {
+	if err := conn.WriteJSON(protocol.MsgNeedBlobs, protocol.NeedBlobs{Hashes: missing}); err != nil {
 		return err
 	}
 
-	if progress != nil {
-		progress.CompleteFile()
+	need, err := expectDataFrameWithOutput[protocol.NeedBlobs](
+		conn,
+		protocol.MsgNeedBlobs,
+		opts.Stderr,
+	)
+	if err != nil {
+		return err
 	}
 
-	logger.Printf(
-		"download file done: path=%s bytes=%s",
-		info.Path,
-		formatBytes(received),
-	)
+	if len(need.Hashes) > 0 {
+		missingFiles, missingBytes := selectedFileTotals(changes.Entries, need.Hashes)
+		transferProgress := newTransferProgress("download-transfer", logger, missingFiles, missingBytes)
+		if err := receiveMissingBlobsFromHost(ctx, need, changes.Entries, store, opts, transferProgress); err != nil {
+			return err
+		}
+		transferProgress.Done()
+	}
 
-	return nil
+	progress := newTransferProgress("download", logger, files, bytes)
+	if err := materializeDownloadedChanges(ctx, root, store, changes.Entries, progress); err != nil {
+		return err
+	}
+	progress.Done()
+
+	updateManifestCacheAfterSync(root, opts.ContextID, changes, logger)
+
+	return conn.WriteJSON(protocol.MsgSyncComplete, nil)
 }
 
 func changeSetFileTotals(entries []syncfs.Entry) (int, int64) {
@@ -1280,6 +1268,366 @@ func changeSetFileTotals(entries []syncfs.Entry) (int, int64) {
 	}
 
 	return files, bytes
+}
+
+func selectedFileTotals(entries []syncfs.Entry, hashes []string) (int, int64) {
+	selected := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		selected[hash] = struct{}{}
+	}
+
+	seen := map[string]struct{}{}
+	var bytes int64
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile {
+			continue
+		}
+		if _, ok := selected[entry.Hash]; !ok {
+			continue
+		}
+		if _, ok := seen[entry.Hash]; ok {
+			continue
+		}
+		seen[entry.Hash] = struct{}{}
+		bytes += entry.Size
+	}
+
+	return len(seen), bytes
+}
+
+func receiveMissingBlobsFromHost(
+	ctx context.Context,
+	need protocol.NeedBlobs,
+	entries []syncfs.Entry,
+	store *syncfs.BlobStore,
+	opts ExecOptions,
+	progress *transferProgress,
+) error {
+	if len(need.Hashes) == 0 {
+		return nil
+	}
+	if need.TransferToken == "" {
+		return errors.New("host did not provide blob transfer token")
+	}
+
+	chunkSize := need.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = protocol.DefaultBlobChunkSize
+	}
+
+	descriptors, err := descriptorsForHashes(entries, need.Hashes)
+	if err != nil {
+		return err
+	}
+
+	receiver, err := syncfs.NewChunkedBlobReceiver(store, descriptors, chunkSize)
+	if err != nil {
+		return err
+	}
+
+	chunks := protocol.PlanBlobChunks(descriptors, chunkSize)
+	parallel := downloadParallelism(need, len(chunks))
+	chunkProgress := newBlobChunkProgress(progress, chunks)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	for range parallel {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := downloadBlobWorker(ctx, need.TransferToken, chunkSize, opts, receiver, chunkProgress); err != nil {
+				select {
+				case errCh <- err:
+					cancel()
+				default:
+				}
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiver.Wait(ctx) }()
+
+	for {
+		select {
+		case err := <-errCh:
+			_ = receiver.Fail(err)
+			return err
+		case err := <-receiverDone:
+			if err != nil {
+				cancel()
+				return err
+			}
+			receiverDone = nil
+		case <-done:
+			if receiverDone != nil {
+				continue
+			}
+			return nil
+		case <-ctx.Done():
+			_ = receiver.Fail(ctx.Err())
+			return ctx.Err()
+		}
+	}
+}
+
+func descriptorsForHashes(
+	entries []syncfs.Entry,
+	hashes []string,
+) ([]protocol.BlobDescriptor, error) {
+	byHash := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
+			continue
+		}
+		if _, ok := byHash[entry.Hash]; !ok {
+			byHash[entry.Hash] = entry.Size
+		}
+	}
+
+	descriptors := make([]protocol.BlobDescriptor, 0, len(hashes))
+	for _, hash := range hashes {
+		size, ok := byHash[hash]
+		if !ok {
+			return nil, fmt.Errorf("host requested unknown blob %s", hash)
+		}
+		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: hash, Size: size})
+	}
+
+	return descriptors, nil
+}
+
+func downloadParallelism(need protocol.NeedBlobs, totalChunks int) int {
+	parallel := need.Parallel
+	if parallel <= 0 {
+		parallel = transferParallelism(totalChunks)
+	}
+	if parallel > maxBlobTransferParallel {
+		parallel = maxBlobTransferParallel
+	}
+	if parallel > totalChunks {
+		parallel = totalChunks
+	}
+	if parallel < 1 {
+		return 1
+	}
+
+	return parallel
+}
+
+func downloadBlobWorker(
+	ctx context.Context,
+	token string,
+	chunkSize int64,
+	opts ExecOptions,
+	receiver *syncfs.ChunkedBlobReceiver,
+	progress *blobChunkProgress,
+) error {
+	conn, err := dialTLS(
+		ctx,
+		opts.Address,
+		opts.DiscoveryService,
+		opts.Host.Fingerprint,
+		opts.ClientCertPEM,
+		opts.ClientKeyPEM,
+	)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(conn.Raw())
+
+	req := protocol.BlobTransferRequest{
+		ContextID: opts.ContextID,
+		Session:   opts.Session,
+		Token:     token,
+		Direction: protocol.BlobTransferDownload,
+	}
+	if err := conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
+		return err
+	}
+
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return err
+		}
+
+		switch head.Type {
+		case protocol.MsgHeartbeat:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+		case protocol.MsgError:
+			return decodeServerError(head)
+		case protocol.MsgBlobChunk:
+			info, err := protocol.DecodeData[protocol.BlobChunkInfo](head)
+			if err != nil {
+				return err
+			}
+			if err := receiver.ReceiveChunk(info, conn.PayloadReader(head), head.PayloadLen); err != nil {
+				return err
+			}
+			progress.AddBytes(int(head.PayloadLen))
+			progress.CompleteChunk(info.Hash)
+		case protocol.MsgSyncComplete:
+			return nil
+		default:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+			return fmt.Errorf("unexpected blob transfer frame: %s", head.Type)
+		}
+	}
+}
+
+func materializeDownloadedChanges(
+	ctx context.Context,
+	root string,
+	store *syncfs.BlobStore,
+	entries []syncfs.Entry,
+	progress *transferProgress,
+) error {
+	files := make([]syncfs.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Kind == syncfs.KindFile {
+			files = append(files, entry)
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workers := transferParallelism(len(files))
+	jobs := make(chan syncfs.Entry)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case entry, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if err := materializeDownloadedFile(root, store, entry, progress); err != nil {
+						select {
+						case errCh <- err:
+							cancel()
+						default:
+						}
+						return
+					}
+					progress.CompleteFile()
+				}
+			}
+		}()
+	}
+
+sendJobs:
+	for _, entry := range files {
+		select {
+		case <-ctx.Done():
+			break sendJobs
+		case jobs <- entry:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	return ctx.Err()
+}
+
+func materializeDownloadedFile(
+	root string,
+	store *syncfs.BlobStore,
+	entry syncfs.Entry,
+	progress *transferProgress,
+) error {
+	target, err := pathutil.SecureJoin(root, filepath.FromSlash(entry.Path))
+	if err != nil {
+		return err
+	}
+
+	mode := os.FileMode(entry.Mode)
+	if mode == 0 {
+		mode = 0o644
+	}
+
+	return store.MaterializeWithProgress(
+		entry.Hash,
+		target,
+		mode,
+		entry.ModTime,
+		func(n int) {
+			progress.AddBytes(n)
+		},
+	)
+}
+
+func updateManifestCacheAfterSync(
+	root string,
+	contextID string,
+	changes protocol.ChangeSet,
+	logger *runLogger,
+) {
+	previous, err := loadCachedManifest(root, contextID)
+	if err != nil {
+		logger.Printf("local manifest cache sync-back update skipped: %v", err)
+		return
+	}
+
+	updated := applyManifestChanges(previous, changes)
+	if err := saveCachedManifest(root, contextID, updated); err != nil {
+		logger.Printf("local manifest cache sync-back update failed: %v", err)
+	}
+}
+
+func applyManifestChanges(previous []syncfs.Entry, changes protocol.ChangeSet) []syncfs.Entry {
+	byPath := make(map[string]syncfs.Entry, len(previous)+len(changes.Entries))
+	for _, entry := range previous {
+		byPath[entry.Path] = entry
+	}
+	for _, path := range changes.Deleted {
+		delete(byPath, path)
+	}
+	for _, entry := range changes.Entries {
+		byPath[entry.Path] = entry
+	}
+
+	updated := make([]syncfs.Entry, 0, len(byPath))
+	for _, entry := range byPath {
+		updated = append(updated, entry)
+	}
+	sort.Slice(updated, func(i, j int) bool {
+		return updated[i].Path < updated[j].Path
+	})
+
+	return updated
 }
 
 type PairOptions struct {
@@ -1475,12 +1823,26 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f PiB", value/unit)
 }
 
-func formatCompression(compression string) string {
-	if compression == "" {
-		return "none"
+func transferParallelism(totalChunks int) int {
+	if totalChunks <= 1 {
+		return 1
 	}
 
-	return compression
+	parallel := runtime.NumCPU()
+	if parallel > 8 {
+		parallel = 8
+	}
+	if parallel > maxBlobTransferParallel {
+		parallel = maxBlobTransferParallel
+	}
+	if parallel > totalChunks {
+		parallel = totalChunks
+	}
+	if parallel < 1 {
+		return 1
+	}
+
+	return parallel
 }
 
 func sendMissingBlobs(
@@ -1502,45 +1864,38 @@ func sendMissingBlobs(
 		return nil
 	}
 
-	parallel := uploadParallelism(need, len(ordered))
-	compression := chooseBlobUploadCompression(ordered)
-	useUploadWorkers := need.UploadToken != "" && (parallel > 1 || compression != "")
-	actualParallel := 1
-	actualCompression := ""
-	if useUploadWorkers {
-		actualParallel = parallel
-		actualCompression = compression
+	if need.TransferToken == "" {
+		return errors.New("host did not provide blob transfer token")
 	}
+
+	chunkSize := need.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = protocol.DefaultBlobChunkSize
+	}
+	descriptors := uploadBlobDescriptors(ordered)
+	chunks := protocol.PlanBlobChunks(descriptors, chunkSize)
+	parallel := uploadParallelism(need, len(chunks))
 
 	progress := newTransferProgress("upload", logger, len(ordered), totalBytes)
 	logger.Printf(
-		"uploading missing file blobs: files=%d bytes=%s parallel=%d compression=%s",
+		"uploading missing file blobs: files=%d chunks=%d bytes=%s parallel=%d",
 		len(ordered),
+		len(chunks),
 		formatBytes(totalBytes),
-		actualParallel,
-		formatCompression(actualCompression),
+		parallel,
 	)
 
-	if useUploadWorkers {
-		if err := sendMissingBlobsParallel(
-			ctx,
-			ordered,
-			parallel,
-			need.UploadToken,
-			compression,
-			opts,
-			progress,
-			logger,
-		); err != nil {
-			return err
-		}
-
-		progress.Done()
-
-		return nil
-	}
-
-	if err := sendMissingBlobsSequential(conn, ordered, progress, logger); err != nil {
+	if err := sendMissingBlobsParallel(
+		ctx,
+		ordered,
+		chunks,
+		parallel,
+		need.TransferToken,
+		chunkSize,
+		opts,
+		progress,
+		logger,
+	); err != nil {
 		return err
 	}
 
@@ -1595,34 +1950,27 @@ func uploadDisplayPath(root, srcPath string) string {
 	return filepath.ToSlash(srcPath)
 }
 
-func chooseBlobUploadCompression(items []blobUploadItem) string {
-	candidates := make([]syncfs.CompressionCandidate, 0, len(items))
+func uploadBlobDescriptors(items []blobUploadItem) []protocol.BlobDescriptor {
+	descriptors := make([]protocol.BlobDescriptor, 0, len(items))
 	for _, item := range items {
-		candidates = append(candidates, syncfs.CompressionCandidate{
-			Path: item.path,
-			Size: item.size,
-		})
+		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: item.hash, Size: item.size})
 	}
 
-	if syncfs.ShouldCompressTransfer(candidates) {
-		return protocol.CompressionZstd
-	}
-
-	return ""
+	return descriptors
 }
 
-func uploadParallelism(need protocol.NeedBlobs, total int) int {
+func uploadParallelism(need protocol.NeedBlobs, totalChunks int) int {
 	parallel := need.Parallel
 	if parallel <= 0 {
-		parallel = parallelBlobUploads
+		parallel = transferParallelism(totalChunks)
 	}
 
-	if parallel > parallelBlobUploads {
-		parallel = parallelBlobUploads
+	if parallel > maxBlobTransferParallel {
+		parallel = maxBlobTransferParallel
 	}
 
-	if parallel > total {
-		parallel = total
+	if parallel > totalChunks {
+		parallel = totalChunks
 	}
 
 	if parallel < 1 {
@@ -1632,29 +1980,13 @@ func uploadParallelism(need protocol.NeedBlobs, total int) int {
 	return parallel
 }
 
-func sendMissingBlobsSequential(
-	conn *protocol.Conn,
-	items []blobUploadItem,
-	progress *transferProgress,
-	logger *runLogger,
-) error {
-	for _, item := range items {
-		if err := sendBlob(conn, item, "", progress, logger); err != nil {
-			return err
-		}
-
-		progress.CompleteFile()
-	}
-
-	return nil
-}
-
 func sendMissingBlobsParallel(
 	ctx context.Context,
 	items []blobUploadItem,
+	chunks []protocol.BlobChunkInfo,
 	parallel int,
 	token string,
-	compression string,
+	chunkSize int64,
 	opts ExecOptions,
 	progress *transferProgress,
 	logger *runLogger,
@@ -1662,8 +1994,10 @@ func sendMissingBlobsParallel(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan blobUploadItem)
+	jobs := make(chan blobUploadChunk)
 	errCh := make(chan error, 1)
+	chunkProgress := newBlobChunkProgress(progress, chunks)
+	itemsByHash := uploadItemsByHash(items)
 
 	var wg sync.WaitGroup
 	for range parallel {
@@ -1672,7 +2006,14 @@ func sendMissingBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			if err := uploadBlobWorker(ctx, jobs, token, compression, opts, progress, logger); err != nil {
+			if err := uploadBlobWorker(
+				ctx,
+				jobs,
+				token,
+				chunkSize,
+				opts,
+				chunkProgress,
+			); err != nil {
 				select {
 				case errCh <- err:
 					cancel()
@@ -1682,7 +2023,7 @@ func sendMissingBlobsParallel(
 		}()
 	}
 
-	go sendUploadJobs(ctx, items, jobs)
+	go sendUploadJobs(ctx, chunks, itemsByHash, jobs)
 
 	done := make(chan struct{})
 
@@ -1701,26 +2042,45 @@ func sendMissingBlobsParallel(
 	}
 }
 
-func sendUploadJobs(ctx context.Context, items []blobUploadItem, jobs chan<- blobUploadItem) {
+type blobUploadChunk struct {
+	item blobUploadItem
+	info protocol.BlobChunkInfo
+}
+
+func uploadItemsByHash(items []blobUploadItem) map[string]blobUploadItem {
+	byHash := make(map[string]blobUploadItem, len(items))
+	for _, item := range items {
+		byHash[item.hash] = item
+	}
+
+	return byHash
+}
+
+func sendUploadJobs(
+	ctx context.Context,
+	chunks []protocol.BlobChunkInfo,
+	items map[string]blobUploadItem,
+	jobs chan<- blobUploadChunk,
+) {
 	defer close(jobs)
 
-	for _, item := range items {
+	for _, chunk := range chunks {
+		item := items[chunk.Hash]
 		select {
 		case <-ctx.Done():
 			return
-		case jobs <- item:
+		case jobs <- blobUploadChunk{item: item, info: chunk}:
 		}
 	}
 }
 
 func uploadBlobWorker(
 	ctx context.Context,
-	jobs <-chan blobUploadItem,
+	jobs <-chan blobUploadChunk,
 	token string,
-	compression string,
+	chunkSize int64,
 	opts ExecOptions,
-	progress *transferProgress,
-	logger *runLogger,
+	progress *blobChunkProgress,
 ) error {
 	conn, err := dialTLS(
 		ctx,
@@ -1736,119 +2096,107 @@ func uploadBlobWorker(
 
 	defer closeQuietly(conn.Raw())
 
-	req := protocol.BlobUploadRequest{
-		ContextID:   opts.ContextID,
-		Session:     opts.Session,
-		Token:       token,
-		Compression: compression,
+	req := protocol.BlobTransferRequest{
+		ContextID: opts.ContextID,
+		Session:   opts.Session,
+		Token:     token,
+		Direction: protocol.BlobTransferUpload,
 	}
 
-	var closeCompressed func() error
-	if compression == protocol.CompressionZstd {
-		closeCompressed, err = conn.WriteJSONAndEnableZstdWriter(
-			protocol.MsgBlobUploadRequest,
-			req,
-		)
-		if err != nil {
-			return err
-		}
-
-	} else if err := conn.WriteJSON(protocol.MsgBlobUploadRequest, req); err != nil {
+	if err := conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
 		return err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)
 	defer stopLiveness()
-	defer func() {
-		if closeCompressed != nil {
-			_ = closeCompressed()
-		}
-	}()
-
-	for item := range jobs {
+	for job := range jobs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		if err := sendBlob(conn, item, compression, progress, logger); err != nil {
+		if err := sendUploadChunk(conn, job, chunkSize, progress); err != nil {
 			return err
 		}
-
-		progress.CompleteFile()
+		progress.CompleteChunk(job.info.Hash)
 	}
 
 	if err := conn.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
 		return err
 	}
 
-	if closeCompressed != nil {
-		return closeCompressed()
+	return nil
+}
+
+func sendUploadChunk(
+	conn *protocol.Conn,
+	job blobUploadChunk,
+	chunkSize int64,
+	progress *blobChunkProgress,
+) error {
+	payloadLen := protocol.BlobChunkPayloadLen(job.info, chunkSize)
+	f, err := os.Open(job.item.path)
+	if err != nil {
+		return fmt.Errorf("open blob source %s: %w", job.item.path, err)
+	}
+
+	defer closeQuietly(f)
+
+	reader := &progressReader{
+		src: io.NewSectionReader(f, job.info.Offset, payloadLen),
+		onRead: func(n int) {
+			progress.AddBytes(n)
+		},
+	}
+
+	if err := conn.WriteFrom(
+		protocol.MsgBlobChunk,
+		job.info,
+		reader,
+		payloadLen,
+	); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func sendBlob(
-	conn *protocol.Conn,
-	item blobUploadItem,
-	compression string,
+type blobChunkProgress struct {
+	progress  *transferProgress
+	remaining map[string]int
+	mu        sync.Mutex
+}
+
+func newBlobChunkProgress(
 	progress *transferProgress,
-	logger *runLogger,
-) error {
-	displayPath := item.displayPath
-	if displayPath == "" {
-		displayPath = filepath.ToSlash(item.path)
+	chunks []protocol.BlobChunkInfo,
+) *blobChunkProgress {
+	remaining := map[string]int{}
+	for _, chunk := range chunks {
+		remaining[chunk.Hash]++
 	}
 
-	f, err := os.Open(item.path)
-	if err != nil {
-		return fmt.Errorf("open blob source %s: %w", item.path, err)
+	return &blobChunkProgress{progress: progress, remaining: remaining}
+}
+
+func (p *blobChunkProgress) AddBytes(n int) {
+	if p != nil && p.progress != nil {
+		p.progress.AddBytes(n)
+	}
+}
+
+func (p *blobChunkProgress) CompleteChunk(hash string) {
+	if p == nil || p.progress == nil {
+		return
 	}
 
-	defer closeQuietly(f)
+	p.mu.Lock()
+	remaining := p.remaining[hash] - 1
+	p.remaining[hash] = remaining
+	p.mu.Unlock()
 
-	logger.Printf(
-		"upload file started: path=%s bytes=%s compression=%s",
-		displayPath,
-		formatBytes(item.size),
-		formatCompression(compression),
-	)
-
-	var uploaded int64
-
-	reader := &progressReader{
-		src: f,
-		onRead: func(n int) {
-			uploaded += int64(n)
-			progress.AddBytes(n)
-			logger.Every(
-				"upload-file:"+item.hash,
-				"upload file: current_file=%s bytes=%s/%s compression=%s",
-				displayPath,
-				formatBytes(uploaded),
-				formatBytes(item.size),
-				formatCompression(compression),
-			)
-		},
+	if remaining == 0 {
+		p.progress.CompleteFile()
 	}
-
-	if err := conn.WriteFrom(
-		protocol.MsgBlob,
-		protocol.BlobInfo{Path: displayPath, Hash: item.hash, Size: item.size},
-		reader,
-		item.size,
-	); err != nil {
-		return err
-	}
-
-	logger.Printf(
-		"upload file done: path=%s bytes=%s compression=%s",
-		displayPath,
-		formatBytes(uploaded),
-		formatCompression(compression),
-	)
-
-	return nil
 }
 
 type progressReader struct {

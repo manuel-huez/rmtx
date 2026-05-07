@@ -16,6 +16,10 @@ func (s *Server) consumeTTYInput(
 	inputClosed := false
 
 	for {
+		if stopped, ok := writer.(interface{ Stopped() bool }); ok && stopped.Stopped() {
+			return nil
+		}
+
 		head, err := conn.ReadHeader()
 		if err != nil {
 			return err

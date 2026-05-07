@@ -118,14 +118,14 @@ func (s *Server) runOCIPipeCommand(
 		preparedRuntime,
 		runLogs,
 	); err != nil {
-		input.Stop()
+		_ = stopPipeInputReader(conn, input)
 		return 1, err
 	}
 	runLogs.Flush()
 
 	cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime, runLogs)
 	if err != nil {
-		input.Stop()
+		_ = stopPipeInputReader(conn, input)
 		return 1, err
 	}
 

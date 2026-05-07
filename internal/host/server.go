@@ -27,21 +27,21 @@ import (
 )
 
 const (
-	defaultDirMode        = 0o755
-	streamBufferSize      = 32 * 1024
-	splitNEquals          = 2
-	pipeCount             = 2
-	exitCodeNotFound      = 127
-	defaultFileMode       = 0o644
-	noneValue             = "none"
-	reverseDialTimeout    = 5 * time.Second
-	progressEvery         = 3 * time.Second
-	blobUploadParallel    = 4
-	materializeParallel   = 4
-	hostUpdateTimeout     = 5 * time.Minute
-	startupCleanupTimeout = 15 * time.Second
-	restartPollEvery      = 100 * time.Millisecond
-	tcpKeepAliveEvery     = 15 * time.Second
+	defaultDirMode          = 0o755
+	streamBufferSize        = 32 * 1024
+	splitNEquals            = 2
+	pipeCount               = 2
+	exitCodeNotFound        = 127
+	defaultFileMode         = 0o644
+	noneValue               = "none"
+	reverseDialTimeout      = 5 * time.Second
+	progressEvery           = 3 * time.Second
+	maxBlobTransferParallel = 16
+	materializeParallel     = 4
+	hostUpdateTimeout       = 5 * time.Minute
+	startupCleanupTimeout   = 15 * time.Second
+	restartPollEvery        = 100 * time.Millisecond
+	tcpKeepAliveEvery       = 15 * time.Second
 )
 
 var (
@@ -93,12 +93,12 @@ type Server struct {
 	restartVersion       string
 	restartInstallTarget string
 
-	contextLocksMu sync.Mutex
-	contextLocks   map[string]*sync.Mutex
-	activeMu       sync.Mutex
-	activeContexts map[string]int
-	uploadsMu      sync.Mutex
-	uploads        map[string]*blobUploadSession
+	contextLocksMu  sync.Mutex
+	contextLocks    map[string]*sync.Mutex
+	activeMu        sync.Mutex
+	activeContexts  map[string]int
+	blobTransfersMu sync.Mutex
+	blobTransfers   map[string]*blobTransferSession
 	// Hold during pre-run sync so blob GC cannot remove hashes before manifest commit.
 	blobGCMu     sync.RWMutex
 	ociMu        sync.Mutex
@@ -159,7 +159,7 @@ func New(opts Options) (*Server, error) {
 		fingerprint:    fingerprint,
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
-		uploads:        map[string]*blobUploadSession{},
+		blobTransfers:  map[string]*blobTransferSession{},
 		updateRunner:   defaultUpdateRunner,
 	}, nil
 }
@@ -489,6 +489,28 @@ func isDisconnectErrno(errno syscall.Errno) bool {
 		errno == windowsConnectionReset
 }
 
+func transferParallelism(totalChunks int) int {
+	if totalChunks <= 1 {
+		return 1
+	}
+
+	parallel := runtime.NumCPU()
+	if parallel > 8 {
+		parallel = 8
+	}
+	if parallel > maxBlobTransferParallel {
+		parallel = maxBlobTransferParallel
+	}
+	if parallel > totalChunks {
+		parallel = totalChunks
+	}
+	if parallel < 1 {
+		return 1
+	}
+
+	return parallel
+}
+
 func (s *Server) handleConnSession(
 	parent context.Context,
 	cancel context.CancelFunc,
@@ -704,8 +726,8 @@ func (s *Server) dispatchSessionRequest(
 	switch head.Type {
 	case protocol.MsgRunRequest:
 		return s.dispatchRunRequest(parent, conn, head, requestLogs)
-	case protocol.MsgBlobUploadRequest:
-		return s.dispatchBlobUploadRequest(conn, head)
+	case protocol.MsgBlobTransferRequest:
+		return s.dispatchBlobTransferRequest(parent, conn, head)
 	case protocol.MsgPingRequest:
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
 			return s.handlePing(conn, requestLogs)
@@ -773,13 +795,17 @@ func (s *Server) dispatchRunRequest(
 	return s.handleRunRequest(parent, conn, req, runLogs)
 }
 
-func (s *Server) dispatchBlobUploadRequest(conn *protocol.Conn, head protocol.Header) error {
-	req, err := protocol.DecodeData[protocol.BlobUploadRequest](head)
+func (s *Server) dispatchBlobTransferRequest(
+	ctx context.Context,
+	conn *protocol.Conn,
+	head protocol.Header,
+) error {
+	req, err := protocol.DecodeData[protocol.BlobTransferRequest](head)
 	if err != nil {
 		return err
 	}
 
-	return s.handleBlobUploadRequest(conn, req)
+	return s.handleBlobTransferRequest(ctx, conn, req)
 }
 
 func (s *Server) dispatchHostUpdateRequest(
@@ -935,23 +961,20 @@ func (s *Server) executeAndSyncRun(
 		)
 	}
 
-	closeCompressed, err := s.sendWorkspaceChanges(
+	if err := s.sendWorkspaceChanges(
+		parent,
 		conn,
+		request.ContextID,
+		request.Session,
 		handle.workspace,
+		post.BlobSources,
 		request.Manifest,
 		postEntries,
 		request.SyncBack,
 		ignoreMode,
-	)
-	if err != nil {
+	); err != nil {
 		return err
 	}
-
-	defer func() {
-		if closeCompressed != nil {
-			_ = closeCompressed()
-		}
-	}()
 
 	if err := s.saveTrackedManifest(request.ContextID, postEntries); err != nil {
 		return err
@@ -974,13 +997,6 @@ func (s *Server) executeAndSyncRun(
 
 	if err := conn.WriteJSON(protocol.MsgChangesDone, nil); err != nil {
 		return err
-	}
-
-	if closeCompressed != nil {
-		if err := closeCompressed(); err != nil {
-			return err
-		}
-		closeCompressed = nil
 	}
 
 	return nil
@@ -1132,78 +1148,63 @@ func (s *Server) executeRequest(
 }
 
 func (s *Server) sendWorkspaceChanges(
+	ctx context.Context,
 	conn *protocol.Conn,
+	contextID string,
+	session string,
 	workspace string,
+	blobSources map[string]string,
 	before []syncfs.Entry,
 	after []syncfs.Entry,
 	syncBack []string,
 	ignoreMode bool,
-) (func() error, error) {
+) error {
 	changed, deleted := diffWorkspaceChanges(before, after, syncBack, ignoreMode)
-	compression := chooseWorkspaceChangeCompression(workspace, changed)
 	s.logger.Printf(
-		"sending workspace changes: sync_back=%s changed=%d deleted=%d compression=%s",
+		"sending workspace changes: sync_back=%s changed=%d deleted=%d",
 		formatSyncBack(syncBack),
 		len(changed),
 		len(deleted),
-		compression,
 	)
-
-	var (
-		closeCompressed func() error
-		err             error
-	)
-
-	if compression != "" {
-		closeCompressed, err = conn.WriteJSONAndEnableZstdWriter(
-			protocol.MsgSyncCompressionStart,
-			protocol.CompressionInfo{Algorithm: compression},
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	if err := conn.WriteJSON(
 		protocol.MsgChangeSet,
 		protocol.ChangeSet{Entries: changed, Deleted: deleted},
 	); err != nil {
-		if closeCompressed != nil {
-			_ = closeCompressed()
-		}
-
-		return nil, err
+		return err
 	}
 
-	if err := s.sendChangedFileBlobs(conn, workspace, changed); err != nil {
-		if closeCompressed != nil {
-			_ = closeCompressed()
-		}
-
-		return nil, err
+	need, err := readClientNeedBlobs(conn)
+	if err != nil {
+		return err
 	}
 
-	return closeCompressed, nil
-}
-
-func chooseWorkspaceChangeCompression(workspace string, entries []syncfs.Entry) string {
-	candidates := make([]syncfs.CompressionCandidate, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Kind != syncfs.KindFile {
-			continue
-		}
-
-		candidates = append(candidates, syncfs.CompressionCandidate{
-			Path: filepath.Join(workspace, filepath.FromSlash(entry.Path)),
-			Size: entry.Size,
-		})
+	transfer, err := s.sendChangedFileBlobs(
+		ctx,
+		conn,
+		contextID,
+		session,
+		workspace,
+		blobSources,
+		changed,
+		need,
+	)
+	if transfer != nil {
+		defer s.unregisterBlobTransferSession(transfer.token)
+	}
+	if err != nil {
+		return err
 	}
 
-	if syncfs.ShouldCompressTransfer(candidates) {
-		return protocol.CompressionZstd
+	if err := s.storeChangedFileBlobs(workspace, blobSources, changed); err != nil {
+		return err
 	}
 
-	return ""
+	if err := s.waitForClientSyncCompleteAndBlobTransfer(ctx, conn, transfer); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func diffWorkspaceChanges(
@@ -1300,104 +1301,259 @@ func (s *Server) logBuildProgress(
 }
 
 func (s *Server) sendChangedFileBlobs(
+	ctx context.Context,
 	conn *protocol.Conn,
+	contextID string,
+	session string,
 	workspace string,
+	blobSources map[string]string,
 	changed []syncfs.Entry,
-) error {
-	total := 0
+	need protocol.NeedBlobs,
+) (*blobTransferSession, error) {
+	items, descriptors, err := prepareDownloadBlobItems(workspace, blobSources, changed, need.Hashes)
+	if err != nil {
+		return nil, err
+	}
 
+	chunkSize := protocol.DefaultBlobChunkSize
+	chunks := protocol.PlanBlobChunks(descriptors, chunkSize)
+	parallel := transferParallelism(len(chunks))
+
+	s.logger.Printf(
+		"sending changed file blobs to client: blobs=%d chunks=%d parallel=%d",
+		len(items),
+		len(chunks),
+		parallel,
+	)
+
+	if len(items) == 0 {
+		return nil, conn.WriteJSON(protocol.MsgNeedBlobs, protocol.NeedBlobs{})
+	}
+
+	token, err := protocol.RandomNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	jobs := make(chan blobSendJob)
+	transfer := newBlobSendSession(
+		contextID,
+		session,
+		token,
+		jobs,
+		len(chunks),
+		chunkSize,
+		parallel,
+	)
+	s.registerBlobTransferSession(transfer)
+
+	if err := conn.WriteJSON(
+		protocol.MsgNeedBlobs,
+		protocol.NeedBlobs{
+			Hashes:        need.Hashes,
+			TransferToken: token,
+			Parallel:      parallel,
+			ChunkSize:     chunkSize,
+		},
+	); err != nil {
+		close(jobs)
+		return transfer, err
+	}
+
+	go feedBlobSendJobs(ctx, chunks, items, jobs)
+
+	return transfer, nil
+}
+
+type downloadBlobItem struct {
+	hash string
+	path string
+	size int64
+}
+
+func prepareDownloadBlobItems(
+	workspace string,
+	blobSources map[string]string,
+	changed []syncfs.Entry,
+	hashes []string,
+) (map[string]downloadBlobItem, []protocol.BlobDescriptor, error) {
+	entriesByHash := map[string]syncfs.Entry{}
 	for _, entry := range changed {
-		if entry.Kind == syncfs.KindFile {
-			total++
+		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
+			continue
+		}
+		if _, ok := entriesByHash[entry.Hash]; !ok {
+			entriesByHash[entry.Hash] = entry
 		}
 	}
 
-	s.logger.Printf("sending changed file blobs to client: files=%d", total)
+	items := make(map[string]downloadBlobItem, len(hashes))
+	descriptors := make([]protocol.BlobDescriptor, 0, len(hashes))
+	for _, hash := range hashes {
+		entry, ok := entriesByHash[hash]
+		if !ok {
+			return nil, nil, fmt.Errorf("client requested unknown changed blob %s", hash)
+		}
 
-	sent := 0
+		source := blobSources[hash]
+		if source == "" {
+			source = filepath.Join(workspace, filepath.FromSlash(entry.Path))
+		}
 
-	var bytesSent int64
+		items[hash] = downloadBlobItem{hash: hash, path: source, size: entry.Size}
+		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: hash, Size: entry.Size})
+	}
 
-	lastProgress := time.Time{}
+	return items, descriptors, nil
+}
 
+func feedBlobSendJobs(
+	ctx context.Context,
+	chunks []protocol.BlobChunkInfo,
+	items map[string]downloadBlobItem,
+	jobs chan<- blobSendJob,
+) {
+	defer close(jobs)
+
+	for _, chunk := range chunks {
+		item := items[chunk.Hash]
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- blobSendJob{info: chunk, path: item.path}:
+		}
+	}
+}
+
+func (s *Server) storeChangedFileBlobs(
+	workspace string,
+	blobSources map[string]string,
+	changed []syncfs.Entry,
+) error {
+	stored := map[string]struct{}{}
 	for _, entry := range changed {
-		if entry.Kind != syncfs.KindFile {
+		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
+			continue
+		}
+		if _, ok := stored[entry.Hash]; ok {
 			continue
 		}
 
-		onRead := func(n int) {
-			bytesSent += int64(n)
-
-			now := time.Now()
-			if lastProgress.IsZero() || now.Sub(lastProgress) >= progressEvery {
-				lastProgress = now
-
-				s.logger.Printf(
-					"send changed blob progress: files=%d/%d bytes=%d",
-					sent,
-					total,
-					bytesSent,
-				)
-			}
+		source := blobSources[entry.Hash]
+		if source == "" {
+			source = filepath.Join(workspace, filepath.FromSlash(entry.Path))
 		}
-
-		if err := s.sendChangedFileBlob(conn, workspace, entry, onRead); err != nil {
-			return err
+		if err := s.blobStore.StorePath(entry.Hash, entry.Size, source); err != nil {
+			return fmt.Errorf("store changed blob %s: %w", entry.Path, err)
 		}
-
-		sent++
+		stored[entry.Hash] = struct{}{}
 	}
-
-	s.logger.Printf("sending changed file blobs done: files=%d bytes=%d", sent, bytesSent)
 
 	return nil
 }
 
-func (s *Server) sendChangedFileBlob(
+func readClientNeedBlobs(conn *protocol.Conn) (protocol.NeedBlobs, error) {
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return protocol.NeedBlobs{}, err
+		}
+
+		switch head.Type {
+		case protocol.MsgHeartbeat:
+			if err := conn.DiscardPayload(head); err != nil {
+				return protocol.NeedBlobs{}, err
+			}
+		case protocol.MsgStdinData, protocol.MsgStdinClose:
+			if err := conn.DiscardPayload(head); err != nil {
+				return protocol.NeedBlobs{}, err
+			}
+		case protocol.MsgRunCancel:
+			if err := conn.DiscardPayload(head); err != nil {
+				return protocol.NeedBlobs{}, err
+			}
+			return protocol.NeedBlobs{}, context.Canceled
+		case protocol.MsgNeedBlobs:
+			return protocol.DecodeData[protocol.NeedBlobs](head)
+		default:
+			if err := conn.DiscardPayload(head); err != nil {
+				return protocol.NeedBlobs{}, err
+			}
+			return protocol.NeedBlobs{}, fmt.Errorf("expected %s, got %s", protocol.MsgNeedBlobs, head.Type)
+		}
+	}
+}
+
+func readClientSyncComplete(conn *protocol.Conn) error {
+	for {
+		head, err := conn.ReadHeader()
+		if err != nil {
+			return err
+		}
+
+		switch head.Type {
+		case protocol.MsgHeartbeat:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+		case protocol.MsgStdinData, protocol.MsgStdinClose:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+		case protocol.MsgRunCancel:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+			return context.Canceled
+		case protocol.MsgSyncComplete:
+			return nil
+		default:
+			if err := conn.DiscardPayload(head); err != nil {
+				return err
+			}
+			return fmt.Errorf("expected %s, got %s", protocol.MsgSyncComplete, head.Type)
+		}
+	}
+}
+
+func (s *Server) waitForClientSyncCompleteAndBlobTransfer(
+	ctx context.Context,
 	conn *protocol.Conn,
-	workspace string,
-	entry syncfs.Entry,
-	onRead func(int),
+	transfer *blobTransferSession,
 ) error {
-	path := filepath.Join(workspace, filepath.FromSlash(entry.Path))
-
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open change blob %s: %w", entry.Path, err)
+	if transfer == nil {
+		return readClientSyncComplete(conn)
 	}
 
-	defer func() { _ = f.Close() }()
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- readClientSyncComplete(conn) }()
 
-	if err := conn.WriteFrom(
-		protocol.MsgChangeBlob,
-		protocol.BlobInfo{
-			Path:    entry.Path,
-			Hash:    entry.Hash,
-			Size:    entry.Size,
-			Mode:    entry.Mode,
-			ModTime: entry.ModTime,
-		},
-		&logReader{src: f, onRead: onRead},
-		entry.Size,
-	); err != nil {
-		return err
+	transferDone := make(chan error, 1)
+	go func() { transferDone <- transfer.wait(ctx) }()
+
+	for syncDone != nil || transferDone != nil {
+		select {
+		case err := <-syncDone:
+			syncDone = nil
+			if err != nil {
+				_ = transfer.fail(err)
+				return err
+			}
+		case err := <-transferDone:
+			transferDone = nil
+			if err != nil {
+				if conn != nil && conn.Raw() != nil {
+					_ = conn.Raw().SetReadDeadline(time.Now())
+				}
+				if syncDone != nil {
+					<-syncDone
+				}
+				return err
+			}
+		}
 	}
 
-	if s.blobStore.Has(entry.Hash) {
-		return nil
-	}
-
-	blob, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open change blob for host store %s: %w", entry.Path, err)
-	}
-
-	defer func() { _ = blob.Close() }()
-
-	if err := s.blobStore.Store(entry.Hash, entry.Size, blob); err != nil {
-		return fmt.Errorf("store changed blob %s: %w", entry.Path, err)
-	}
-
+	s.logger.Printf("sending changed file blobs done")
 	return nil
 }
 
@@ -1507,13 +1663,13 @@ func (s *Server) handlePairRequest(
 	})
 }
 
-func (s *Server) receiveBlobs(
+func (s *Server) waitForClientBlobTransfer(
 	ctx context.Context,
 	conn *protocol.Conn,
 	contextID string,
 	session string,
 	total int,
-	upload *blobUploadSession,
+	transfer *blobTransferSession,
 ) error {
 	s.logger.Printf(
 		"receiving client blobs: context=%s session=%s files=%d",
@@ -1521,12 +1677,6 @@ func (s *Server) receiveBlobs(
 		session,
 		total,
 	)
-
-	received := 0
-
-	var bytesReceived int64
-
-	lastProgress := time.Time{}
 
 	for {
 		head, err := conn.ReadHeader()
@@ -1539,34 +1689,18 @@ func (s *Server) receiveBlobs(
 			if err := conn.DiscardPayload(head); err != nil {
 				return err
 			}
-		case protocol.MsgBlob:
-			if err := s.receiveControlBlob(
-				conn,
-				head,
-				contextID,
-				session,
-				total,
-				&received,
-				&bytesReceived,
-				&lastProgress,
-				upload,
-			); err != nil {
-				return err
-			}
 		case protocol.MsgSyncComplete:
-			if upload != nil {
-				if err := waitForBlobUpload(ctx, upload); err != nil {
+			if transfer != nil {
+				if err := transfer.wait(ctx); err != nil {
 					return err
 				}
 			}
 
 			s.logger.Printf(
-				"receiving client blobs done: context=%s session=%s files=%d/%d bytes=%d",
+				"receiving client blobs done: context=%s session=%s files=%d",
 				contextID,
 				session,
-				received,
 				total,
-				bytesReceived,
 			)
 
 			return nil
@@ -1577,75 +1711,6 @@ func (s *Server) receiveBlobs(
 
 			return fmt.Errorf("unexpected sync frame: %s", head.Type)
 		}
-	}
-}
-
-func (s *Server) receiveControlBlob(
-	conn *protocol.Conn,
-	head protocol.Header,
-	contextID string,
-	session string,
-	total int,
-	received *int,
-	bytesReceived *int64,
-	lastProgress *time.Time,
-	upload *blobUploadSession,
-) error {
-	info, err := protocol.DecodeData[protocol.BlobInfo](head)
-	if err != nil {
-		return err
-	}
-
-	if info.Hash == "" {
-		return errors.New("blob hash is required")
-	}
-
-	reader := &logReader{
-		src: conn.PayloadReader(head),
-		onRead: func(n int) {
-			*bytesReceived += int64(n)
-
-			now := time.Now()
-			if lastProgress.IsZero() || now.Sub(*lastProgress) >= progressEvery {
-				*lastProgress = now
-
-				s.logger.Printf(
-					"receive blob progress: context=%s session=%s files=%d/%d bytes=%d",
-					contextID,
-					session,
-					*received,
-					total,
-					*bytesReceived,
-				)
-			}
-		},
-	}
-
-	if err := s.blobStore.Store(info.Hash, head.PayloadLen, reader); err != nil {
-		return err
-	}
-
-	if upload != nil {
-		if err := upload.complete(info.Hash); err != nil {
-			return err
-		}
-	}
-
-	(*received)++
-
-	return nil
-}
-
-func waitForBlobUpload(ctx context.Context, upload *blobUploadSession) error {
-	done := make(chan error, 1)
-
-	go func() { done <- upload.wait() }()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 
@@ -1767,7 +1832,18 @@ func (s *Server) runPipeExecCommandWithInput(
 		cancelRunHandle.Set(cancelRun)
 	}
 	defer cancelRun()
-	defer input.Stop()
+
+	inputStopped := false
+	stopInput := func() {
+		if inputStopped {
+			return
+		}
+		inputStopped = true
+		if err := stopPipeInputReader(conn, input); err != nil && !errors.Is(err, io.EOF) {
+			s.logger.Printf("stdin forwarding ended: %v", err)
+		}
+	}
+	defer stopInput()
 
 	stdout, stderr, err := commandOutputPipes(cmd)
 	if err != nil {
@@ -1806,15 +1882,7 @@ func (s *Server) runPipeExecCommandWithInput(
 	waitErr := cmd.Wait()
 
 	outWG.Wait()
-	input.Stop()
-
-	select {
-	case err := <-input.Done():
-		if err != nil && !errors.Is(err, io.EOF) && !isDisconnectError(err) {
-			s.logger.Printf("stdin forwarding ended: %v", err)
-		}
-	default:
-	}
+	stopInput()
 
 	return exitCode(waitErr), waitErr
 }

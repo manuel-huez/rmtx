@@ -66,8 +66,11 @@ func TestRunLoggerStageUsesDelimiter(t *testing.T) {
 
 	newRunLogger(&logs).Stage("execute remote command")
 
-	if got, want := logs.String(), "rmtx: === execute remote command ===\n"; got != want {
-		t.Fatalf("stage log=%q want %q", got, want)
+	got := logs.String()
+	if !strings.Contains(got, "rmtx: === execute remote command ===") ||
+		!strings.Contains(got, "elapsed=") ||
+		!strings.Contains(got, "total=") {
+		t.Fatalf("stage log missing timing fields: %q", got)
 	}
 }
 
