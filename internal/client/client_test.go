@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -119,6 +120,102 @@ func TestSendMissingBlobsDoesNotLogFilesWhenNothingTransfers(t *testing.T) {
 	if strings.Contains(logs.String(), "upload file started") ||
 		strings.Contains(logs.String(), "upload file done") {
 		t.Fatalf("unexpected file upload log: %s", logs.String())
+	}
+}
+
+func TestFillDownloadPipelineQueuesWindowWithoutResponse(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	pending := make([]protocol.BlobChunkInfo, downloadPipelineWindow+2)
+	for i := range pending {
+		pending[i] = protocol.BlobChunkInfo{
+			Hash:   fmt.Sprintf("hash-%d", i),
+			Size:   int64(downloadPipelineWindow + 2),
+			Offset: int64(i),
+		}
+	}
+
+	inFlight := map[blobChunkKey]protocol.BlobChunkInfo{}
+	inFlightOrder := []protocol.BlobChunkInfo{}
+	done := make(chan error, 1)
+	go func() {
+		_, err := fillDownloadPipeline(
+			context.Background(),
+			&blobTransferConn{conn: protocol.NewConn(clientConn)},
+			"token",
+			ExecOptions{ContextID: "ctx", Session: "session"},
+			&pending,
+			inFlight,
+			&inFlightOrder,
+		)
+		done <- err
+	}()
+
+	server := protocol.NewConn(serverConn)
+	for i := range downloadPipelineWindow {
+		head, err := server.ReadHeader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head.Type != protocol.MsgBlobTransferRequest {
+			t.Fatalf("frame %d type=%q want %q", i, head.Type, protocol.MsgBlobTransferRequest)
+		}
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fillDownloadPipeline blocked waiting for chunk responses")
+	}
+
+	if len(inFlight) != downloadPipelineWindow {
+		t.Fatalf("inFlight=%d want %d", len(inFlight), downloadPipelineWindow)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+}
+
+func TestRetryDownloadPipelineCountsOnlyFailedChunks(t *testing.T) {
+	failed := []protocol.BlobChunkInfo{
+		{Hash: "failed-1", Size: 10, Offset: 0},
+		{Hash: "failed-2", Size: 10, Offset: 1},
+	}
+	queued := []protocol.BlobChunkInfo{
+		{Hash: "queued-1", Size: 10, Offset: 2},
+		{Hash: "queued-2", Size: 10, Offset: 3},
+	}
+	attempts := map[blobChunkKey]int{}
+	for _, chunk := range failed {
+		attempts[keyBlobChunk(chunk)] = blobTransferMaxAttempts - 1
+	}
+
+	err := retryDownloadPipeline(
+		context.Background(),
+		nil,
+		attempts,
+		failed,
+		nil,
+		&syncfs.ChunkReadError{Hash: "failed-1", Err: io.ErrUnexpectedEOF},
+	)
+	if err == nil {
+		t.Fatal("retryDownloadPipeline succeeded after max attempts")
+	}
+
+	for _, chunk := range failed {
+		if got := attempts[keyBlobChunk(chunk)]; got != blobTransferMaxAttempts {
+			t.Fatalf("failed chunk attempts=%d want %d", got, blobTransferMaxAttempts)
+		}
+	}
+	for _, chunk := range queued {
+		if got := attempts[keyBlobChunk(chunk)]; got != 0 {
+			t.Fatalf("queued chunk attempts=%d want 0", got)
+		}
 	}
 }
 

@@ -1329,16 +1329,15 @@ func receiveMissingBlobsFromHost(
 	chunks := protocol.PlanBlobChunks(descriptors, chunkSize)
 	parallel := downloadParallelism(need, len(chunks))
 	chunkProgress := newBlobChunkProgress(progress, chunks)
+	groups := downloadChunkGroups(chunks, parallel)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan protocol.BlobChunkInfo)
 	errCh, done := startDownloadBlobWorkers(
 		ctx,
 		cancel,
-		jobs,
-		parallel,
+		groups,
 		need.TransferToken,
 		chunkSize,
 		opts,
@@ -1346,16 +1345,13 @@ func receiveMissingBlobsFromHost(
 		chunkProgress,
 	)
 
-	go sendDownloadJobs(ctx, chunks, jobs)
-
 	return waitForBlobDownload(ctx, cancel, receiver, errCh, done)
 }
 
 func startDownloadBlobWorkers(
 	ctx context.Context,
 	cancel context.CancelFunc,
-	jobs <-chan protocol.BlobChunkInfo,
-	parallel int,
+	groups [][]protocol.BlobChunkInfo,
 	token string,
 	chunkSize int64,
 	opts ExecOptions,
@@ -1366,11 +1362,11 @@ func startDownloadBlobWorkers(
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
-	for range parallel {
+	for _, group := range groups {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := downloadBlobWorker(ctx, jobs, token, chunkSize, opts, receiver, chunkProgress); err != nil {
+			if err := downloadBlobWorker(ctx, group, token, chunkSize, opts, receiver, chunkProgress); err != nil {
 				select {
 				case errCh <- err:
 					cancel()
@@ -1386,6 +1382,25 @@ func startDownloadBlobWorkers(
 	}()
 
 	return errCh, done
+}
+
+func downloadChunkGroups(chunks []protocol.BlobChunkInfo, parallel int) [][]protocol.BlobChunkInfo {
+	if parallel < 1 {
+		parallel = 1
+	}
+	if parallel > len(chunks) {
+		parallel = len(chunks)
+	}
+	if parallel < 1 {
+		return nil
+	}
+
+	groups := make([][]protocol.BlobChunkInfo, parallel)
+	for i, chunk := range chunks {
+		groups[i%parallel] = append(groups[i%parallel], chunk)
+	}
+
+	return groups
 }
 
 func waitForBlobDownload(
@@ -1417,22 +1432,6 @@ func waitForBlobDownload(
 		case <-ctx.Done():
 			_ = receiver.Fail(ctx.Err())
 			return ctx.Err()
-		}
-	}
-}
-
-func sendDownloadJobs(
-	ctx context.Context,
-	chunks []protocol.BlobChunkInfo,
-	jobs chan<- protocol.BlobChunkInfo,
-) {
-	defer close(jobs)
-
-	for _, chunk := range chunks {
-		select {
-		case <-ctx.Done():
-			return
-		case jobs <- chunk:
 		}
 	}
 }
@@ -1483,7 +1482,7 @@ func downloadParallelism(need protocol.NeedBlobs, totalChunks int) int {
 
 func downloadBlobWorker(
 	ctx context.Context,
-	jobs <-chan protocol.BlobChunkInfo,
+	chunks []protocol.BlobChunkInfo,
 	token string,
 	chunkSize int64,
 	opts ExecOptions,
@@ -1493,22 +1492,10 @@ func downloadBlobWorker(
 	var conn *blobTransferConn
 	defer closeBlobTransferConn(conn)
 
-	for chunk := range jobs {
-		var err error
-		conn, err = retryBlobTransferChunk(
-			ctx,
-			conn,
-			"download",
-			chunk.Hash,
-			chunk.Offset,
-			blobProgressLogger(progress),
-			func(conn *blobTransferConn) (*blobTransferConn, error) {
-				return downloadBlobChunk(ctx, conn, token, chunkSize, opts, receiver, progress, chunk)
-			},
-		)
-		if err != nil {
-			return err
-		}
+	var err error
+	conn, err = downloadBlobChunksPipelined(ctx, conn, token, chunkSize, opts, receiver, progress, chunks)
+	if err != nil {
+		return err
 	}
 
 	if conn != nil {
@@ -1518,7 +1505,7 @@ func downloadBlobWorker(
 	return nil
 }
 
-func downloadBlobChunk(
+func downloadBlobChunksPipelined(
 	ctx context.Context,
 	conn *blobTransferConn,
 	token string,
@@ -1526,7 +1513,73 @@ func downloadBlobChunk(
 	opts ExecOptions,
 	receiver *syncfs.ChunkedBlobReceiver,
 	progress *blobChunkProgress,
-	chunk protocol.BlobChunkInfo,
+	chunks []protocol.BlobChunkInfo,
+) (*blobTransferConn, error) {
+	pending := append([]protocol.BlobChunkInfo(nil), chunks...)
+	inFlight := map[blobChunkKey]protocol.BlobChunkInfo{}
+	inFlightOrder := make([]protocol.BlobChunkInfo, 0, downloadPipelineWindow)
+	attempts := map[blobChunkKey]int{}
+
+	for len(pending) > 0 || len(inFlight) > 0 {
+		nextConn, err := fillDownloadPipeline(ctx, conn, token, opts, &pending, inFlight, &inFlightOrder)
+		conn = nextConn
+		if err != nil {
+			failed := downloadInflight(inFlight, inFlightOrder)
+			pending = append(failed, pending...)
+			inFlight = map[blobChunkKey]protocol.BlobChunkInfo{}
+			inFlightOrder = inFlightOrder[:0]
+			if err := retryDownloadPipeline(ctx, conn, attempts, failed, blobProgressLogger(progress), err); err != nil {
+				return nil, err
+			}
+			conn = nil
+			continue
+		}
+		if len(inFlight) == 0 {
+			continue
+		}
+
+		head, err := conn.conn.ReadHeader()
+		if err != nil {
+			failed := downloadInflight(inFlight, inFlightOrder)
+			pending = append(failed, pending...)
+			inFlight = map[blobChunkKey]protocol.BlobChunkInfo{}
+			inFlightOrder = inFlightOrder[:0]
+			if err := retryDownloadPipeline(ctx, conn, attempts, failed, blobProgressLogger(progress), err); err != nil {
+				return nil, err
+			}
+			conn = nil
+			continue
+		}
+
+		done, err := handleDownloadBlobTransferFrame(conn.conn, receiver, progress, inFlight, head)
+		if err != nil {
+			failed := downloadInflight(inFlight, inFlightOrder)
+			pending = append(failed, pending...)
+			inFlight = map[blobChunkKey]protocol.BlobChunkInfo{}
+			inFlightOrder = inFlightOrder[:0]
+			if err := retryDownloadPipeline(ctx, conn, attempts, failed, blobProgressLogger(progress), err); err != nil {
+				return nil, err
+			}
+			conn = nil
+			continue
+		}
+		if done {
+			inFlight = map[blobChunkKey]protocol.BlobChunkInfo{}
+			inFlightOrder = inFlightOrder[:0]
+		}
+	}
+
+	return conn, nil
+}
+
+func fillDownloadPipeline(
+	ctx context.Context,
+	conn *blobTransferConn,
+	token string,
+	opts ExecOptions,
+	pending *[]protocol.BlobChunkInfo,
+	inFlight map[blobChunkKey]protocol.BlobChunkInfo,
+	inFlightOrder *[]protocol.BlobChunkInfo,
 ) (*blobTransferConn, error) {
 	if conn == nil {
 		var err error
@@ -1536,6 +1589,26 @@ func downloadBlobChunk(
 		}
 	}
 
+	for len(*pending) > 0 && len(inFlight) < downloadPipelineWindow {
+		chunk := (*pending)[0]
+		*pending = (*pending)[1:]
+		key := keyBlobChunk(chunk)
+		inFlight[key] = chunk
+		*inFlightOrder = append(*inFlightOrder, chunk)
+		if err := writeDownloadBlobRequest(conn.conn, token, opts, chunk); err != nil {
+			return conn, err
+		}
+	}
+
+	return conn, nil
+}
+
+func writeDownloadBlobRequest(
+	conn *protocol.Conn,
+	token string,
+	opts ExecOptions,
+	chunk protocol.BlobChunkInfo,
+) error {
 	req := protocol.BlobTransferRequest{
 		ContextID: opts.ContextID,
 		Session:   opts.Session,
@@ -1543,31 +1616,82 @@ func downloadBlobChunk(
 		Direction: protocol.BlobTransferDownload,
 		Chunk:     &chunk,
 	}
-	if err := conn.conn.WriteJSON(protocol.MsgBlobTransferRequest, req); err != nil {
-		return conn, err
+
+	return conn.WriteJSON(protocol.MsgBlobTransferRequest, req)
+}
+
+func retryDownloadPipeline(
+	ctx context.Context,
+	conn *blobTransferConn,
+	attempts map[blobChunkKey]int,
+	failed []protocol.BlobChunkInfo,
+	logger *runLogger,
+	err error,
+) error {
+	closeBlobTransferConn(conn)
+	if !isRetryableBlobTransferError(ctx, err) {
+		return err
+	}
+	if len(failed) == 0 {
+		return err
 	}
 
-	for {
-		head, err := conn.conn.ReadHeader()
-		if err != nil {
-			return conn, err
-		}
-
-		done, err := handleDownloadBlobTransferFrame(conn.conn, receiver, progress, chunk, head)
-		if err != nil {
-			return conn, err
-		}
-		if done {
-			return conn, nil
+	maxAttempt := 0
+	for _, chunk := range failed {
+		key := keyBlobChunk(chunk)
+		attempts[key]++
+		if attempts[key] > maxAttempt {
+			maxAttempt = attempts[key]
 		}
 	}
+	if maxAttempt >= blobTransferMaxAttempts {
+		first := failed[0]
+		return fmt.Errorf(
+			"download blob chunk %s offset %d failed after %d attempts: %w",
+			first.Hash,
+			first.Offset,
+			blobTransferMaxAttempts,
+			err,
+		)
+	}
+	if logger != nil {
+		first := failed[0]
+		logger.Printf(
+			"retrying blob download pipeline: chunks=%d first_hash=%s first_offset=%d attempt=%d/%d error=%v",
+			len(failed),
+			first.Hash,
+			first.Offset,
+			maxAttempt+1,
+			blobTransferMaxAttempts,
+			err,
+		)
+	}
+	if waitErr := waitBlobTransferRetry(ctx, maxAttempt); waitErr != nil {
+		return waitErr
+	}
+
+	return nil
+}
+
+func downloadInflight(
+	inFlight map[blobChunkKey]protocol.BlobChunkInfo,
+	order []protocol.BlobChunkInfo,
+) []protocol.BlobChunkInfo {
+	chunks := make([]protocol.BlobChunkInfo, 0, len(inFlight))
+	for _, chunk := range order {
+		if _, ok := inFlight[keyBlobChunk(chunk)]; ok {
+			chunks = append(chunks, chunk)
+		}
+	}
+
+	return chunks
 }
 
 func handleDownloadBlobTransferFrame(
 	conn *protocol.Conn,
 	receiver *syncfs.ChunkedBlobReceiver,
 	progress *blobChunkProgress,
-	chunk protocol.BlobChunkInfo,
+	inFlight map[blobChunkKey]protocol.BlobChunkInfo,
 	head protocol.Header,
 ) (bool, error) {
 	switch head.Type {
@@ -1576,7 +1700,9 @@ func handleDownloadBlobTransferFrame(
 	case protocol.MsgError:
 		return false, decodeServerError(head)
 	case protocol.MsgBlobChunk:
-		return receiveDownloadBlobChunk(conn, receiver, progress, chunk, head)
+		return receiveDownloadBlobChunk(conn, receiver, progress, inFlight, head)
+	case protocol.MsgSyncComplete:
+		return true, nil
 	default:
 		if err := conn.DiscardPayload(head); err != nil {
 			return false, err
@@ -1590,33 +1716,29 @@ func receiveDownloadBlobChunk(
 	conn *protocol.Conn,
 	receiver *syncfs.ChunkedBlobReceiver,
 	progress *blobChunkProgress,
-	chunk protocol.BlobChunkInfo,
+	inFlight map[blobChunkKey]protocol.BlobChunkInfo,
 	head protocol.Header,
 ) (bool, error) {
 	info, err := protocol.DecodeData[protocol.BlobChunkInfo](head)
 	if err != nil {
 		return false, err
 	}
-	if info.Hash != chunk.Hash || info.Offset != chunk.Offset {
+	key := keyBlobChunk(info)
+	if _, ok := inFlight[key]; !ok {
 		if err := conn.DiscardPayload(head); err != nil {
 			return false, err
 		}
 
-		return false, fmt.Errorf(
-			"unexpected blob chunk %s offset %d; want %s offset %d",
-			info.Hash,
-			info.Offset,
-			chunk.Hash,
-			chunk.Offset,
-		)
+		return false, fmt.Errorf("unexpected blob chunk %s offset %d", info.Hash, info.Offset)
 	}
 	if err := receiver.ReceiveChunk(info, conn.PayloadReader(head), head.PayloadLen); err != nil {
 		return false, err
 	}
+	delete(inFlight, key)
 	progress.AddBytes(int(head.PayloadLen))
 	progress.CompleteChunk(info.Hash)
 
-	return true, nil
+	return false, nil
 }
 
 func materializeDownloadedChanges(

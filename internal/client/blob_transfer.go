@@ -13,6 +13,7 @@ const (
 	blobTransferMaxAttempts = 5
 	blobTransferRetryBase   = 200 * time.Millisecond
 	blobTransferRetryMax    = 2 * time.Second
+	downloadPipelineWindow  = 8
 )
 
 type blobTransferConn struct {
@@ -127,4 +128,13 @@ func waitBlobTransferRetry(ctx context.Context, attempt int) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+type blobChunkKey struct {
+	hash   string
+	offset int64
+}
+
+func keyBlobChunk(chunk protocol.BlobChunkInfo) blobChunkKey {
+	return blobChunkKey{hash: chunk.Hash, offset: chunk.Offset}
 }

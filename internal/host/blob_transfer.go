@@ -368,7 +368,11 @@ func (s *Server) sendRequestedBlobChunk(
 	return nil
 }
 
-func validateSendBlobChunk(info protocol.BlobChunkInfo, item downloadBlobItem, chunkSize int64) error {
+func validateSendBlobChunk(
+	info protocol.BlobChunkInfo,
+	item downloadBlobItem,
+	chunkSize int64,
+) error {
 	if info.Size != item.size {
 		return fmt.Errorf("blob %s size mismatch: %d != %d", info.Hash, info.Size, item.size)
 	}
