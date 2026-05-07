@@ -1059,9 +1059,12 @@ func runHelp(args []string) int {
 	case "commands", "command", "cli":
 		printUsage(os.Stdout)
 		return 0
+	case "env", "environment":
+		printEnvHelp(os.Stdout)
+		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown help topic %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "topics: commands, config")
+		fmt.Fprintln(os.Stderr, "topics: commands, config, env")
 		return exitUsage
 	}
 }
@@ -1104,6 +1107,7 @@ Examples:
 Help topics:
   rmtx help commands       full command reference
   rmtx help config         full .rmtx.json schema and defaults
+  rmtx help env            env vars available to remote commands
 
 How rmtx works:
   1. Run "rmtx host" on a host machine. It listens on TCP 33221 by default and
@@ -1120,6 +1124,21 @@ Config lookup:
   Remote commands search upward from the current directory for .rmtx.json, then
   rmtx.json. Use --config PATH to override. "rmtx init --config PATH" creates a
   config at PATH. "rmtx help config" documents every supported field.
+
+Remote command environment:
+  rmtx sets these env vars for every remote command, including OCI runtime runs:
+  RMTX=1
+      Command is running under rmtx.
+  RMTX_RUNNER=host
+      Command is running on the rmtx host.
+  RMTX_WORKSPACE
+      Host workspace path visible to the command.
+  RMTX_CONTEXT_ID
+      rmtx context id.
+  RMTX_CPU_COUNT
+      Host logical CPU count.
+  RMTX_MEMORY_AVAILABLE_BYTES
+      Host available memory in bytes when command starts.
 
 Command reference:
   rmtx host [--listen ADDR] [--state-dir DIR] [--name NAME]
@@ -1198,6 +1217,31 @@ Exit codes:
   0 success. 1 runtime/error. 2 usage/invalid flags.
 `); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "failed to print usage:", err)
+	}
+}
+
+func printEnvHelp(f *os.File) {
+	if _, err := fmt.Fprint(f, `rmtx remote command environment
+
+rmtx sets these env vars for every remote command, including OCI runtime runs:
+
+  RMTX=1
+      Command is running under rmtx.
+  RMTX_RUNNER=host
+      Command is running on the rmtx host.
+  RMTX_WORKSPACE
+      Host workspace path visible to the command.
+  RMTX_CONTEXT_ID
+      rmtx context id.
+  RMTX_CPU_COUNT
+      Host logical CPU count.
+  RMTX_MEMORY_AVAILABLE_BYTES
+      Host available memory in bytes when command starts.
+
+Client-side host resolution still uses RMTX_HOST as host address input:
+  --host ADDR, RMTX_HOST env var, config host, LAN discovery.
+`); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "failed to print env help:", err)
 	}
 }
 

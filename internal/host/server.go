@@ -1879,12 +1879,7 @@ func (s *Server) newSessionCommand(
 	configureCommandProcessGroup(cmd)
 	cmd.Dir = workdir
 	cmd.Env = mergeEnv(os.Environ(), request.Env)
-	cmd.Env = append(
-		cmd.Env,
-		"RMTX=1",
-		"RMTX_WORKSPACE="+workspace,
-		"RMTX_CONTEXT_ID="+request.ContextID,
-	)
+	cmd.Env = mergeEnvEntries(cmd.Env, rmtxRunEnv(ctx, workspace, request.ContextID))
 
 	return cmd
 }

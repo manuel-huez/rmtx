@@ -121,6 +121,16 @@ metadata or content changed are sent back to the client. After each run, the
 host workspace is cleaned and rehydrated from synced blobs on the next run;
 use runtime volumes for state that should persist only on the host.
 
+Remote commands receive these rmtx environment variables:
+
+- `RMTX=1`: command is running under rmtx.
+- `RMTX_RUNNER=host`: command is running on the rmtx host.
+- `RMTX_WORKSPACE`: host workspace path visible to the command.
+- `RMTX_CONTEXT_ID`: rmtx context id.
+- `RMTX_CPU_COUNT`: host logical CPU count.
+- `RMTX_MEMORY_AVAILABLE_BYTES`: host available memory in bytes when the
+  command starts.
+
 ## Isolated runtimes
 
 By default, `rmtx` still runs commands directly on the host context workspace.

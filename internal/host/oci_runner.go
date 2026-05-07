@@ -568,11 +568,7 @@ func (s *Server) newOCICommand(
 	)
 
 	env := mergeEnv(ociBaseEnv(prepared.Image.Env), request.Env)
-	env = append(env,
-		"RMTX=1",
-		"RMTX_WORKSPACE="+runtimeWorkspace,
-		"RMTX_CONTEXT_ID="+request.ContextID,
-	)
+	env = mergeEnvEntries(env, rmtxRunEnv(ctx, runtimeWorkspace, request.ContextID))
 
 	binds := []ociBind{
 		{Source: workspace, Target: runtimeWorkspace},

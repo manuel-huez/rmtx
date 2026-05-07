@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -69,6 +71,96 @@ func TestSummarizeCPUUsageDerivesAggregateFromPerCore(t *testing.T) {
 	if usedCores != 1.75 {
 		t.Fatalf("used cores=%f want 1.75", usedCores)
 	}
+}
+
+func TestRMTXRunEnvIdentifiesHostResources(t *testing.T) {
+	env := envMap(rmtxRunEnv(context.Background(), "/workspace", "ctx-1"))
+
+	if env["RMTX"] != "1" {
+		t.Fatalf("RMTX=%q want 1", env["RMTX"])
+	}
+	if env["RMTX_RUNNER"] != "host" {
+		t.Fatalf("RMTX_RUNNER=%q want host", env["RMTX_RUNNER"])
+	}
+	if env["RMTX_WORKSPACE"] != "/workspace" {
+		t.Fatalf("RMTX_WORKSPACE=%q want /workspace", env["RMTX_WORKSPACE"])
+	}
+	if env["RMTX_CONTEXT_ID"] != "ctx-1" {
+		t.Fatalf("RMTX_CONTEXT_ID=%q want ctx-1", env["RMTX_CONTEXT_ID"])
+	}
+	cpuCount, err := strconv.Atoi(env["RMTX_CPU_COUNT"])
+	if err != nil {
+		t.Fatalf("RMTX_CPU_COUNT should be numeric: %v", err)
+	}
+	if cpuCount < 1 {
+		t.Fatalf("RMTX_CPU_COUNT=%d want >= 1", cpuCount)
+	}
+	if _, err := strconv.ParseUint(env["RMTX_MEMORY_AVAILABLE_BYTES"], 10, 64); err != nil {
+		t.Fatalf("RMTX_MEMORY_AVAILABLE_BYTES should be numeric: %v", err)
+	}
+}
+
+func TestRMTXRunEnvOverridesExistingEntries(t *testing.T) {
+	env := mergeEnvEntries(
+		[]string{
+			"RMTX=old",
+			"RMTX_RUNNER=old",
+			"RMTX_WORKSPACE=/old",
+			"RMTX_CONTEXT_ID=old",
+			"RMTX_CPU_COUNT=old",
+			"RMTX_MEMORY_AVAILABLE_BYTES=old",
+			"OTHER=value",
+		},
+		rmtxRunEnv(context.Background(), "/workspace", "ctx-1"),
+	)
+
+	seen := map[string]int{}
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		seen[key]++
+	}
+	for _, key := range []string{
+		"RMTX",
+		"RMTX_RUNNER",
+		"RMTX_WORKSPACE",
+		"RMTX_CONTEXT_ID",
+		"RMTX_CPU_COUNT",
+		"RMTX_MEMORY_AVAILABLE_BYTES",
+	} {
+		if seen[key] != 1 {
+			t.Fatalf("%s count=%d want 1 in %#v", key, seen[key], env)
+		}
+	}
+
+	values := envMap(env)
+	if values["RMTX"] != "1" {
+		t.Fatalf("RMTX=%q want 1", values["RMTX"])
+	}
+	if values["RMTX_RUNNER"] != "host" {
+		t.Fatalf("RMTX_RUNNER=%q want host", values["RMTX_RUNNER"])
+	}
+	if values["RMTX_WORKSPACE"] != "/workspace" {
+		t.Fatalf("RMTX_WORKSPACE=%q want /workspace", values["RMTX_WORKSPACE"])
+	}
+	if values["RMTX_CONTEXT_ID"] != "ctx-1" {
+		t.Fatalf("RMTX_CONTEXT_ID=%q want ctx-1", values["RMTX_CONTEXT_ID"])
+	}
+	if values["RMTX_CPU_COUNT"] == "old" {
+		t.Fatalf("RMTX_CPU_COUNT was not overridden: %#v", env)
+	}
+	if values["RMTX_MEMORY_AVAILABLE_BYTES"] == "old" {
+		t.Fatalf("RMTX_MEMORY_AVAILABLE_BYTES was not overridden: %#v", env)
+	}
+}
+
+func envMap(entries []string) map[string]string {
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		key, value, _ := strings.Cut(entry, "=")
+		out[key] = value
+	}
+
+	return out
 }
 
 func TestWaitForClientSyncCompleteKeepsFinishedTransferOpen(t *testing.T) {
