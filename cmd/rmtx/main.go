@@ -81,6 +81,8 @@ func run(ctx context.Context, args []string) int {
 		return runInit(ctx, args[1:])
 	case "ping":
 		return runPing(ctx, args[1:])
+	case "stats":
+		return runStats(ctx, args[1:])
 	case "pair":
 		return runPair(ctx, args[1:])
 	case "context", "contexts":
@@ -267,6 +269,32 @@ func runPing(ctx context.Context, args []string) int {
 		info.Fingerprint,
 		info.Now.Format(time.RFC3339),
 	)
+
+	return 0
+}
+
+func runStats(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("rmtx stats", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	remote := bindRemoteFlags(fs)
+
+	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
+	if code != 0 {
+		return code
+	}
+
+	stats, err := app.RunHostStats(ctx, cwd, params)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintln(os.Stdout, formatStatsLine(stats))
+
+	for _, warning := range stats.Warnings {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+	}
 
 	return 0
 }
@@ -980,6 +1008,44 @@ func emptyFallback(value, fallback string) string {
 	return value
 }
 
+func formatStatsLine(stats client.HostStatsInfo) string {
+	return fmt.Sprintf(
+		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tversion=%s\tfingerprint=%s\tat=%s",
+		emptyFallback(stats.Name, "rmtx-host"),
+		stats.Address,
+		stats.OS,
+		stats.Arch,
+		stats.CPU.LogicalCores,
+		stats.CPU.PhysicalCores,
+		stats.CPU.UsedPercent,
+		stats.CPU.UsedCores,
+		formatPercentList(stats.CPU.PerCoreUsedPercent),
+		stats.Memory.TotalBytes,
+		stats.Memory.UsedBytes,
+		stats.Memory.AvailableBytes,
+		stats.Memory.UsedPercent,
+		stats.ActiveRuns,
+		stats.ActiveContextCount,
+		stats.ContextCount,
+		stats.Version,
+		stats.Fingerprint,
+		stats.Now.Format(time.RFC3339),
+	)
+}
+
+func formatPercentList(values []float64) string {
+	if len(values) == 0 {
+		return "-"
+	}
+
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, fmt.Sprintf("%.1f", value))
+	}
+
+	return strings.Join(parts, ",")
+}
+
 func runHelp(args []string) int {
 	if len(args) == 0 {
 		printUsage(os.Stdout)
@@ -1010,6 +1076,7 @@ Usage:
   rmtx init [flags]
   rmtx pair [flags]
   rmtx ping [flags]
+  rmtx stats [flags]
   rmtx context [list|delete|prune|artifacts] [flags]
   rmtx cache prune [flags]
   rmtx wsl config [flags]
@@ -1026,6 +1093,7 @@ Examples:
   rmtx pair --code 123456
   rmtx exec --tty -- bash
   rmtx ping
+  rmtx stats
   rmtx version
   rmtx context list
   rmtx context delete --current
@@ -1084,6 +1152,11 @@ Command reference:
   rmtx ping [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Verify host reachability, TLS fingerprint, and pairing.
       Output: online<TAB><name><TAB><addr><TAB>version=... contexts=...
+
+  rmtx stats [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
+      Report host OS/arch, aggregate/per-core CPU usage, logical/physical
+      cores, memory usage, active runs, and context counts.
+      Output: stats<TAB><name><TAB><addr><TAB>os=... cpu_used_percent=...
 
   rmtx context list [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       List contexts on host. Columns: ID, NAME, UPDATED, ACTIVE, WORKSPACE.

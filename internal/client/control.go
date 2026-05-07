@@ -32,6 +32,24 @@ func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	)
 }
 
+func HostStats(ctx context.Context, opts RemoteOptions) (HostStatsInfo, error) {
+	conn, err := updatedRemoteConn(ctx, opts)
+	if err != nil {
+		return HostStatsInfo{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	if err := conn.WriteJSON(protocol.MsgHostStatsRequest, protocol.HostStatsRequest{}); err != nil {
+		return HostStatsInfo{}, err
+	}
+
+	return expectDataFrameWithOutput[protocol.HostStatsResponse](
+		conn,
+		protocol.MsgHostStatsResponse,
+		opts.Stderr,
+	)
+}
+
 func UpdateHost(
 	ctx context.Context,
 	opts RemoteOptions,

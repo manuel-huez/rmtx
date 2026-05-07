@@ -732,6 +732,10 @@ func (s *Server) dispatchSessionRequest(
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
 			return s.handlePing(conn, requestLogs)
 		})
+	case protocol.MsgHostStatsRequest:
+		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
+			return s.handleHostStats(parent, conn, requestLogs)
+		})
 	case protocol.MsgHostUpdateRequest:
 		return s.dispatchHostUpdateRequest(parent, conn, head, requestLogs)
 	case protocol.MsgListContextsRequest:

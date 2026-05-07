@@ -296,6 +296,29 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 		t.Fatalf("expected ping context count 1, got %d", ping.ContextCount)
 	}
 
+	stats, err := RunHostStats(ctx, project, RemoteParams{
+		AddressOverride: addr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if stats.CPU.LogicalCores < 1 {
+		t.Fatalf("expected logical cores, got %#v", stats.CPU)
+	}
+
+	if len(stats.CPU.PerCoreUsedPercent) != stats.CPU.LogicalCores {
+		t.Fatalf("expected per-core stats for each logical core, got %#v", stats.CPU)
+	}
+
+	if stats.Memory.TotalBytes == 0 || stats.Memory.AvailableBytes == 0 {
+		t.Fatalf("expected memory stats, got %#v", stats.Memory)
+	}
+
+	if stats.ContextCount != 1 {
+		t.Fatalf("expected stats context count 1, got %d", stats.ContextCount)
+	}
+
 	deleteResult, err := RunDeleteContexts(ctx, project, ContextDeleteParams{
 		AddressOverride: addr,
 		Current:         true,

@@ -12,6 +12,7 @@
 - `rmtx <command> ...` or `rmtx exec -- <command> ...`: run a command remotely in the current context.
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
+- `rmtx stats`: report host CPU/RAM/core/per-core usage.
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
 - `rmtx cache prune`: delete unreferenced host cache data.
@@ -28,6 +29,31 @@ rmtx version
 ```bash
 go build ./cmd/rmtx
 ```
+
+## Supported platforms
+
+Core client and host commands build on these platforms:
+
+- Linux: `386`, `amd64`, `arm`, `arm64`, `loong64`, `mips`, `mips64`,
+  `mips64le`, `mipsle`, `ppc64`, `ppc64le`, `riscv64`, `s390x`
+- macOS: `amd64`, `arm64`
+- Windows: `386`, `amd64`, `arm64`
+- FreeBSD: `386`, `amd64`, `arm`, `arm64`
+- OpenBSD: `386`, `amd64`, `arm`, `arm64`, `riscv64`
+- NetBSD: `amd64`, `arm`, `arm64`
+- DragonFly BSD: `amd64`
+
+Support means `rmtx host`, non-TTY remote exec, sync, pairing, ping, stats,
+context, and cache commands compile for that OS/architecture. Feature-specific
+support is narrower:
+
+- Interactive `--tty`: Linux and Windows.
+- OCI runtime: Linux hosts natively, Windows hosts through WSL2.
+- NVIDIA GPU runtime support: Linux hosts and Windows hosts through WSL2.
+- `rmtx wsl config`: Windows only.
+
+Unsupported Go targets include Android, iOS, JS/WASM, wasip1/WASM, Plan 9,
+Solaris, illumos, AIX, NetBSD/386, and OpenBSD/ppc64.
 
 ## Minimal setup
 
@@ -211,6 +237,7 @@ because `rmtx` ignore rules only exclude files.
 rmtx exec --host 192.168.1.42:33221 -- go run ./cmd/api
 rmtx exec --tty -- bash
 rmtx ping
+rmtx stats
 rmtx context list
 rmtx context delete --current
 rmtx context prune --older-than 168h

@@ -30,6 +30,8 @@ const (
 	MsgHeartbeat                = "heartbeat"
 	MsgPingRequest              = "ping_request"
 	MsgPingResponse             = "ping_response"
+	MsgHostStatsRequest         = "host_stats_request"
+	MsgHostStatsResponse        = "host_stats_response"
 	MsgHostUpdateRequest        = "host_update_request"
 	MsgHostUpdateResponse       = "host_update_response"
 	MsgListContextsRequest      = "list_contexts_request"
@@ -154,6 +156,39 @@ type PingResponse struct {
 	Fingerprint  string    `json:"fingerprint,omitempty"`
 	Now          time.Time `json:"now"`
 	ContextCount int       `json:"context_count,omitempty"`
+}
+
+type HostStatsRequest struct{}
+
+type HostStatsResponse struct {
+	Version            string          `json:"version"`
+	Name               string          `json:"name,omitempty"`
+	Address            string          `json:"address,omitempty"`
+	Fingerprint        string          `json:"fingerprint,omitempty"`
+	Now                time.Time       `json:"now"`
+	OS                 string          `json:"os"`
+	Arch               string          `json:"arch"`
+	CPU                HostCPUStats    `json:"cpu"`
+	Memory             HostMemoryStats `json:"memory"`
+	ContextCount       int             `json:"context_count,omitempty"`
+	ActiveRuns         int             `json:"active_runs,omitempty"`
+	ActiveContextCount int             `json:"active_context_count,omitempty"`
+	Warnings           []string        `json:"warnings,omitempty"`
+}
+
+type HostCPUStats struct {
+	LogicalCores       int       `json:"logical_cores"`
+	PhysicalCores      int       `json:"physical_cores,omitempty"`
+	UsedPercent        float64   `json:"used_percent"`
+	UsedCores          float64   `json:"used_cores"`
+	PerCoreUsedPercent []float64 `json:"per_core_used_percent,omitempty"`
+}
+
+type HostMemoryStats struct {
+	TotalBytes     uint64  `json:"total_bytes"`
+	AvailableBytes uint64  `json:"available_bytes"`
+	UsedBytes      uint64  `json:"used_bytes"`
+	UsedPercent    float64 `json:"used_percent"`
 }
 
 type HostUpdateRequest struct {

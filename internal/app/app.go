@@ -344,26 +344,25 @@ func gitignoreLineToExclude(line string) (string, bool) {
 }
 
 func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingInfo, error) {
-	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
 		return client.PingInfo{}, err
 	}
 
-	state, err := clientstate.Load()
+	return client.Ping(ctx, remote)
+}
+
+func RunHostStats(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+) (client.HostStatsInfo, error) {
+	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
-		return client.PingInfo{}, err
+		return client.HostStatsInfo{}, err
 	}
 
-	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
-
-	return client.Ping(ctx, client.RemoteOptions{
-		Address:          address,
-		DiscoveryService: service,
-		Host:             *hostRecord,
-		ClientCertPEM:    []byte(clientCertPEM),
-		ClientKeyPEM:     []byte(clientKeyPEM),
-		Stderr:           params.Stderr,
-	})
+	return client.HostStats(ctx, remote)
 }
 
 func RunListContexts(
@@ -371,26 +370,12 @@ func RunListContexts(
 	cwd string,
 	params RemoteParams,
 ) ([]client.ContextInfo, error) {
-	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
 		return nil, err
 	}
 
-	state, err := clientstate.Load()
-	if err != nil {
-		return nil, err
-	}
-
-	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
-
-	return client.ListContexts(ctx, client.RemoteOptions{
-		Address:          address,
-		DiscoveryService: service,
-		Host:             *hostRecord,
-		ClientCertPEM:    []byte(clientCertPEM),
-		ClientKeyPEM:     []byte(clientKeyPEM),
-		Stderr:           params.Stderr,
-	})
+	return client.ListContexts(ctx, remote)
 }
 
 func RunDeleteContexts(
@@ -398,7 +383,7 @@ func RunDeleteContexts(
 	cwd string,
 	params ContextDeleteParams,
 ) (client.DeleteContextsResult, error) {
-	address, service, hostRecord, loaded, err := resolveRemoteTarget(
+	remote, loaded, err := resolveClientRemoteOptions(
 		ctx,
 		cwd,
 		RemoteParams{
@@ -425,24 +410,10 @@ func RunDeleteContexts(
 	}
 
 	req := client.DeleteContextsOptions{
-		Remote: client.RemoteOptions{
-			Address:          address,
-			DiscoveryService: service,
-			Host:             *hostRecord,
-			Stderr:           params.Stderr,
-		},
-		IDs: ids,
-		All: params.All,
+		Remote: remote,
+		IDs:    ids,
+		All:    params.All,
 	}
-
-	state, err := clientstate.Load()
-	if err != nil {
-		return client.DeleteContextsResult{}, err
-	}
-
-	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
-	req.Remote.ClientCertPEM = []byte(clientCertPEM)
-	req.Remote.ClientKeyPEM = []byte(clientKeyPEM)
 
 	if params.OlderThan > 0 {
 		req.OlderThan = params.OlderThan.String()
@@ -456,7 +427,7 @@ func RunContextArtifacts(
 	cwd string,
 	params ContextArtifactsParams,
 ) (client.ContextArtifactsResult, error) {
-	address, service, hostRecord, loaded, err := resolveRemoteTarget(
+	remote, loaded, err := resolveClientRemoteOptions(
 		ctx,
 		cwd,
 		RemoteParams{
@@ -482,22 +453,8 @@ func RunContextArtifacts(
 		contextID = loaded.ContextID()
 	}
 
-	state, err := clientstate.Load()
-	if err != nil {
-		return client.ContextArtifactsResult{}, err
-	}
-
-	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
-
 	return client.ContextArtifacts(ctx, client.ContextArtifactsOptions{
-		Remote: client.RemoteOptions{
-			Address:          address,
-			DiscoveryService: service,
-			Host:             *hostRecord,
-			ClientCertPEM:    []byte(clientCertPEM),
-			ClientKeyPEM:     []byte(clientKeyPEM),
-			Stderr:           params.Stderr,
-		},
+		Remote:    remote,
 		ContextID: contextID,
 		Prune:     params.Prune,
 		Delete:    params.Delete,
@@ -510,26 +467,39 @@ func RunCachePrune(
 	cwd string,
 	params RemoteParams,
 ) (client.CachePruneResult, error) {
-	address, service, hostRecord, _, err := resolveRemoteTarget(ctx, cwd, params)
+	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
 		return client.CachePruneResult{}, err
+	}
+
+	return client.CachePrune(ctx, remote)
+}
+
+func resolveClientRemoteOptions(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+) (client.RemoteOptions, *config.Loaded, error) {
+	address, service, hostRecord, loaded, err := resolveRemoteTarget(ctx, cwd, params)
+	if err != nil {
+		return client.RemoteOptions{}, nil, err
 	}
 
 	state, err := clientstate.Load()
 	if err != nil {
-		return client.CachePruneResult{}, err
+		return client.RemoteOptions{}, nil, err
 	}
 
 	clientCertPEM, clientKeyPEM := state.HostCredentials(address, hostRecord.Fingerprint)
 
-	return client.CachePrune(ctx, client.RemoteOptions{
+	return client.RemoteOptions{
 		Address:          address,
 		DiscoveryService: service,
 		Host:             *hostRecord,
 		ClientCertPEM:    []byte(clientCertPEM),
 		ClientKeyPEM:     []byte(clientKeyPEM),
 		Stderr:           params.Stderr,
-	})
+	}, loaded, nil
 }
 
 func RunHost(ctx context.Context, params HostParams) error {

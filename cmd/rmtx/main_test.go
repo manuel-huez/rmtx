@@ -6,8 +6,11 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/app"
+	"github.com/manuel-huez/rmtx/internal/client"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/wslconfig"
 )
 
@@ -48,6 +51,61 @@ func TestCRLFLineFeedWriterConvertsLoneLineFeeds(t *testing.T) {
 func TestRunCacheRequiresPruneSubcommand(t *testing.T) {
 	if code := runCache(context.Background(), nil); code != exitUsage {
 		t.Fatalf("exit code=%d want %d", code, exitUsage)
+	}
+}
+
+func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+
+	got := formatStatsLine(client.HostStatsInfo{
+		Version:     "v1.2.3",
+		Name:        "build-host",
+		Address:     "127.0.0.1:33221",
+		Fingerprint: "sha256:abc",
+		Now:         now,
+		OS:          "linux",
+		Arch:        "amd64",
+		CPU: protocol.HostCPUStats{
+			LogicalCores:       8,
+			PhysicalCores:      4,
+			UsedPercent:        25,
+			UsedCores:          2,
+			PerCoreUsedPercent: []float64{10, 25.5, 0, 100},
+		},
+		Memory: protocol.HostMemoryStats{
+			TotalBytes:     16,
+			UsedBytes:      8,
+			AvailableBytes: 8,
+			UsedPercent:    50,
+		},
+		ActiveRuns:         1,
+		ActiveContextCount: 1,
+		ContextCount:       3,
+	})
+
+	for _, want := range []string{
+		"stats\tbuild-host\t127.0.0.1:33221",
+		"os=linux",
+		"logical_cpus=8",
+		"physical_cores=4",
+		"cpu_used_percent=25.0",
+		"cpu_used_cores=2.00",
+		"cpu_per_core_used_percent=10.0,25.5,0.0,100.0",
+		"memory_available_bytes=8",
+		"contexts=3",
+		"at=2026-05-07T12:00:00Z",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stats line missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestFormatStatsLineUsesPlaceholderForMissingPerCoreUsage(t *testing.T) {
+	got := formatStatsLine(client.HostStatsInfo{})
+
+	if !strings.Contains(got, "cpu_per_core_used_percent=-") {
+		t.Fatalf("stats line missing per-core placeholder: %s", got)
 	}
 }
 

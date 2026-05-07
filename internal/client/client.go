@@ -65,6 +65,7 @@ type RemoteOptions struct {
 }
 
 type PingInfo = protocol.PingResponse
+type HostStatsInfo = protocol.HostStatsResponse
 type HostUpdateResult = protocol.HostUpdateResponse
 type ContextInfo = protocol.ContextSummary
 type DeleteContextsResult = protocol.DeleteContextsResponse
