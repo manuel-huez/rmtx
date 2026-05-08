@@ -9,7 +9,7 @@
 
 - `rmtx host`: run the host service.
 - `rmtx init`: discover host, create local config, pair client.
-- `rmtx <command> ...` or `rmtx exec -- <command> ...`: run a command remotely in the current context.
+- `rmtx exec -- <command> ...`: run a command remotely in the current context.
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
 - `rmtx stats`: report host CPU/RAM/core/per-core usage.
@@ -67,7 +67,7 @@ In your project on the client, initialize once:
 
 ```bash
 ./rmtx init
-./rmtx go test ./...
+./rmtx exec -- go test ./...
 ```
 
 `rmtx init` discovers available hosts, asks you to trust selected host fingerprint, writes `.rmtx.json`, then requests a one-time pairing code from that host and prompts you to enter it. After init, `rmtx pair` re-pairs an existing config. If LAN discovery is blocked, run `rmtx host pair-code` on host to get fingerprint, then use `rmtx init --host 192.168.1.42:33221 --fingerprint sha256:...`. For non-interactive/manual pairing, `rmtx host pair-code` and `rmtx pair --code ...` still work.

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +54,53 @@ func TestRunCacheRequiresPruneSubcommand(t *testing.T) {
 	if code := runCache(context.Background(), nil); code != exitUsage {
 		t.Fatalf("exit code=%d want %d", code, exitUsage)
 	}
+}
+
+func TestRunRejectsUnknownCommandInsteadOfExec(t *testing.T) {
+	for _, args := range [][]string{
+		{"echo", "test"},
+		{"status"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			code, stderr := captureRunStderr(t, func() int {
+				return run(context.Background(), args)
+			})
+
+			if code != exitUsage {
+				t.Fatalf("exit code=%d want %d", code, exitUsage)
+			}
+			if !strings.Contains(stderr, `error: unknown command "`+args[0]+`"`) {
+				t.Fatalf("stderr missing unknown command error: %q", stderr)
+			}
+		})
+	}
+}
+
+func captureRunStderr(t *testing.T, fn func() int) (int, string) {
+	t.Helper()
+
+	original := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+
+	code := fn()
+
+	os.Stderr = original
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	return code, string(output)
 }
 
 func TestFormatStatsLineIncludesMachineFields(t *testing.T) {

@@ -94,19 +94,9 @@ func run(ctx context.Context, args []string) int {
 	case "help", "--help", "-h":
 		return runHelp(args[1:])
 	default:
-		return runExec(
-			ctx,
-			app.ExecParams{
-				Command:    args,
-				Stdout:     os.Stdout,
-				Stderr:     os.Stderr,
-				Stdin:      os.Stdin,
-				StdinFile:  os.Stdin,
-				StdoutFile: os.Stdout,
-				StderrFile: os.Stderr,
-				TTYMode:    app.TTYDisable,
-			},
-		)
+		fmt.Fprintf(os.Stderr, "error: unknown command %q\n", args[0])
+		printUsage(os.Stderr)
+		return exitUsage
 	}
 }
 
@@ -1084,7 +1074,6 @@ Usage:
   rmtx cache prune [flags]
   rmtx wsl config [flags]
   rmtx version
-  rmtx <command> [args...]
 
 Examples:
   rmtx host --listen :33221
@@ -1092,7 +1081,7 @@ Examples:
   rmtx init --host 192.168.1.42:33221 --fingerprint sha256:...
   rmtx pair
   rmtx host pair-code
-  rmtx go test ./...
+  rmtx exec -- go test ./...
   rmtx pair --code 123456
   rmtx exec --tty -- bash
   rmtx ping
@@ -1114,7 +1103,7 @@ How rmtx works:
      advertises itself on LAN discovery service "rmtx".
   2. Run "rmtx init" in a client project. It discovers or uses --host, verifies
      host TLS fingerprint, writes .rmtx.json, and pairs a client identity.
-  3. Run "rmtx <command> [args...]" or "rmtx exec -- <command> [args...]".
+  3. Run "rmtx exec -- <command> [args...]".
      rmtx syncs configured mounts to a persistent host context, runs the command
      in that context, streams stdin/stdout/stderr, then syncs changed files back.
      Ctrl+C asks the host command to stop, then still syncs touched files back.
@@ -1164,8 +1153,7 @@ Command reference:
 
   rmtx exec [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
             [--tty|--no-tty] -- <command> [args...]
-      Run command remotely. "rmtx <command> [args...]" is shorthand for exec
-      with TTY disabled. Use --tty for interactive shells/programs. Ctrl+C
+      Run command remotely. Use --tty for interactive shells/programs. Ctrl+C
       cancels the remote command but keeps the connection open for sync-back.
 
   rmtx ping [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
@@ -1251,8 +1239,8 @@ func printConfigHelp(f *os.File) {
 Lookup:
   rmtx searches current directory, then parents, for .rmtx.json then rmtx.json.
   --config PATH overrides lookup. Paths inside config are relative to config dir.
-  "rmtx exec" and "rmtx <command>" require config. Utility commands such as
-  ping/context/pair can also use --host, env, pairing state, or discovery.
+  "rmtx exec" requires config. Utility commands such as ping/context/pair can
+  also use --host, env, pairing state, or discovery.
 
 Minimal config:
   {
