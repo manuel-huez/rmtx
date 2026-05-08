@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 type commandOutputCollector struct {
@@ -147,7 +148,21 @@ func writeRunLogLine(w io.Writer, format string, args ...any) {
 		return
 	}
 
-	_, _ = fmt.Fprintf(w, "rmtx: "+format+"\n", args...)
+	line := fmt.Sprintf(format, args...)
+	if strings.HasPrefix(line, "===") {
+		if runLogs, ok := w.(*hostLogSubscription); ok {
+			if elapsed, total, timed := runLogs.markRunLogSection(); timed {
+				line = fmt.Sprintf(
+					"%s elapsed=%s total=%s",
+					line,
+					elapsed.Round(time.Millisecond),
+					total.Round(time.Millisecond),
+				)
+			}
+		}
+	}
+
+	_, _ = fmt.Fprintf(w, "rmtx: %s\n", line)
 }
 
 func (s *Server) hostOnlyLogger() *log.Logger {

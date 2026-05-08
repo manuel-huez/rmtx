@@ -114,6 +114,40 @@ func TestHostLogSubscriptionStreamsDirectWrites(t *testing.T) {
 	}
 }
 
+func TestHostLogSubscriptionAddsSectionTimingToRunLogLines(t *testing.T) {
+	serverRaw, clientRaw := net.Pipe()
+
+	defer func() { _ = serverRaw.Close() }()
+	defer func() { _ = clientRaw.Close() }()
+
+	sub := newHostLogSubscription(protocol.NewConn(serverRaw))
+	defer sub.Close()
+
+	writeRunLogLine(sub, "=== runtime context setup ===")
+
+	if err := clientRaw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	client := protocol.NewConn(clientRaw)
+
+	head, err := client.ReadHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := io.ReadAll(client.PayloadReader(head))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := string(payload)
+	if !strings.HasPrefix(got, "rmtx: === runtime context setup === elapsed=") ||
+		!strings.Contains(got, " total=") {
+		t.Fatalf("section log missing timing: %q", got)
+	}
+}
+
 func TestHostLogHubDoesNotStreamGeneralLogs(t *testing.T) {
 	serverRaw, clientRaw := net.Pipe()
 
