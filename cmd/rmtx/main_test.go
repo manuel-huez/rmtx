@@ -130,6 +130,8 @@ func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 		ActiveRuns:         1,
 		ActiveContextCount: 1,
 		ContextCount:       3,
+		ContextID:          "ctx-1",
+		ContextDiskBytes:   42,
 	})
 
 	for _, want := range []string{
@@ -142,6 +144,8 @@ func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 		"cpu_per_core_used_percent=10.0,25.5,0.0,100.0",
 		"memory_available_bytes=8",
 		"contexts=3",
+		"context_id=ctx-1",
+		"context_disk_bytes=42",
 		"at=2026-05-07T12:00:00Z",
 	} {
 		if !strings.Contains(got, want) {

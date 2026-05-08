@@ -12,7 +12,7 @@
 - `rmtx exec -- <command> ...`: run a command remotely in the current context.
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
-- `rmtx stats`: report host CPU/RAM/core/per-core usage.
+- `rmtx stats`: report host CPU/RAM/core/per-core usage and current context disk use.
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
 - `rmtx cache prune`: delete unreferenced host cache data.

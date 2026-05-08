@@ -319,6 +319,14 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 		t.Fatalf("expected stats context count 1, got %d", stats.ContextCount)
 	}
 
+	if stats.ContextID != contextID {
+		t.Fatalf("expected stats context id %s, got %s", contextID, stats.ContextID)
+	}
+
+	if stats.ContextDiskBytes <= 0 {
+		t.Fatalf("expected context disk usage, got %d", stats.ContextDiskBytes)
+	}
+
 	deleteResult, err := RunDeleteContexts(ctx, project, ContextDeleteParams{
 		AddressOverride: addr,
 		Current:         true,

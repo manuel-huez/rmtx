@@ -158,9 +158,9 @@ func TestChunkedBlobReceiverRejectsBadLengthBeforeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	read := false
 	reader := readerFunc(func([]byte) (int, error) {
-		read = true
+		t.Fatal("reader was consumed before chunk length validation")
+
 		return 0, errors.New("unexpected read")
 	})
 
@@ -171,9 +171,6 @@ func TestChunkedBlobReceiverRejectsBadLengthBeforeRead(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected chunk length error")
-	}
-	if read {
-		t.Fatal("reader was consumed before chunk length validation")
 	}
 }
 

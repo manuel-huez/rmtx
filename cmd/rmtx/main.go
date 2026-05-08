@@ -1000,7 +1000,7 @@ func emptyFallback(value, fallback string) string {
 
 func formatStatsLine(stats client.HostStatsInfo) string {
 	return fmt.Sprintf(
-		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tversion=%s\tfingerprint=%s\tat=%s",
+		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tcontext_id=%s\tcontext_disk_bytes=%d\tversion=%s\tfingerprint=%s\tat=%s",
 		emptyFallback(stats.Name, "rmtx-host"),
 		stats.Address,
 		stats.OS,
@@ -1017,6 +1017,8 @@ func formatStatsLine(stats client.HostStatsInfo) string {
 		stats.ActiveRuns,
 		stats.ActiveContextCount,
 		stats.ContextCount,
+		emptyFallback(stats.ContextID, "-"),
+		stats.ContextDiskBytes,
 		stats.Version,
 		stats.Fingerprint,
 		stats.Now.Format(time.RFC3339),
@@ -1162,8 +1164,8 @@ Command reference:
 
   rmtx stats [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Report host OS/arch, aggregate/per-core CPU usage, logical/physical
-      cores, memory usage, active runs, and context counts.
-      Output: stats<TAB><name><TAB><addr><TAB>os=... cpu_used_percent=...
+      cores, memory usage, active runs, context counts, and current context disk use.
+      Output: stats<TAB><name><TAB><addr><TAB>os=... context_disk_bytes=...
 
   rmtx context list [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       List contexts on host. Columns: ID, NAME, UPDATED, ACTIVE, WORKSPACE.

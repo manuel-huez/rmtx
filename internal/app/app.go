@@ -357,12 +357,17 @@ func RunHostStats(
 	cwd string,
 	params RemoteParams,
 ) (client.HostStatsInfo, error) {
-	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
+	remote, loaded, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
 		return client.HostStatsInfo{}, err
 	}
 
-	return client.HostStats(ctx, remote)
+	contextID := ""
+	if loaded != nil {
+		contextID = loaded.ContextID()
+	}
+
+	return client.HostStats(ctx, remote, contextID)
 }
 
 func RunListContexts(

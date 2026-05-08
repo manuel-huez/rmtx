@@ -159,7 +159,9 @@ type PingResponse struct {
 	ContextCount int       `json:"context_count,omitempty"`
 }
 
-type HostStatsRequest struct{}
+type HostStatsRequest struct {
+	ContextID string `json:"context_id,omitempty"`
+}
 
 type HostStatsResponse struct {
 	Version            string          `json:"version"`
@@ -172,6 +174,8 @@ type HostStatsResponse struct {
 	CPU                HostCPUStats    `json:"cpu"`
 	Memory             HostMemoryStats `json:"memory"`
 	ContextCount       int             `json:"context_count,omitempty"`
+	ContextID          string          `json:"context_id,omitempty"`
+	ContextDiskBytes   int64           `json:"context_disk_bytes,omitempty"`
 	ActiveRuns         int             `json:"active_runs,omitempty"`
 	ActiveContextCount int             `json:"active_context_count,omitempty"`
 	Warnings           []string        `json:"warnings,omitempty"`
