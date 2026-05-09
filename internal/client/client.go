@@ -2,12 +2,10 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,7 +17,6 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 
-	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
@@ -90,12 +87,8 @@ type ContextArtifactsOptions struct {
 
 const stdinBufferSize = 32 * 1024
 const (
-	directDialTimeout       = 1500 * time.Millisecond
-	reverseDialTimeout      = 5 * time.Second
-	defaultDiscoverySvc     = "rmtx"
 	progressEvery           = 3 * time.Second
 	maxBlobTransferParallel = 16
-	tcpKeepAliveEvery       = 15 * time.Second
 )
 
 var (
@@ -316,7 +309,14 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		formatCommand(opts.Command),
 	)
 
-	if err := ensureHostUpdated(
+	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts, logger)
+	if err != nil {
+		return 1, err
+	}
+
+	logger.Printf("connecting to host: %s", opts.Address)
+
+	conn, err := updatedRemoteConn(
 		ctx,
 		RemoteOptions{
 			Address:          opts.Address,
@@ -326,25 +326,6 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 			ClientKeyPEM:     opts.ClientKeyPEM,
 			Stderr:           opts.Stderr,
 		},
-		logger,
-	); err != nil {
-		return 1, err
-	}
-
-	manifest, request, err := buildRunRequest(ctx, root, workdir, &opts, logger)
-	if err != nil {
-		return 1, err
-	}
-
-	logger.Printf("connecting to host: %s", opts.Address)
-
-	conn, err := dialTLS(
-		ctx,
-		opts.Address,
-		opts.DiscoveryService,
-		opts.Host.Fingerprint,
-		opts.ClientCertPEM,
-		opts.ClientKeyPEM,
 	)
 	if err != nil {
 		return 1, err
@@ -604,170 +585,6 @@ func loadManifestCache(root, contextID string, logger *runLogger) []syncfs.Entry
 func saveManifestCache(root, contextID string, entries []syncfs.Entry, logger *runLogger) {
 	if err := saveCachedManifest(root, contextID, entries); err != nil {
 		logger.Printf("local manifest cache save failed: %v", err)
-	}
-}
-
-func dialTLS(
-	ctx context.Context,
-	address, discoveryService, fingerprint string,
-	clientCertPEM, clientKeyPEM []byte,
-) (*protocol.Conn, error) {
-	dialer := net.Dialer{Timeout: directDialTimeout, KeepAlive: tcpKeepAliveEvery}
-
-	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
-	if err != nil {
-		return nil, err
-	}
-
-	raw, err := tls.DialWithDialer(&dialer, "tcp", address, tlsConfig)
-	if err != nil {
-		reverse, reverseErr := dialReverseTLS(
-			ctx,
-			address,
-			discoveryService,
-			fingerprint,
-			clientCertPEM,
-			clientKeyPEM,
-		)
-		if reverseErr == nil {
-			return reverse, nil
-		}
-
-		return nil, fmt.Errorf(
-			"dial host %s: %w; reverse connect failed: %w",
-			address,
-			err,
-			reverseErr,
-		)
-	}
-
-	return protocol.NewConn(protocol.NewIdleDeadlineConn(raw)), nil
-}
-
-func dialReverseTLS(
-	ctx context.Context,
-	address, discoveryService, fingerprint string,
-	clientCertPEM, clientKeyPEM []byte,
-) (*protocol.Conn, error) {
-	listenConfig := net.ListenConfig{KeepAlive: tcpKeepAliveEvery}
-	ln, err := listenConfig.Listen(ctx, "tcp4", "0.0.0.0:0")
-	if err != nil {
-		return nil, fmt.Errorf("listen for reverse connection: %w", err)
-	}
-	defer closeQuietly(ln)
-
-	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok || tcpAddr.Port == 0 {
-		return nil, fmt.Errorf("listen for reverse connection: unexpected address %s", ln.Addr())
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, reverseDialTimeout)
-	defer cancel()
-
-	requestCtx, requestCancel := context.WithCancel(ctx)
-	defer requestCancel()
-
-	requestErrCh := startReverseConnectRequests(
-		requestCtx,
-		nonEmpty(discoveryService, defaultDiscoverySvc),
-		address,
-		tcpAddr.Port,
-		fingerprint,
-	)
-
-	raw, err := acceptReverse(ctx, ln, requestErrCh)
-	if err != nil {
-		return nil, err
-	}
-
-	requestCancel()
-
-	tlsConfig, err := security.ClientTLSConfig(clientCertPEM, clientKeyPEM, fingerprint)
-	if err != nil {
-		closeQuietly(raw)
-
-		return nil, err
-	}
-
-	conn := tls.Client(raw, tlsConfig)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		closeQuietly(conn)
-
-		return nil, fmt.Errorf("reverse tls handshake: %w", err)
-	}
-
-	return protocol.NewConn(protocol.NewIdleDeadlineConn(conn)), nil
-}
-
-func startReverseConnectRequests(
-	ctx context.Context,
-	discoveryService string,
-	address string,
-	callbackPort int,
-	fingerprint string,
-) <-chan error {
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- discovery.RequestReverseConnect(
-			ctx,
-			discoveryService,
-			address,
-			callbackPort,
-			fingerprint,
-		)
-	}()
-
-	return errCh
-}
-
-func nonEmpty(value, fallback string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return fallback
-	}
-
-	return value
-}
-
-func acceptReverse(
-	ctx context.Context,
-	ln net.Listener,
-	requestErrCh <-chan error,
-) (net.Conn, error) {
-	type acceptResult struct {
-		conn net.Conn
-		err  error
-	}
-
-	resultCh := make(chan acceptResult, 1)
-
-	go func() {
-		conn, err := ln.Accept()
-		resultCh <- acceptResult{conn: conn, err: err}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			_ = ln.Close()
-
-			return nil, fmt.Errorf("accept reverse connection: %w", ctx.Err())
-		case err := <-requestErrCh:
-			requestErrCh = nil
-
-			if err != nil {
-				_ = ln.Close()
-
-				return nil, err
-			}
-		case result := <-resultCh:
-			if result.err != nil {
-				return nil, fmt.Errorf("accept reverse connection: %w", result.err)
-			}
-
-			return result.conn, nil
-		}
 	}
 }
 

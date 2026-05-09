@@ -7,19 +7,15 @@ import (
 )
 
 func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
-	if err := ensureHostUpdated(ctx, opts, newRunLogger(opts.Stderr)); err != nil {
-		return PingInfo{}, err
-	}
-
-	return pingHost(ctx, opts)
-}
-
-func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
-	conn, err := dialRemote(ctx, opts)
+	conn, info, checked, err := connectUpdatedRemote(ctx, opts, newRunLogger(opts.Stderr))
 	if err != nil {
 		return PingInfo{}, err
 	}
 	defer closeQuietly(conn.Raw())
+
+	if checked {
+		return info, nil
+	}
 
 	if err := conn.WriteJSON(protocol.MsgPingRequest, protocol.PingRequest{}); err != nil {
 		return PingInfo{}, err
@@ -30,6 +26,42 @@ func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 		protocol.MsgPingResponse,
 		opts.Stderr,
 	)
+}
+
+func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
+	conn, info, err := pingHostConn(ctx, opts)
+	if err != nil {
+		return PingInfo{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	return info, nil
+}
+
+func pingHostConn(ctx context.Context, opts RemoteOptions) (*protocol.Conn, PingInfo, error) {
+	conn, err := dialRemote(ctx, opts)
+	if err != nil {
+		return nil, PingInfo{}, err
+	}
+
+	if err := conn.WriteJSON(protocol.MsgPingRequest, protocol.PingRequest{}); err != nil {
+		closeQuietly(conn.Raw())
+
+		return nil, PingInfo{}, err
+	}
+
+	info, err := expectDataFrameWithOutput[protocol.PingResponse](
+		conn,
+		protocol.MsgPingResponse,
+		opts.Stderr,
+	)
+	if err != nil {
+		closeQuietly(conn.Raw())
+
+		return nil, PingInfo{}, err
+	}
+
+	return conn, info, nil
 }
 
 func HostStats(ctx context.Context, opts RemoteOptions) (HostStatsInfo, error) {
@@ -202,9 +234,6 @@ func dialRemote(ctx context.Context, opts RemoteOptions) (*protocol.Conn, error)
 }
 
 func updatedRemoteConn(ctx context.Context, opts RemoteOptions) (*protocol.Conn, error) {
-	if err := ensureHostUpdated(ctx, opts, newRunLogger(opts.Stderr)); err != nil {
-		return nil, err
-	}
-
-	return dialRemote(ctx, opts)
+	conn, _, _, err := connectUpdatedRemote(ctx, opts, newRunLogger(opts.Stderr))
+	return conn, err
 }

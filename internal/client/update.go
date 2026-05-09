@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/version"
 )
 
@@ -15,21 +16,37 @@ const (
 
 var clientVersion = version.String
 
-func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogger) error {
+func connectUpdatedRemote(
+	ctx context.Context,
+	opts RemoteOptions,
+	logger *runLogger,
+) (*protocol.Conn, PingInfo, bool, error) {
 	targetVersion := clientVersion()
 	if !version.ValidRelease(targetVersion) {
-		return nil
+		conn, err := dialRemote(ctx, opts)
+		return conn, PingInfo{}, false, err
 	}
 
 	for {
-		info, err := pingHost(ctx, opts)
+		conn, info, err := pingHostConn(ctx, opts)
 		if err != nil {
-			return err
+			return nil, PingInfo{}, false, err
 		}
 
-		if !hostNeedsUpdate(info.Version, targetVersion) {
-			return nil
+		cmp, comparable := version.CompareRelease(targetVersion, info.Version)
+		if !comparable {
+			// Old/dev hosts may close after ping, so a fresh conn preserves one-request compatibility.
+			closeQuietly(conn.Raw())
+
+			conn, err := dialRemote(ctx, opts)
+			return conn, PingInfo{}, false, err
 		}
+
+		if cmp <= 0 {
+			return conn, info, true, nil
+		}
+
+		closeQuietly(conn.Raw())
 
 		logger.Printf(
 			"host update required: host_version=%s client_version=%s",
@@ -39,7 +56,7 @@ func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogge
 
 		result, err := UpdateHost(ctx, opts, targetVersion)
 		if err != nil {
-			return fmt.Errorf(
+			return nil, PingInfo{}, false, fmt.Errorf(
 				"host update required (%s -> %s): %w; if the host is too old for auto-update, run `go install %s@%s` on the host",
 				info.Version,
 				targetVersion,
@@ -50,7 +67,7 @@ func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogge
 		}
 
 		if !result.Restarting {
-			return nil
+			continue
 		}
 
 		if err := waitForHostUpdate(
@@ -59,15 +76,9 @@ func ensureHostUpdated(ctx context.Context, opts RemoteOptions, logger *runLogge
 			hostUpdateWaitVersion(result, targetVersion),
 			logger,
 		); err != nil {
-			return err
+			return nil, PingInfo{}, false, err
 		}
 	}
-}
-
-func hostNeedsUpdate(hostVersion, targetVersion string) bool {
-	cmp, ok := version.CompareRelease(targetVersion, hostVersion)
-
-	return ok && cmp > 0
 }
 
 func hostUpdateWaitVersion(result HostUpdateResult, targetVersion string) string {

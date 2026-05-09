@@ -491,17 +491,31 @@ func (s *Server) handleConnSession(
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
 ) error {
-	setConnectionIdleTimeout(conn, requestHeaderIdleTimeout)
+	for {
+		setConnectionIdleTimeout(conn, requestHeaderIdleTimeout)
 
-	head, err := conn.ReadHeader()
-	if err != nil {
-		if protocol.IsDisconnectError(err) {
-			return nil
+		head, err := conn.ReadHeader()
+		if err != nil {
+			if protocol.IsDisconnectError(err) {
+				return nil
+			}
+
+			return err
 		}
 
-		return err
+		keepOpen, err := s.handleConnRequest(parent, cancel, conn, head)
+		if err != nil || !keepOpen {
+			return err
+		}
 	}
+}
 
+func (s *Server) handleConnRequest(
+	parent context.Context,
+	cancel context.CancelFunc,
+	conn *protocol.Conn,
+	head protocol.Header,
+) (bool, error) {
 	var requestLogs *hostLogSubscription
 	if streamsHostLogs(head.Type) {
 		requestLogs = s.logHub.Subscribe(conn)
@@ -523,16 +537,16 @@ func (s *Server) handleConnSession(
 
 	if err := s.dispatchSessionRequest(parent, conn, head, requestLogs); err != nil {
 		if protocol.IsDisconnectError(err) {
-			return nil
+			return false, nil
 		}
 
 		s.logger.Printf("request failed: remote=%s error=%v", conn.Raw().RemoteAddr(), err)
 		requestLogs.Flush()
 
-		return conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
+		return false, conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{Message: err.Error()})
 	}
 
-	return nil
+	return true, nil
 }
 
 func streamsHostLogs(messageType string) bool {

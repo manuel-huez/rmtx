@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +19,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/clientstate"
 	"github.com/manuel-huez/rmtx/internal/host"
 	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
@@ -271,6 +274,290 @@ func TestRequestPairCodeFallsBackToReverseConnect(t *testing.T) {
 	}
 }
 
+func TestRequestPairCodeRacesReverseWhenDirectTLSStalls(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stalled := startStalledTCPListener(t)
+
+	var logs lockedBuffer
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         t.TempDir(),
+		DiscoveryService: "test-rmtx-race",
+		Logger:           log.New(&logs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ctx) }()
+	waitForAddr(t, server)
+
+	start := time.Now()
+	_, err = RequestPairCode(ctx, PairOptions{
+		Address:          stalled.Addr().String(),
+		DiscoveryService: "test-rmtx-race",
+		Host: clientstate.HostRecord{
+			Fingerprint: server.Fingerprint(),
+		},
+		ClientLabel: "reverse-client",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if elapsed := time.Since(start); elapsed >= directDialTimeout {
+		t.Fatalf("reverse fallback elapsed=%s want less than direct timeout %s", elapsed, directDialTimeout)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestUpdatedRemoteConnKeepsConnectionForNextRequest(t *testing.T) {
+	oldClientVersion := clientVersion
+	clientVersion = func() string { return "v0.0.1" }
+	defer func() { clientVersion = oldClientVersion }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stateDir := t.TempDir()
+	var logs lockedBuffer
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DiscoveryService: "test-rmtx-reuse",
+		Logger:           log.New(&logs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ctx) }()
+	waitForAddr(t, server)
+
+	pairCode, err := host.CreatePairCodeInfo(stateDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, keyPEM, csrPEM, err := GenerateClientIdentity("reuse-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairResp, err := PairHost(ctx, PairOptions{
+		Address:          server.Addr(),
+		DiscoveryService: "test-rmtx-reuse",
+		Host: clientstate.HostRecord{
+			Fingerprint: server.Fingerprint(),
+		},
+		Code:        pairCode.Code,
+		ClientLabel: "reuse-client",
+		CSRPEM:      csrPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := updatedRemoteConn(ctx, RemoteOptions{
+		Address:          server.Addr(),
+		DiscoveryService: "test-rmtx-reuse",
+		Host: clientstate.HostRecord{
+			Fingerprint: server.Fingerprint(),
+		},
+		ClientCertPEM: []byte(pairResp.ClientCertPEM),
+		ClientKeyPEM:  keyPEM,
+		Stderr:        io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeQuietly(conn.Raw())
+
+	if err := conn.WriteJSON(protocol.MsgHostStatsRequest, protocol.HostStatsRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := expectDataFrameWithOutput[protocol.HostStatsResponse](
+		conn,
+		protocol.MsgHostStatsResponse,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Fingerprint != server.Fingerprint() {
+		t.Fatalf("stats fingerprint=%s want %s", stats.Fingerprint, server.Fingerprint())
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestUpdatedRemoteConnDialsFreshForUncomparableHostVersion(t *testing.T) {
+	oldClientVersion := clientVersion
+	clientVersion = func() string { return "v0.0.1" }
+	defer func() { clientVersion = oldClientVersion }()
+
+	pki, err := security.EnsureHostPKI(t.TempDir(), "one-shot-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConfig, fingerprint, err := security.ServerTLSConfig(pki)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(ln, tlsConfig)
+
+	requestTypes := make(chan string, 4)
+	serverErrCh := make(chan error, 1)
+	serverDone := make(chan struct{})
+	sendServerErr := func(err error) {
+		select {
+		case serverErrCh <- err:
+		default:
+		}
+	}
+
+	go func() {
+		defer close(serverDone)
+
+		for {
+			raw, err := tlsLn.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				sendServerErr(err)
+
+				return
+			}
+
+			conn := protocol.NewConn(raw)
+			head, err := conn.ReadHeader()
+			if err != nil {
+				_ = raw.Close()
+				if !protocol.IsDisconnectError(err) {
+					sendServerErr(err)
+
+					return
+				}
+
+				continue
+			}
+
+			requestTypes <- head.Type
+			if err := conn.DiscardPayload(head); err != nil {
+				_ = raw.Close()
+				sendServerErr(err)
+
+				return
+			}
+
+			var writeErr error
+			switch head.Type {
+			case protocol.MsgPingRequest:
+				writeErr = conn.WriteJSON(protocol.MsgPingResponse, protocol.PingResponse{
+					Online:      true,
+					Version:     "dev",
+					Fingerprint: fingerprint,
+					Now:         time.Now().UTC(),
+				})
+			case protocol.MsgHostStatsRequest:
+				writeErr = conn.WriteJSON(protocol.MsgHostStatsResponse, protocol.HostStatsResponse{
+					Version:     "dev",
+					Fingerprint: fingerprint,
+					Now:         time.Now().UTC(),
+				})
+			default:
+				writeErr = conn.WriteJSON(protocol.MsgError, protocol.ErrorMessage{
+					Message: fmt.Sprintf("unexpected request %s", head.Type),
+				})
+			}
+			_ = raw.Close()
+			if writeErr != nil {
+				sendServerErr(writeErr)
+
+				return
+			}
+		}
+	}()
+	defer func() {
+		_ = tlsLn.Close()
+
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for one-shot host shutdown")
+		}
+
+		select {
+		case err := <-serverErrCh:
+			t.Errorf("one-shot host failed: %v", err)
+		default:
+		}
+	}()
+
+	conn, err := updatedRemoteConn(context.Background(), RemoteOptions{
+		Address: ln.Addr().String(),
+		Host: clientstate.HostRecord{
+			Fingerprint: fingerprint,
+		},
+		Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeQuietly(conn.Raw())
+
+	if err := conn.WriteJSON(protocol.MsgHostStatsRequest, protocol.HostStatsRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := expectDataFrameWithOutput[protocol.HostStatsResponse](
+		conn,
+		protocol.MsgHostStatsResponse,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Fingerprint != fingerprint {
+		t.Fatalf("stats fingerprint=%s want %s", stats.Fingerprint, fingerprint)
+	}
+
+	for _, want := range []string{protocol.MsgPingRequest, protocol.MsgHostStatsRequest} {
+		select {
+		case got := <-requestTypes:
+			if got != want {
+				t.Fatalf("request type=%s want %s", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", want)
+		}
+	}
+}
+
 func TestRunHandshakeStreamsSetupOutput(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 
@@ -518,4 +805,48 @@ func waitForAddr(t *testing.T, server interface{ Addr() string }) string {
 	t.Fatal("timed out waiting for server address")
 
 	return ""
+}
+
+func startStalledTCPListener(t *testing.T) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var connsMu sync.Mutex
+	var conns []net.Conn
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			connsMu.Lock()
+			conns = append(conns, conn)
+			connsMu.Unlock()
+
+			go func(conn net.Conn) {
+				<-done
+				_ = conn.Close()
+			}(conn)
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(done)
+		_ = ln.Close()
+
+		connsMu.Lock()
+		defer connsMu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+
+	return ln
 }
