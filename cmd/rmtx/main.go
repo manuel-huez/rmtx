@@ -622,7 +622,7 @@ func runContextArtifactsList(ctx context.Context, args []string) int {
 		args,
 		"list",
 		func(_ *app.ContextArtifactsParams, _ *flag.FlagSet) {},
-		func(result client.ContextArtifactsResult) { printArtifacts(result.Artifacts) },
+		func(result client.ContextArtifactsResult) { printArtifacts(os.Stdout, result.Artifacts) },
 	)
 }
 
@@ -1000,7 +1000,7 @@ func emptyFallback(value, fallback string) string {
 
 func formatStatsLine(stats client.HostStatsInfo) string {
 	return fmt.Sprintf(
-		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tcontext_id=%s\tcontext_disk_bytes=%d\tversion=%s\tfingerprint=%s\tat=%s",
+		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tversion=%s\tfingerprint=%s\tat=%s",
 		emptyFallback(stats.Name, "rmtx-host"),
 		stats.Address,
 		stats.OS,
@@ -1017,8 +1017,6 @@ func formatStatsLine(stats client.HostStatsInfo) string {
 		stats.ActiveRuns,
 		stats.ActiveContextCount,
 		stats.ContextCount,
-		emptyFallback(stats.ContextID, "-"),
-		stats.ContextDiskBytes,
 		stats.Version,
 		stats.Fingerprint,
 		stats.Now.Format(time.RFC3339),
@@ -1164,8 +1162,8 @@ Command reference:
 
   rmtx stats [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Report host OS/arch, aggregate/per-core CPU usage, logical/physical
-      cores, memory usage, active runs, context counts, and current context disk use.
-      Output: stats<TAB><name><TAB><addr><TAB>os=... context_disk_bytes=...
+      cores, memory usage, active runs, and context counts.
+      Output: stats<TAB><name><TAB><addr><TAB>os=... cpu_used_percent=...
 
   rmtx context list [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       List contexts on host. Columns: ID, NAME, UPDATED, ACTIVE, WORKSPACE.
@@ -1177,7 +1175,7 @@ Command reference:
       Delete old/all contexts.
 
   rmtx context artifacts list [--current|--context ID] [remote flags]
-      List context artifacts. Columns: KIND, NAME, REF, SIZE, PATH, DETAIL.
+      List context artifacts and total listed size. Columns: KIND, NAME, REF, SIZE, PATH, DETAIL.
 
   rmtx context artifacts prune [--current|--context ID] [remote flags]
       Delete unreferenced artifacts for context.
@@ -1403,12 +1401,14 @@ func printDeletedContexts(deleted []client.ContextInfo) {
 	}
 }
 
-func printArtifacts(artifacts []client.ContextArtifact) {
-	tw := tabwriter.NewWriter(os.Stdout, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
+func printArtifacts(w io.Writer, artifacts []client.ContextArtifact) {
+	tw := tabwriter.NewWriter(w, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
 
 	_, _ = fmt.Fprintln(tw, "KIND\tNAME\tREF\tSIZE\tPATH\tDETAIL")
 
+	var total int64
 	for _, artifact := range artifacts {
+		total += artifact.Size
 		_, _ = fmt.Fprintf(
 			tw,
 			"%s\t%s\t%s\t%d\t%s\t%s\n",
@@ -1420,6 +1420,8 @@ func printArtifacts(artifacts []client.ContextArtifact) {
 			artifact.Detail,
 		)
 	}
+
+	_, _ = fmt.Fprintf(tw, "total\t-\t-\t%d\t-\tlisted artifact bytes\n", total)
 
 	_ = tw.Flush()
 }

@@ -130,8 +130,6 @@ func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 		ActiveRuns:         1,
 		ActiveContextCount: 1,
 		ContextCount:       3,
-		ContextID:          "ctx-1",
-		ContextDiskBytes:   42,
 	})
 
 	for _, want := range []string{
@@ -144,12 +142,16 @@ func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 		"cpu_per_core_used_percent=10.0,25.5,0.0,100.0",
 		"memory_available_bytes=8",
 		"contexts=3",
-		"context_id=ctx-1",
-		"context_disk_bytes=42",
 		"at=2026-05-07T12:00:00Z",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stats line missing %q: %s", want, got)
+		}
+	}
+
+	for _, unwanted := range []string{"context_id=", "context_disk_bytes="} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("stats line should not include %q: %s", unwanted, got)
 		}
 	}
 }
@@ -160,6 +162,24 @@ func TestFormatStatsLineUsesPlaceholderForMissingPerCoreUsage(t *testing.T) {
 	if !strings.Contains(got, "cpu_per_core_used_percent=-") {
 		t.Fatalf("stats line missing per-core placeholder: %s", got)
 	}
+}
+
+func TestPrintArtifactsIncludesTotalListedSize(t *testing.T) {
+	var out bytes.Buffer
+	printArtifacts(&out, []client.ContextArtifact{
+		{Kind: "workspace", Size: 3},
+		{Kind: "volume", Size: 4},
+	})
+
+	got := out.String()
+	for _, line := range strings.Split(got, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "total" && fields[3] == "7" {
+			return
+		}
+	}
+
+	t.Fatalf("artifact output missing total size: %q", got)
 }
 
 func TestSelectWSLProfileByFlag(t *testing.T) {

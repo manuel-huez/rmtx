@@ -708,7 +708,9 @@ func (s *Server) dispatchSessionRequest(
 			return s.handlePing(conn, requestLogs)
 		})
 	case protocol.MsgHostStatsRequest:
-		return s.dispatchHostStats(parent, conn, head, requestLogs)
+		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
+			return s.handleHostStats(parent, conn, requestLogs)
+		})
 	case protocol.MsgHostUpdateRequest:
 		return s.dispatchHostUpdateRequest(parent, conn, head, requestLogs)
 	case protocol.MsgListContextsRequest:
@@ -797,20 +799,6 @@ func (s *Server) dispatchHostUpdateRequest(
 	}
 
 	return s.handleHostUpdateRequest(parent, conn, req, requestLogs)
-}
-
-func (s *Server) dispatchHostStats(
-	parent context.Context,
-	conn *protocol.Conn,
-	head protocol.Header,
-	requestLogs *hostLogSubscription,
-) error {
-	req, err := protocol.DecodeData[protocol.HostStatsRequest](head)
-	if err != nil {
-		return err
-	}
-
-	return s.handleHostStats(parent, conn, req, requestLogs)
 }
 
 func (s *Server) dispatchDeleteContexts(

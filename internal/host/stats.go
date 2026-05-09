@@ -4,10 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/protocol"
@@ -21,31 +18,25 @@ const systemStatsSampleInterval = 250 * time.Millisecond
 func (s *Server) handleHostStats(
 	ctx context.Context,
 	conn *protocol.Conn,
-	req protocol.HostStatsRequest,
 	requestLogs *hostLogSubscription,
 ) error {
-	resp, err := s.hostStats(ctx, req)
+	resp, err := s.hostStats(ctx)
 	if err != nil {
 		return err
 	}
 
 	s.logger.Printf(
-		"host stats handled: remote=%s cpu_used=%.1f memory_used=%.1f context=%s context_disk_bytes=%d active_runs=%d",
+		"host stats handled: remote=%s cpu_used=%.1f memory_used=%.1f active_runs=%d",
 		conn.Raw().RemoteAddr(),
 		resp.CPU.UsedPercent,
 		resp.Memory.UsedPercent,
-		resp.ContextID,
-		resp.ContextDiskBytes,
 		resp.ActiveRuns,
 	)
 
 	return writeJSONAfterLogs(conn, requestLogs, protocol.MsgHostStatsResponse, resp)
 }
 
-func (s *Server) hostStats(
-	ctx context.Context,
-	req protocol.HostStatsRequest,
-) (protocol.HostStatsResponse, error) {
+func (s *Server) hostStats(ctx context.Context) (protocol.HostStatsResponse, error) {
 	cpuStats, memoryStats, warnings, err := collectMachineStats(ctx)
 	if err != nil {
 		return protocol.HostStatsResponse{}, err
@@ -54,26 +45,6 @@ func (s *Server) hostStats(
 	contexts, err := s.listContexts()
 	if err != nil {
 		warnings = append(warnings, fmt.Sprintf("contexts: %v", err))
-	}
-
-	contextID := strings.TrimSpace(req.ContextID)
-	var contextDiskBytes int64
-	if contextID != "" {
-		normalizedContextID, err := normalizeContextID(contextID)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("context disk usage: %v", err))
-			contextID = ""
-		} else {
-			contextID = normalizedContextID
-			size, err := dirSize(filepath.Join(s.contextsRoot(), contextID))
-			switch {
-			case errors.Is(err, os.ErrNotExist):
-			case err != nil:
-				warnings = append(warnings, fmt.Sprintf("context disk usage: %v", err))
-			default:
-				contextDiskBytes = size
-			}
-		}
 	}
 
 	return protocol.HostStatsResponse{
@@ -87,8 +58,6 @@ func (s *Server) hostStats(
 		CPU:                cpuStats,
 		Memory:             memoryStats,
 		ContextCount:       len(contexts),
-		ContextID:          contextID,
-		ContextDiskBytes:   contextDiskBytes,
 		ActiveRuns:         s.activeRunCount(),
 		ActiveContextCount: s.activeContextCount(),
 		Warnings:           warnings,

@@ -12,7 +12,7 @@
 - `rmtx exec -- <command> ...`: run a command remotely in the current context.
 - `rmtx pair`: pair a client with a host.
 - `rmtx ping`: verify host connectivity/auth.
-- `rmtx stats`: report host CPU/RAM/core/per-core usage and current context disk use.
+- `rmtx stats`: report host CPU/RAM/core/per-core usage.
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
 - `rmtx cache prune`: delete unreferenced host cache data.
@@ -201,7 +201,7 @@ context setup runs every command.
 
 Synced file blobs, OCI image blobs, manifests, and refs are stored once in host
 global caches, while contexts keep references to the data they use.
-Context artifact commands show the project-owned view:
+Context artifact commands show the project-owned view and list total bytes:
 
 ```bash
 rmtx context artifacts list --current
