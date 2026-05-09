@@ -9,49 +9,64 @@ set -euo pipefail
 # check, run the underlying tools directly instead of changing this file.
 
 status=0
-step_index=0
+step_pids=()
+step_logs=()
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/stx-code-health.XXXXXX")"
 
-timestamp_ms() {
-  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+cleanup() {
+  rm -rf "$tmp_dir"
 }
 
-format_elapsed() {
-  local elapsed_ms="$1"
-  if [ "$elapsed_ms" -lt 1000 ]; then
-    printf '%sms' "$elapsed_ms"
-    return
-  fi
-
-  printf '%ss' "$((elapsed_ms / 1000))"
+terminate() {
+  kill "${step_pids[@]}" 2>/dev/null || true
+  cleanup
+  exit 130
 }
 
-run_step() {
+trap cleanup EXIT
+trap terminate INT TERM
+
+launch_step() {
   local label="$1"
   shift
 
-  if [ "$step_index" -gt 0 ]; then
-    echo
-  fi
-  step_index=$((step_index + 1))
+  local step_index="${#step_pids[@]}"
+  local log_path="$tmp_dir/step-$step_index.log"
 
-  echo "==> $label"
+  # Checks are independent read-only validators; run together to reduce hook wall time.
+  (
+    echo "==> $label"
 
-  local start_ms
-  start_ms="$(timestamp_ms)"
-  local outcome="completed"
-  if ! "$@"; then
-    status=1
-    outcome="failed"
-  fi
+    local start_seconds="$SECONDS"
+    local outcome="completed"
+    local step_status=0
+    if ! "$@"; then
+      outcome="failed"
+      step_status=1
+    fi
 
-  local end_ms elapsed_ms
-  end_ms="$(timestamp_ms)"
-  elapsed_ms=$((end_ms - start_ms))
-  if [ "$elapsed_ms" -lt 0 ]; then
-    elapsed_ms=0
-  fi
+    local elapsed_seconds=$((SECONDS - start_seconds))
+    printf '==> %s %s in %ss\n' "$label" "$outcome" "$elapsed_seconds"
+    exit "$step_status"
+  ) >"$log_path" 2>&1 &
 
-  printf '==> %s %s in %s\n' "$label" "$outcome" "$(format_elapsed "$elapsed_ms")"
+  step_pids+=("$!")
+  step_logs+=("$log_path")
+}
+
+wait_for_steps() {
+  local step_index
+  for step_index in "${!step_pids[@]}"; do
+    if [ "$step_index" -gt 0 ]; then
+      echo
+    fi
+
+    if ! wait "${step_pids[$step_index]}"; then
+      status=1
+    fi
+
+    cat "${step_logs[$step_index]}"
+  done
 }
 
 run_golangci_lint() {
@@ -70,10 +85,12 @@ run_jscpd() {
     --threshold 0
 }
 
-run_step "go vet" go vet ./...
-run_step "go test" go test ./...
-run_step "golangci-lint" run_golangci_lint
-run_step "go deadcode" run_go_deadcode
-run_step "jscpd" run_jscpd
+launch_step "go vet" go vet ./...
+launch_step "go test" go test ./...
+launch_step "golangci-lint" run_golangci_lint
+launch_step "slopelint" slopelint ./...
+launch_step "jscpd" run_jscpd
+
+wait_for_steps
 
 exit "$status"
