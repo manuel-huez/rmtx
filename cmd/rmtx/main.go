@@ -108,7 +108,7 @@ func runHost(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("rmtx host", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	listen := fs.String("listen", fmt.Sprintf(":%d", config.DefaultPort), "listen address")
-	stateDir := fs.String("state-dir", "", "state directory for blobs and contexts")
+	stateDir := fs.String("state-dir", "", "state directory for host data")
 	name := fs.String("name", "", "discovery instance name")
 	service := fs.String("service", config.DefaultService, "discovery service name")
 
@@ -1199,7 +1199,8 @@ Remote resolution order:
 
 State files:
   Client pairings live in ~/.rmtx/state.json.
-  Host state defaults to a platform app-data directory unless --state-dir set.
+  Host control state defaults to a platform app-data directory unless
+  --state-dir set. Windows OCI runtime data lives in runtime.wsl_distro.
 
 Exit codes:
   0 success. 1 runtime/error. 2 usage/invalid flags.

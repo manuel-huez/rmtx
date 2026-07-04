@@ -26,10 +26,14 @@ func (s *Server) handleContextArtifacts(
 		return err
 	}
 
-	contextDir := filepath.Join(s.contextsRoot(), contextID)
 	if req.Delete || req.Prune {
 		release := s.acquireContext(contextID)
 		defer release()
+	}
+
+	contextDir, err := s.contextDataDir(contextID)
+	if err != nil {
+		return err
 	}
 
 	if _, err := os.Stat(contextDir); err != nil {
@@ -285,7 +289,7 @@ func (s *Server) listContextArtifacts(
 			Kind:   "image",
 			Name:   image.Reference,
 			Ref:    image.Digest,
-			Size:   s.ociBlobSize(image.Blobs),
+			Size:   ociBlobSize(contextDir, image.Blobs),
 			Detail: fmt.Sprintf("%d blobs", len(image.Blobs)),
 		})
 	}
@@ -354,7 +358,7 @@ func (s *Server) pruneAllCaches(ctx context.Context) ([]protocol.ContextArtifact
 	deleted = append(deleted, updateDeleted...)
 	bytes += updateBytes
 
-	wslDeleted, wslBytes, err := pruneWSLStagedRootFS(ctx, s.opts.StateDir)
+	wslDeleted, wslBytes, err := s.pruneWSLStagedRootFS(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -368,7 +372,11 @@ func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64,
 	s.ociMu.Lock()
 	defer s.ociMu.Unlock()
 
-	refs, err := s.referencedOCIDigests()
+	refsByRoot, err := s.referencedOCIDigestsByRoot()
+	if err != nil {
+		return nil, 0, err
+	}
+	roots, err := s.runtimeStateRoots()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -376,7 +384,24 @@ func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64,
 	var deleted []protocol.ContextArtifact
 	var bytes int64
 
-	store := s.ociStore()
+	for _, root := range roots {
+		pruned, prunedBytes, err := pruneUnreferencedOCIStore(ociStore(root), refsByRoot[root])
+		if err != nil {
+			return nil, 0, err
+		}
+		deleted = append(deleted, pruned...)
+		bytes += prunedBytes
+	}
+
+	return deleted, bytes, nil
+}
+
+func pruneUnreferencedOCIStore(
+	store *oci.Store,
+	refs map[string]bool,
+) ([]protocol.ContextArtifact, int64, error) {
+	var deleted []protocol.ContextArtifact
+	var bytes int64
 
 	for _, root := range []string{
 		store.BlobsDir(),
@@ -477,14 +502,19 @@ func readOCIRefManifestDigest(path string) (string, error) {
 	return image.ManifestDigest, nil
 }
 
-func (s *Server) referencedOCIDigests() (map[string]bool, error) {
-	refs := map[string]bool{}
+func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error) {
+	refs := map[string]map[string]bool{}
 	contexts, err := s.listContexts()
 	if err != nil {
 		return nil, err
 	}
 
 	for _, context := range contexts {
+		root := filepath.Clean(runtimeRootForContextDataDir(context.Path))
+		if refs[root] == nil {
+			refs[root] = map[string]bool{}
+		}
+
 		state, err := loadArtifactState(
 			filepath.Join(context.Path, runtimeDirName, artifactStateFile),
 		)
@@ -493,9 +523,9 @@ func (s *Server) referencedOCIDigests() (map[string]bool, error) {
 		}
 
 		for _, image := range state.Images {
-			refs[image.Digest] = true
+			refs[root][image.Digest] = true
 			for _, blob := range image.Blobs {
-				refs[blob] = true
+				refs[root][blob] = true
 			}
 		}
 	}
@@ -507,12 +537,37 @@ func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, er
 	s.blobGCMu.Lock()
 	defer s.blobGCMu.Unlock()
 
-	refs, err := s.referencedBlobHashes()
+	refsByRoot, err := s.referencedBlobHashesByRoot()
+	if err != nil {
+		return nil, 0, err
+	}
+	roots, err := s.runtimeStateRoots()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	root := filepath.Join(s.opts.StateDir, "blobs")
+	var deleted []protocol.ContextArtifact
+	var bytes int64
+
+	for _, runtimeRoot := range roots {
+		pruned, prunedBytes, err := pruneUnreferencedBlobsInRoot(
+			filepath.Join(runtimeRoot, "blobs"),
+			refsByRoot[runtimeRoot],
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+		deleted = append(deleted, pruned...)
+		bytes += prunedBytes
+	}
+
+	return deleted, bytes, nil
+}
+
+func pruneUnreferencedBlobsInRoot(
+	root string,
+	refs map[string]bool,
+) ([]protocol.ContextArtifact, int64, error) {
 	var deleted []protocol.ContextArtifact
 	var bytes int64
 
@@ -549,14 +604,19 @@ func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, er
 	return deleted, bytes, nil
 }
 
-func (s *Server) referencedBlobHashes() (map[string]bool, error) {
-	refs := map[string]bool{}
+func (s *Server) referencedBlobHashesByRoot() (map[string]map[string]bool, error) {
+	refs := map[string]map[string]bool{}
 	contexts, err := s.listContexts()
 	if err != nil {
 		return nil, err
 	}
 
 	for _, context := range contexts {
+		root := filepath.Clean(runtimeRootForContextDataDir(context.Path))
+		if refs[root] == nil {
+			refs[root] = map[string]bool{}
+		}
+
 		entries, err := s.loadTrackedManifest(context.ID)
 		if err != nil {
 			return nil, err
@@ -564,7 +624,7 @@ func (s *Server) referencedBlobHashes() (map[string]bool, error) {
 
 		for _, entry := range entries {
 			if entry.Kind == syncfs.KindFile && entry.Hash != "" {
-				refs[entry.Hash] = true
+				refs[root][entry.Hash] = true
 			}
 		}
 	}
@@ -683,8 +743,8 @@ func isOCICacheTempFile(name string) bool {
 	return strings.Contains(name, ".tmp-")
 }
 
-func (s *Server) ociBlobSize(digests []string) int64 {
-	store := s.ociStore()
+func ociBlobSize(contextDir string, digests []string) int64 {
+	store := ociStore(runtimeRootForContextDataDir(contextDir))
 	var total int64
 
 	for _, digest := range digests {

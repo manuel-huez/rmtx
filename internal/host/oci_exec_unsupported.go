@@ -42,6 +42,6 @@ func nvidiaUnavailableError(err error) error {
 	return err
 }
 
-func pruneWSLStagedRootFS(context.Context, string) ([]protocol.ContextArtifact, int64, error) {
+func pruneWSLStagedRootFS(context.Context, []string) ([]protocol.ContextArtifact, int64, error) {
 	return nil, 0, nil
 }

@@ -908,7 +908,7 @@ func applyNonFileEntry(entry Entry, target string) error {
 		}
 
 		_ = os.RemoveAll(target)
-		if err := os.Symlink(entry.Linkname, target); err != nil {
+		if err := pathutil.Symlink(entry.Linkname, target); err != nil {
 			if isUnsupportedWindowsSymlink(err) {
 				return nil
 			}

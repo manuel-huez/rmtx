@@ -201,6 +201,10 @@ context setup runs every command.
 
 Synced file blobs, OCI image blobs, manifests, and refs are stored once in host
 global caches, while contexts keep references to the data they use.
+On Windows OCI runs, hot runtime data (synced blobs, OCI cache, workspaces,
+volumes, prepared rootfs, and setup cache) is stored inside the configured WSL
+distro under `${XDG_STATE_HOME:-$HOME/.local/state}/rmtx`; host identity,
+pairing, trust, and update data stay in the Windows host state directory.
 Context artifact commands show the project-owned view and list total bytes:
 
 ```bash
@@ -222,9 +226,9 @@ Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI
 execution to WSL2 through `wsl.exe`. Set `runtime.wsl_distro` in the project
 config; rmtx uses that distro and auto-installs it if missing.
-The private imported rmtx WSL distro and WSL ext4 workspace storage are still
-deferred, so Windows OCI runs use paths bridged from Windows into WSL and may be
-slower than native WSL ext4 storage.
+Windows OCI runtime storage uses that distro's Linux filesystem by default, so
+commands avoid `/mnt/c` hot paths. If a context changes WSL distro, rmtx drops
+the old runtime data for that context and syncs into the new distro.
 
 `gpu=nvidia` requires NVIDIA/WSL GPU devices and fails clearly when unavailable.
 Linux binds `/dev/nvidia*`, NVIDIA driver libraries discovered through

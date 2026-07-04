@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -73,10 +74,14 @@ type Options struct {
 	Logger           *log.Logger
 }
 
+type runtimeStorage struct {
+	root      string
+	blobStore *syncfs.BlobStore
+}
+
 type Server struct {
 	opts        Options
 	listener    net.Listener
-	blobStore   *syncfs.BlobStore
 	logger      *log.Logger
 	logHub      *hostLogHub
 	advertiser  *discovery.Responder
@@ -119,11 +124,6 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("create context dir: %w", err)
 	}
 
-	store := syncfs.NewBlobStore(filepath.Join(opts.StateDir, "blobs"))
-	if err := store.Ensure(); err != nil {
-		return nil, fmt.Errorf("prepare blob store: %w", err)
-	}
-
 	serverName := strings.TrimSpace(opts.AdvertiseName)
 	if serverName == "" {
 		if hostName, err := os.Hostname(); err == nil && strings.TrimSpace(hostName) != "" {
@@ -146,11 +146,8 @@ func New(opts Options) (*Server, error) {
 	logHub := newHostLogHub(opts.Logger.Writer())
 	logger := log.New(logHub, opts.Logger.Prefix(), opts.Logger.Flags())
 
-	cleanupStartupCaches(context.Background(), opts.StateDir, logger)
-
-	return &Server{
+	server := &Server{
 		opts:           opts,
-		blobStore:      store,
 		logger:         logger,
 		logHub:         logHub,
 		tlsConfig:      tlsConfig,
@@ -160,22 +157,27 @@ func New(opts Options) (*Server, error) {
 		activeContexts: map[string]int{},
 		blobTransfers:  map[string]*blobTransferSession{},
 		updateRunner:   defaultUpdateRunner,
-	}, nil
+	}
+	server.cleanupStartupCaches(context.Background())
+
+	return server, nil
 }
 
-func cleanupStartupCaches(ctx context.Context, stateDir string, logger *log.Logger) {
-	updates, err := pruneOldUpdateDirs(stateDir)
-	logCleanupResult(logger, "update", "dirs", updates, err)
+func (s *Server) cleanupStartupCaches(ctx context.Context) {
+	updates, err := pruneOldUpdateDirs(s.opts.StateDir)
+	logCleanupResult(s.logger, "update", "dirs", updates, err)
 
-	temps, err := pruneStartupTempFiles(stateDir)
-	logCleanupResult(logger, "temp", "files", temps, err)
+	for _, root := range s.runtimeStateRootsOrDefault() {
+		temps, err := pruneStartupTempFiles(root)
+		logCleanupResult(s.logger, "temp", "files", temps, err)
+	}
 
 	// WSL can stall while distros initialize or update; startup cleanup is best-effort.
 	cleanupCtx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
 	defer cancel()
 
-	removed, _, err := pruneWSLStagedRootFS(cleanupCtx, stateDir)
-	logArtifactCleanupResult(logger, "WSL rootfs", "dirs", removed, err)
+	removed, _, err := s.pruneWSLStagedRootFS(cleanupCtx)
+	logArtifactCleanupResult(s.logger, "WSL rootfs", "dirs", removed, err)
 }
 
 func logCleanupResult(logger *log.Logger, name string, unit string, removed []string, err error) {
@@ -235,6 +237,80 @@ func defaultStateDir() string {
 	}
 
 	return filepath.Join(home, ".local", "state", "rmtx")
+}
+
+func (s *Server) runtimeStorage(
+	ctx context.Context,
+	runtime protocol.RuntimeSpec,
+	runLogs *hostLogSubscription,
+) (runtimeStorage, error) {
+	root, err := s.platformRuntimeStateDir(ctx, runtime, runLogs)
+	if err != nil {
+		return runtimeStorage{}, err
+	}
+	root = filepath.Clean(root)
+
+	if err := os.MkdirAll(filepath.Join(root, contextDirName), defaultDirMode); err != nil {
+		return runtimeStorage{}, fmt.Errorf("create runtime context dir: %w", err)
+	}
+
+	store := syncfs.NewBlobStore(filepath.Join(root, "blobs"))
+	if err := store.Ensure(); err != nil {
+		return runtimeStorage{}, fmt.Errorf("prepare blob store: %w", err)
+	}
+
+	return runtimeStorage{root: root, blobStore: store}, nil
+}
+
+func (s *Server) defaultRuntimeStorage() (runtimeStorage, error) {
+	return s.runtimeStorage(context.Background(), protocol.RuntimeSpec{}, nil)
+}
+
+func (s *Server) runtimeStateRootsOrDefault() []string {
+	roots, err := s.runtimeStateRoots()
+	if err != nil || len(roots) == 0 {
+		return []string{s.opts.StateDir}
+	}
+
+	return roots
+}
+
+func (s *Server) runtimeStateRoots() ([]string, error) {
+	roots := map[string]struct{}{filepath.Clean(s.opts.StateDir): {}}
+
+	entries, err := os.ReadDir(s.contextsRoot())
+	if errors.Is(err, os.ErrNotExist) {
+		return sortedMapKeys(roots), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list context metadata roots: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		meta, err := loadContextMetadata(filepath.Join(s.contextsRoot(), entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+
+		roots[filepath.Clean(contextDataRoot(meta, s.opts.StateDir))] = struct{}{}
+	}
+
+	return sortedMapKeys(roots), nil
+}
+
+func sortedMapKeys(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 func (s *Server) Addr() string {
@@ -583,7 +659,12 @@ func (s *Server) handleRunRequest(
 	release := s.acquireContext(request.ContextID)
 	defer release()
 
-	handle, err := s.ensureContext(request.ContextID, request.ContextName, request.RootHint)
+	storage, err := s.runtimeStorage(parent, request.Runtime, runLogs)
+	if err != nil {
+		return err
+	}
+
+	handle, err := s.ensureContext(request.ContextID, request.ContextName, request.RootHint, storage)
 	if err != nil {
 		return err
 	}
@@ -662,7 +743,7 @@ func (s *Server) syncClientManifestAndSave(
 
 	if s.workspaceWasCleaned(request.ContextID) {
 		// Cleanup marker may mean cleanup completed or was interrupted.
-		if err := removeContextSetupCache(handle.dir); err != nil {
+		if err := removeContextSetupCache(handle.dataDir); err != nil {
 			return err
 		}
 
@@ -679,6 +760,7 @@ func (s *Server) syncClientManifestAndSave(
 		request.ContextID,
 		request.Session,
 		handle.workspace,
+		handle.storage.blobStore,
 		currentManifest,
 		request.Manifest,
 		runLogs,
@@ -960,6 +1042,7 @@ func (s *Server) executeAndSyncRun(
 		request.ContextID,
 		request.Session,
 		handle.workspace,
+		handle.storage.blobStore,
 		post.BlobSources,
 		request.Manifest,
 		postEntries,
@@ -976,7 +1059,7 @@ func (s *Server) executeAndSyncRun(
 	s.pruneUnreferencedBlobsAfterRunSave(request, "post-run", runLogs)
 
 	handle.meta.UpdatedAt = time.Now().UTC()
-	if err := saveContextMetadata(handle.dir, handle.meta); err != nil {
+	if err := saveContextMetadata(handle.metaDir, handle.meta); err != nil {
 		return err
 	}
 
@@ -1146,6 +1229,7 @@ func (s *Server) sendWorkspaceChanges(
 	contextID string,
 	session string,
 	workspace string,
+	store *syncfs.BlobStore,
 	blobSources map[string]string,
 	before []syncfs.Entry,
 	after []syncfs.Entry,
@@ -1188,7 +1272,7 @@ func (s *Server) sendWorkspaceChanges(
 		return err
 	}
 
-	if err := s.storeChangedFileBlobs(workspace, blobSources, changed); err != nil {
+	if err := s.storeChangedFileBlobs(workspace, store, blobSources, changed); err != nil {
 		return err
 	}
 
@@ -1396,6 +1480,7 @@ func prepareDownloadBlobItems(
 
 func (s *Server) storeChangedFileBlobs(
 	workspace string,
+	store *syncfs.BlobStore,
 	blobSources map[string]string,
 	changed []syncfs.Entry,
 ) error {
@@ -1412,7 +1497,7 @@ func (s *Server) storeChangedFileBlobs(
 		if source == "" {
 			source = filepath.Join(workspace, filepath.FromSlash(entry.Path))
 		}
-		if err := s.blobStore.StorePath(entry.Hash, entry.Size, source); err != nil {
+		if err := store.StorePath(entry.Hash, entry.Size, source); err != nil {
 			return fmt.Errorf("store changed blob %s: %w", entry.Path, err)
 		}
 		stored[entry.Hash] = struct{}{}

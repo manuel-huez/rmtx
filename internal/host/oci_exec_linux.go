@@ -73,6 +73,6 @@ func (s *Server) platformOCIChildCommand(
 	return cmd, cleanupTempFile(specFile.Name()), nil
 }
 
-func pruneWSLStagedRootFS(context.Context, string) ([]protocol.ContextArtifact, int64, error) {
+func pruneWSLStagedRootFS(context.Context, []string) ([]protocol.ContextArtifact, int64, error) {
 	return nil, 0, nil
 }

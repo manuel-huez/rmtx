@@ -3,6 +3,7 @@
 package host
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -126,6 +127,41 @@ func TestWSLPruneRootFSScriptDeletesNonLiveRoots(t *testing.T) {
 	}
 	if strings.Contains(script, "\"$root\"/*.tmp.*") {
 		t.Fatalf("prune script should not target active staging temps:\n%s", script)
+	}
+}
+
+func TestAddLiveWSLStagedRootFSSkipsNativeUNCPathAcrossDistros(t *testing.T) {
+	live := map[string]map[string]bool{}
+	err := addLiveWSLStagedRootFS(
+		context.Background(),
+		[]string{"Debian", "Ubuntu"},
+		`\\wsl.localhost\Ubuntu\home\me\.local\state\rmtx\contexts\ctx\runtime\rootfs\key`,
+		live,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("native WSL rootfs should not be staged: %#v", live)
+	}
+}
+
+func TestAddLiveWSLStagedRootFSKeepsUNCPathInOwningDistro(t *testing.T) {
+	live := map[string]map[string]bool{}
+	err := addLiveWSLStagedRootFS(
+		context.Background(),
+		[]string{"Debian", "Ubuntu"},
+		`\\wsl.localhost\Ubuntu\mnt\c\rmtx\rootfs`,
+		live,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || len(live["Ubuntu"]) != 1 {
+		t.Fatalf("live staged rootfs should belong only to Ubuntu: %#v", live)
+	}
+	if _, ok := live["Debian"]; ok {
+		t.Fatalf("live staged rootfs leaked to Debian: %#v", live)
 	}
 }
 

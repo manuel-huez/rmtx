@@ -164,7 +164,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	store := s.ociStore()
+	store := ociStore(runtimeRootForContextDataDir(handle.dataDir))
 	if err := store.Ensure(); err != nil {
 		return preparedRuntime{}, err
 	}
@@ -175,7 +175,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 	}
 
 	key := runtimeCacheKey(image.ManifestDigest, request.Runtime)
-	rootfs := filepath.Join(handle.dir, runtimeDirName, runtimeRootFSDirName, key)
+	rootfs := filepath.Join(handle.dataDir, runtimeDirName, runtimeRootFSDirName, key)
 
 	setupMarker := filepath.Join(rootfs, runtimeSetupMarker)
 	if _, err := os.Stat(setupMarker); errors.Is(err, os.ErrNotExist) {
@@ -224,11 +224,11 @@ func (s *Server) prepareOCIRuntimeLocked(
 		}
 	}
 
-	if err := s.ensureOCIVolumes(handle.dir, request.Runtime.Volumes); err != nil {
+	if err := s.ensureOCIVolumes(handle.dataDir, request.Runtime.Volumes); err != nil {
 		return preparedRuntime{}, err
 	}
 
-	if err := savePreparedRuntimeState(handle.dir, image, key, rootfs); err != nil {
+	if err := savePreparedRuntimeState(handle.dataDir, image, key, rootfs); err != nil {
 		return preparedRuntime{}, err
 	}
 
@@ -417,7 +417,7 @@ func (s *Server) prepareOCIContextSetup(
 	}
 
 	handle := contextHandle{
-		dir:       filepath.Join(s.contextsRoot(), request.ContextID),
+		dataDir:   filepath.Dir(workspace),
 		workspace: workspace,
 	}
 	prepared, err := s.ensurePreparedOCIRuntime(
@@ -437,8 +437,7 @@ func (s *Server) prepareOCIContextSetup(
 	}
 
 	statePath := filepath.Join(
-		s.contextsRoot(),
-		request.ContextID,
+		handle.dataDir,
 		runtimeDirName,
 		contextSetupFile,
 	)
@@ -552,7 +551,7 @@ func (s *Server) newOCICommand(
 	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	handle := contextHandle{
-		dir:       filepath.Join(s.contextsRoot(), request.ContextID),
+		dataDir:   filepath.Dir(workspace),
 		workspace: workspace,
 	}
 
@@ -575,7 +574,7 @@ func (s *Server) newOCICommand(
 	}
 	for _, volume := range request.Runtime.Volumes {
 		binds = append(binds, ociBind{
-			Source: filepath.Join(handle.dir, "volumes", volume.Name),
+			Source: filepath.Join(handle.dataDir, "volumes", volume.Name),
 			Target: volume.Target,
 		})
 	}
@@ -598,7 +597,7 @@ func (s *Server) newOCICommand(
 		WSLDistro: request.Runtime.WSLDistro,
 	}
 
-	return s.ociChildCommand(ctx, spec, handle.dir, runLogs)
+	return s.ociChildCommand(ctx, spec, handle.dataDir, runLogs)
 }
 
 func finishCommandWithCleanup(code int, runErr error, cleanup commandCleanup) (int, error) {
@@ -679,8 +678,8 @@ func ociWorkspaceTargets(workspace, workdir, configuredWorkdir string) (string, 
 	return runtimeWorkspace, runtimeCommandWorkdir
 }
 
-func (s *Server) ociStore() *oci.Store {
-	return oci.NewStore(filepath.Join(s.opts.StateDir, "cache", "oci"))
+func ociStore(runtimeRoot string) *oci.Store {
+	return oci.NewStore(filepath.Join(runtimeRoot, "cache", "oci"))
 }
 
 func runtimeCacheKey(manifestDigest string, runtimeSpec protocol.RuntimeSpec) string {

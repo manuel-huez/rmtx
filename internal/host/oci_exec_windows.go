@@ -17,6 +17,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"golang.org/x/sys/windows/registry"
 )
@@ -141,7 +142,7 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 	}
 
 	spec.RootFS = rootfs
-	if rootfsID != "" {
+	if rootfsID != "" && wslRootFSNeedsStage(rootfs) {
 		spec.RootFSID = rootfsID
 		spec.StagedRootFS = wslStagedRootFSPath(rootfs)
 	}
@@ -176,8 +177,15 @@ func wslStagedRootFSPath(rootfs string) string {
 	return "/var/lib/rmtx/rootfs/" + hex.EncodeToString(sum[:])
 }
 
-func pruneWSLStagedRootFS(ctx context.Context, stateDir string) ([]protocol.ContextArtifact, int64, error) {
-	live, err := liveWSLStagedRootFS(ctx, stateDir)
+func wslRootFSNeedsStage(rootfs string) bool {
+	return strings.HasPrefix(rootfs, "/mnt/")
+}
+
+func pruneWSLStagedRootFS(
+	ctx context.Context,
+	contextDataDirs []string,
+) ([]protocol.ContextArtifact, int64, error) {
+	live, err := liveWSLStagedRootFS(ctx, contextDataDirs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -200,28 +208,17 @@ func pruneWSLStagedRootFS(ctx context.Context, stateDir string) ([]protocol.Cont
 	return deleted, 0, nil
 }
 
-func liveWSLStagedRootFS(ctx context.Context, stateDir string) (map[string]map[string]bool, error) {
+func liveWSLStagedRootFS(
+	ctx context.Context,
+	contextDataDirs []string,
+) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	distros, err := wslInstalledDistros()
 	if err != nil {
 		return nil, err
 	}
 
-	contextRoot := filepath.Join(stateDir, contextDirName)
-	contexts, err := os.ReadDir(contextRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return out, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	for _, contextEntry := range contexts {
-		if !contextEntry.IsDir() {
-			continue
-		}
-
-		contextDir := filepath.Join(contextRoot, contextEntry.Name())
+	for _, contextDir := range contextDataDirs {
 		state, err := loadArtifactState(
 			filepath.Join(contextDir, runtimeDirName, artifactStateFile),
 		)
@@ -236,7 +233,7 @@ func liveWSLStagedRootFS(ctx context.Context, stateDir string) (map[string]map[s
 				if readErr != nil {
 					return nil, fmt.Errorf(
 						"list context rootfs for WSL prune context %s: %w",
-						contextEntry.Name(),
+						filepath.Base(contextDir),
 						readErr,
 					)
 				}
@@ -256,27 +253,56 @@ func liveWSLStagedRootFS(ctx context.Context, stateDir string) (map[string]map[s
 
 			return nil, fmt.Errorf(
 				"read artifact state for WSL prune context %s: %w",
-				contextEntry.Name(),
+				filepath.Base(contextDir),
 				err,
 			)
 		}
 
 		for _, prepared := range state.Prepared {
-			for _, distro := range distros {
-				rootfs, err := windowsPathToWSL(ctx, distro, prepared.Path)
-				if err != nil {
-					return nil, err
-				}
-
-				if out[distro] == nil {
-					out[distro] = map[string]bool{}
-				}
-				out[distro][wslStagedRootFSPath(rootfs)] = true
+			if err := addLiveWSLStagedRootFS(ctx, distros, prepared.Path, out); err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	return out, nil
+}
+
+func addLiveWSLStagedRootFS(
+	ctx context.Context,
+	distros []string,
+	preparedPath string,
+	out map[string]map[string]bool,
+) error {
+	if parsed, ok, err := pathutil.ParseWSLUNCPath(preparedPath); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		if wslRootFSNeedsStage(parsed.LinuxPath) {
+			if out[parsed.Distro] == nil {
+				out[parsed.Distro] = map[string]bool{}
+			}
+			out[parsed.Distro][wslStagedRootFSPath(parsed.LinuxPath)] = true
+		}
+
+		return nil
+	}
+
+	for _, distro := range distros {
+		rootfs, err := windowsPathToWSL(ctx, distro, preparedPath)
+		if err != nil {
+			return err
+		}
+
+		if wslRootFSNeedsStage(rootfs) {
+			if out[distro] == nil {
+				out[distro] = map[string]bool{}
+			}
+			out[distro][wslStagedRootFSPath(rootfs)] = true
+		}
+	}
+
+	return nil
 }
 
 func pruneWSLStagedRootFSInDistro(
@@ -344,11 +370,25 @@ func windowsPathToWSL(ctx context.Context, distro string, path string) (string, 
 		return "/mnt/" + string(drive) + "/" + strings.TrimPrefix(rest, "/"), nil
 	}
 
-	if strings.HasPrefix(trimmed, `\\`) {
-		return trimmed, nil
-	}
+	if strings.HasPrefix(trimmed, `\\`) || strings.HasPrefix(trimmed, `//`) {
+		if parsed, ok, err := pathutil.ParseWSLUNCPath(trimmed); ok || err != nil {
+			if err != nil {
+				return "", err
+			}
+			if !strings.EqualFold(parsed.Distro, strings.TrimSpace(distro)) {
+				return "", fmt.Errorf(
+					"WSL UNC path %q belongs to distro %q, not %q",
+					trimmed,
+					parsed.Distro,
+					distro,
+				)
+			}
 
-	if strings.HasPrefix(trimmed, `//`) {
+			return parsed.LinuxPath, nil
+		}
+		if strings.HasPrefix(trimmed, `\\`) {
+			return trimmed, nil
+		}
 		return filepath.ToSlash(trimmed), nil
 	}
 

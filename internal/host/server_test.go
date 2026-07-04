@@ -375,9 +375,10 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storage := defaultTestStorage(t, s)
 
 	hash := "aa-live"
-	if err := s.blobStore.Store(hash, 4, bytes.NewReader([]byte("live"))); err != nil {
+	if err := storage.blobStore.Store(hash, 4, bytes.NewReader([]byte("live"))); err != nil {
 		t.Fatal(err)
 	}
 	manifest := []syncfs.Entry{{
@@ -408,7 +409,12 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 				Session:   "session",
 				Manifest:  manifest,
 			},
-			contextHandle{dir: contextDir, workspace: workspace},
+			contextHandle{
+				metaDir:   contextDir,
+				dataDir:   contextDir,
+				storage:   storage,
+				workspace: workspace,
+			},
 			nil,
 		)
 	}()
@@ -459,7 +465,7 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := s.ociStore()
+	store := ociStore(stateDir)
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
 	}
@@ -529,13 +535,14 @@ func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storage := defaultTestStorage(t, s)
 
 	liveHash := "aa-live"
 	staleHash := "bb-stale"
-	if err := s.blobStore.Store(liveHash, 4, bytes.NewReader([]byte("live"))); err != nil {
+	if err := storage.blobStore.Store(liveHash, 4, bytes.NewReader([]byte("live"))); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.blobStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
+	if err := storage.blobStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.saveTrackedManifest("ctx", []syncfs.Entry{{
@@ -558,8 +565,134 @@ func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	if bytesDeleted != 5 {
 		t.Fatalf("deleted bytes=%d want 5", bytesDeleted)
 	}
-	assertPathExists(t, s.blobStore.Path(liveHash))
-	assertPathMissing(t, s.blobStore.Path(staleHash))
+	assertPathExists(t, storage.blobStore.Path(liveHash))
+	assertPathMissing(t, storage.blobStore.Path(staleHash))
+}
+
+func TestEnsureContextReplacesOldRuntimeDataRoot(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeRoot := t.TempDir()
+	s, err := New(Options{
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contextID := "ctx"
+	metaDir := s.contextMetaDir(contextID)
+	oldWorkspace := filepath.Join(metaDir, contextWorkspaceDir)
+	oldVolume := filepath.Join(metaDir, "volumes", "cache")
+	oldRuntime := filepath.Join(metaDir, runtimeDirName)
+	newPartialFile := filepath.Join(
+		runtimeRoot,
+		contextDirName,
+		contextID,
+		contextWorkspaceDir,
+		"stale.txt",
+	)
+	for _, path := range []string{oldWorkspace, oldVolume, oldRuntime, filepath.Dir(newPartialFile)} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(newPartialFile, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveContextMetadata(metaDir, contextMetadata{
+		ID:       contextID,
+		Name:     "ctx",
+		DataRoot: stateDir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveTrackedManifest(contextID, []syncfs.Entry{{
+		Path: "stale.txt",
+		Kind: syncfs.KindFile,
+		Hash: "aa-stale",
+		Size: 5,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markWorkspaceCleaned(contextID); err != nil {
+		t.Fatal(err)
+	}
+
+	store := syncfs.NewBlobStore(filepath.Join(runtimeRoot, "blobs"))
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := s.ensureContext(contextID, "ctx", "", runtimeStorage{
+		root:      runtimeRoot,
+		blobStore: store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertPathMissing(t, oldWorkspace)
+	assertPathMissing(t, oldVolume)
+	assertPathMissing(t, oldRuntime)
+	assertPathMissing(t, newPartialFile)
+	assertPathMissing(t, filepath.Join(metaDir, contextManifestFile))
+	assertPathMissing(t, filepath.Join(metaDir, contextCleanFile))
+	assertPathExists(t, handle.workspace)
+	if handle.dataDir != filepath.Join(runtimeRoot, contextDirName, contextID) {
+		t.Fatalf("dataDir=%s want runtime root context dir", handle.dataDir)
+	}
+	if handle.meta.DataRoot != runtimeRoot {
+		t.Fatalf("DataRoot=%s want %s", handle.meta.DataRoot, runtimeRoot)
+	}
+	assertPathExists(t, filepath.Join(metaDir, contextMetaFile))
+}
+
+func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeRoot := t.TempDir()
+	s, err := New(Options{
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash := "aa-live"
+	defaultStorage := defaultTestStorage(t, s)
+	runtimeStore := syncfs.NewBlobStore(filepath.Join(runtimeRoot, "blobs"))
+	if err := runtimeStore.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, store := range []*syncfs.BlobStore{defaultStorage.blobStore, runtimeStore} {
+		if err := store.Store(hash, 4, bytes.NewReader([]byte("live"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveContextMetadata(s.contextMetaDir("ctx"), contextMetadata{
+		ID:       "ctx",
+		Name:     "ctx",
+		DataRoot: runtimeRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveTrackedManifest("ctx", []syncfs.Entry{{
+		Path: "live.txt",
+		Kind: syncfs.KindFile,
+		Hash: hash,
+		Size: 4,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := s.pruneUnreferencedBlobs(); err != nil {
+		t.Fatal(err)
+	}
+
+	assertPathMissing(t, defaultStorage.blobStore.Path(hash))
+	assertPathExists(t, runtimeStore.Path(hash))
 }
 
 func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
@@ -572,13 +705,14 @@ func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storage := defaultTestStorage(t, s)
 
 	deletedHash := "aa-deleted"
 	keptHash := "bb-kept"
-	if err := s.blobStore.Store(deletedHash, 7, bytes.NewReader([]byte("deleted"))); err != nil {
+	if err := storage.blobStore.Store(deletedHash, 7, bytes.NewReader([]byte("deleted"))); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.blobStore.Store(keptHash, 4, bytes.NewReader([]byte("kept"))); err != nil {
+	if err := storage.blobStore.Store(keptHash, 4, bytes.NewReader([]byte("kept"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.saveTrackedManifest("delete-me", []syncfs.Entry{{
@@ -609,8 +743,8 @@ func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
 		t.Fatalf("unexpected delete result: %#v", result.Deleted)
 	}
 
-	assertPathMissing(t, s.blobStore.Path(deletedHash))
-	assertPathExists(t, s.blobStore.Path(keptHash))
+	assertPathMissing(t, storage.blobStore.Path(deletedHash))
+	assertPathExists(t, storage.blobStore.Path(keptHash))
 }
 
 func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
@@ -623,9 +757,10 @@ func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storage := defaultTestStorage(t, s)
 
 	sharedHash := "aa-shared"
-	if err := s.blobStore.Store(sharedHash, 6, bytes.NewReader([]byte("shared"))); err != nil {
+	if err := storage.blobStore.Store(sharedHash, 6, bytes.NewReader([]byte("shared"))); err != nil {
 		t.Fatal(err)
 	}
 	for _, contextID := range []string{"delete-me", "keep-me"} {
@@ -646,7 +781,7 @@ func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertPathExists(t, s.blobStore.Path(sharedHash))
+	assertPathExists(t, storage.blobStore.Path(sharedHash))
 }
 
 func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
@@ -659,9 +794,10 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storage := defaultTestStorage(t, s)
 
 	staleHash := "aa-stale"
-	if err := s.blobStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
+	if err := storage.blobStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -683,7 +819,7 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	if !found {
 		t.Fatalf("cache prune did not report stale blob: %#v", deleted)
 	}
-	assertPathMissing(t, s.blobStore.Path(staleHash))
+	assertPathMissing(t, storage.blobStore.Path(staleHash))
 }
 
 func TestPruneStartupTempFilesKeepsVolumeAndRootFSTemps(t *testing.T) {
@@ -1062,6 +1198,17 @@ func mustOCIReference(t *testing.T, ref string) oci.Reference {
 	}
 
 	return parsed
+}
+
+func defaultTestStorage(t *testing.T, s *Server) runtimeStorage {
+	t.Helper()
+
+	storage, err := s.defaultRuntimeStorage()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return storage
 }
 
 func assertPathExists(t *testing.T, path string) {

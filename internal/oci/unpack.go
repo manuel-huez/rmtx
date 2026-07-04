@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 const rootfsMarker = ".rmtx-rootfs-ready"
@@ -173,7 +175,7 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 		}
 
 		_ = os.RemoveAll(target)
-		if err := os.Symlink(hdr.Linkname, target); err != nil {
+		if err := pathutil.Symlink(hdr.Linkname, target); err != nil {
 			if isUnsupportedWindowsSymlink(err) {
 				return nil
 			}
@@ -193,7 +195,7 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 		}
 
 		_ = os.RemoveAll(target)
-		return os.Link(linkTarget, target)
+		return pathutil.Link(linkTarget, target)
 	default:
 		return nil
 	}
