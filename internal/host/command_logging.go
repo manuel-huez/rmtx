@@ -130,17 +130,60 @@ func runCommandWithLiveOutput(
 		return output.Bytes(), err
 	}
 
+	stopProgress := startRunLogProgress(stderrLive, progressEvery, "%s still running", prefix)
 	if err := cmd.Wait(); err != nil {
+		stopProgress()
 		stdout.Flush()
 		stderr.Flush()
 
 		return output.Bytes(), err
 	}
 
+	stopProgress()
+
 	stdout.Flush()
 	stderr.Flush()
 
 	return output.Bytes(), nil
+}
+
+func startRunLogProgress(
+	w io.Writer,
+	interval time.Duration,
+	format string,
+	args ...any,
+) func() {
+	if w == nil || interval <= 0 {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	var stopOnce sync.Once
+
+	go func() {
+		defer close(stopped)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				writeRunLogLine(w, format, args...)
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
 }
 
 func writeRunLogLine(w io.Writer, format string, args ...any) {

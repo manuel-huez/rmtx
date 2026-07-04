@@ -131,20 +131,25 @@ func (s *Server) contextIsActive(id string) bool {
 	return s.activeContexts[id] > 0
 }
 
-func (s *Server) acquireWorkspaceLease(contextID, leaseID string) func() {
+func (s *Server) acquireWorkspaceLease(contextID, leaseID string) (func(), error) {
 	if strings.TrimSpace(leaseID) == "" {
-		return func() {}
+		return func() {}, nil
 	}
 
 	key := workspaceLeaseActiveKey(contextID, leaseID)
 
 	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+
+	if s.deletingLeases[key] {
+		return nil, fmt.Errorf("workspace lease %s is being deleted", leaseID)
+	}
+
 	if s.activeLeases == nil {
 		s.activeLeases = map[string]int{}
 	}
 
 	s.activeLeases[key]++
-	s.activeMu.Unlock()
 
 	return func() {
 		s.activeMu.Lock()
@@ -154,7 +159,7 @@ func (s *Server) acquireWorkspaceLease(contextID, leaseID string) func() {
 			s.activeLeases[key]--
 		}
 		s.activeMu.Unlock()
-	}
+	}, nil
 }
 
 func (s *Server) workspaceLeaseIsActive(contextID, leaseID string) bool {
@@ -166,6 +171,33 @@ func (s *Server) workspaceLeaseIsActive(contextID, leaseID string) bool {
 
 func workspaceLeaseActiveKey(contextID, leaseID string) string {
 	return contextID + "\x00" + leaseID
+}
+
+func (s *Server) beginWorkspaceLeaseDelete(contextID, leaseID string) (func(), error) {
+	key := workspaceLeaseActiveKey(contextID, leaseID)
+
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+
+	if s.activeLeases[key] > 0 {
+		return nil, fmt.Errorf("workspace lease %s is active", leaseID)
+	}
+
+	if s.deletingLeases == nil {
+		s.deletingLeases = map[string]bool{}
+	}
+
+	if s.deletingLeases[key] {
+		return nil, fmt.Errorf("workspace lease %s is being deleted", leaseID)
+	}
+
+	s.deletingLeases[key] = true
+
+	return func() {
+		s.activeMu.Lock()
+		delete(s.deletingLeases, key)
+		s.activeMu.Unlock()
+	}, nil
 }
 
 func (s *Server) ensureContext(

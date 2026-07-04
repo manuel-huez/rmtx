@@ -103,6 +103,7 @@ type Server struct {
 	activeMu        sync.Mutex
 	activeContexts  map[string]int
 	activeLeases    map[string]int
+	deletingLeases  map[string]bool
 	blobTransfersMu sync.Mutex
 	blobTransfers   map[string]*blobTransferSession
 	// Hold during pre-run sync so blob GC cannot remove hashes before manifest commit.
@@ -158,6 +159,7 @@ func New(opts Options) (*Server, error) {
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
 		activeLeases:   map[string]int{},
+		deletingLeases: map[string]bool{},
 		blobTransfers:  map[string]*blobTransferSession{},
 		updateRunner:   defaultUpdateRunner,
 	}
@@ -724,8 +726,7 @@ func (s *Server) handleRunRequest(
 	handle.workspace = runWorkspace.workspace
 
 	if runWorkspace.lease != nil {
-		releaseLease := s.acquireWorkspaceLease(request.ContextID, runWorkspace.lease.state.ID)
-		defer releaseLease()
+		defer runWorkspace.lease.releaseActive()
 	}
 
 	runtimePrep, hasPreparedRuntime, err := s.prepareRuntimeBeforeSync(

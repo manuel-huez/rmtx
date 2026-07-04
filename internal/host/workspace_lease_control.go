@@ -17,9 +17,6 @@ func (s *Server) handleWorkspaceLeases(
 		return err
 	}
 
-	release := s.acquireContext(contextID)
-	defer release()
-
 	contextDir, err := s.contextDataDir(contextID)
 	if err != nil {
 		return err

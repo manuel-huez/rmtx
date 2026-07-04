@@ -702,6 +702,38 @@ func TestRunExecWorkspaceLeaseRestoresNonSyncBackInputs(t *testing.T) {
 	}
 }
 
+func TestRunExecWorkspaceLeaseReusesAfterCommandFailure(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	lease := startWorkspaceLeaseE2E(t, "lease-failed-command-context", "")
+	defer lease.stop(t, "lease-failed-command-host")
+
+	_, firstErr, code := lease.run(
+		t,
+		`mkdir -p cache; echo failed > cache/marker; exit 7`,
+		time.Hour,
+		"",
+	)
+	if code != 7 {
+		t.Fatalf("first run exit code=%d stderr=%s", code, firstErr)
+	}
+
+	leaseID := parseWorkspaceLeaseID(t, firstErr)
+
+	requireWorkspaceLeaseClean(t, lease, leaseID)
+
+	reusedOut, reusedErr, code := lease.run(t, `cat cache/marker`, 0, leaseID)
+	if code != 0 {
+		t.Fatalf("reuse run exit code=%d stderr=%s", code, reusedErr)
+	}
+
+	if reusedOut != "failed\n" {
+		t.Fatalf("reuse stdout=%q want failed", reusedOut)
+	}
+}
+
 type workspaceLeaseE2E struct {
 	cancel     context.CancelFunc
 	errCh      chan error

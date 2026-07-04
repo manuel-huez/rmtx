@@ -2,6 +2,9 @@ package host
 
 import (
 	"errors"
+	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,7 +88,11 @@ func TestPruneExpiredWorkspaceLeasesSkipsActiveLease(t *testing.T) {
 	}
 
 	server := &Server{}
-	release := server.acquireWorkspaceLease(testContextID, state.ID)
+
+	release, err := server.acquireWorkspaceLease(testContextID, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	defer release()
 
@@ -103,6 +110,98 @@ func TestPruneExpiredWorkspaceLeasesSkipsActiveLease(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("active expired lease missing: %v", err)
+	}
+}
+
+func TestHandleWorkspaceLeasesListDoesNotWaitForContextLock(t *testing.T) {
+	server := newWorkspaceLeaseTestServer(t)
+	contextDir := saveWorkspaceLeaseTestContext(t, server)
+	now := time.Now().UTC()
+
+	state := workspaceLeaseState{
+		ID:        "ws_list",
+		ContextID: testContextID,
+		CreatedAt: now,
+		UpdatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := saveWorkspaceLease(contextDir, state); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseContext := server.acquireContext(testContextID)
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.handleWorkspaceLeases(
+			protocol.NewConn(serverConn),
+			protocol.WorkspaceLeasesRequest{ContextID: testContextID},
+			nil,
+		)
+	}()
+
+	client := protocol.NewConn(clientConn)
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := client.ReadHeader()
+
+	releaseContext()
+
+	if err != nil {
+		t.Fatalf("workspace lease list blocked on context lock: %v", err)
+	}
+
+	resp, err := protocol.DecodeData[protocol.WorkspaceLeasesResponse](head)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(resp.Workspaces) != 1 || resp.Workspaces[0].ID != state.ID {
+		t.Fatalf("unexpected workspaces: %#v", resp.Workspaces)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteWorkspaceLeasesRejectsActiveLease(t *testing.T) {
+	contextDir := t.TempDir()
+	now := time.Now().UTC()
+
+	state := workspaceLeaseState{
+		ID:        "ws_active_delete",
+		ContextID: testContextID,
+		CreatedAt: now,
+		UpdatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := saveWorkspaceLease(contextDir, state); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{}
+
+	release, err := server.acquireWorkspaceLease(testContextID, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer release()
+
+	_, _, err = server.deleteWorkspaceLeases(testContextID, contextDir, []string{state.ID})
+	if err == nil || !strings.Contains(err.Error(), "is active") {
+		t.Fatalf("delete active lease err=%v, want active error", err)
+	}
+
+	if _, err := os.Stat(workspaceLeaseDir(contextDir, state.ID)); err != nil {
+		t.Fatalf("active lease should still exist: %v", err)
 	}
 }
 
@@ -205,4 +304,39 @@ func TestFinalizeWorkspaceLeaseExtendsTTLFromFinish(t *testing.T) {
 	if loaded.Dirty {
 		t.Fatalf("lease should be clean: %#v", loaded)
 	}
+}
+
+func newWorkspaceLeaseTestServer(t *testing.T) *Server {
+	t.Helper()
+
+	return &Server{
+		opts: Options{
+			StateDir: t.TempDir(),
+		},
+		logger:         log.New(io.Discard, "", 0),
+		activeContexts: map[string]int{},
+		activeLeases:   map[string]int{},
+		deletingLeases: map[string]bool{},
+	}
+}
+
+func saveWorkspaceLeaseTestContext(t *testing.T, server *Server) string {
+	t.Helper()
+
+	now := time.Now().UTC()
+	if err := saveContextMetadata(server.contextMetaDir(testContextID), contextMetadata{
+		ID:        testContextID,
+		Name:      testContextID,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	contextDir, err := server.contextDataDir(testContextID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return contextDir
 }

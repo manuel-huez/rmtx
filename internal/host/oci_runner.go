@@ -151,6 +151,14 @@ func (s *Server) prepareOCIRuntime(
 	request protocol.RunRequest,
 	runLogs *hostLogSubscription,
 ) (preparedRuntime, error) {
+	s.logRun(
+		runLogs,
+		"waiting for OCI runtime preparation: context=%s image=%s",
+		request.ContextID,
+		request.Runtime.Image,
+	)
+	runLogs.Flush()
+
 	s.ociMu.Lock()
 	defer s.ociMu.Unlock()
 
@@ -197,10 +205,27 @@ func (s *Server) prepareOCIRuntimeLocked(
 			rootfs,
 			request.Runtime.Image,
 		)
+		runLogs.Flush()
 
-		if err := store.UnpackImageContext(ctx, rootfs, image); err != nil {
+		stopProgress := startRunLogProgress(
+			runLogs,
+			progressEvery,
+			"unpacking OCI image still running: context=%s image=%s rootfs=%s",
+			request.ContextID,
+			request.Runtime.Image,
+			rootfs,
+		)
+		err := store.UnpackImageContext(ctx, rootfs, image)
+		stopProgress()
+		if err != nil {
 			return preparedRuntime{}, err
 		}
+		s.logRun(
+			runLogs,
+			"unpacking OCI image done: context=%s image=%s",
+			request.ContextID,
+			request.Runtime.Image,
+		)
 
 		if err := writeRootFSInstanceMarker(rootfs); err != nil {
 			_ = pathutil.RemoveAll(rootfs)
@@ -406,6 +431,7 @@ func (s *Server) runImageSetupCommands(
 		if cleanupErr != nil {
 			return fmt.Errorf("clean runtime image setup spec: %w", cleanupErr)
 		}
+		s.logRun(runLogs, "runtime image setup command done: command=%q", command)
 	}
 
 	return nil
@@ -454,6 +480,12 @@ func (s *Server) prepareOCIContextSetup(
 		contextSetupFile,
 	)
 	if contextSetupCacheHit(statePath, key) {
+		s.logRun(
+			runLogs,
+			"runtime context setup cache hit: context=%s",
+			request.ContextID,
+		)
+
 		return nil
 	}
 
@@ -534,6 +566,12 @@ func (s *Server) runOCIContextSetupCommands(
 		if cleanupErr != nil {
 			return fmt.Errorf("clean runtime context setup spec: %w", cleanupErr)
 		}
+		s.logRun(
+			runLogs,
+			"runtime context setup command done: context=%s command=%q",
+			request.ContextID,
+			command,
+		)
 	}
 
 	return nil

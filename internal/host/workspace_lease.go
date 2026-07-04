@@ -58,14 +58,16 @@ type runWorkspace struct {
 }
 
 type workspaceLeaseRun struct {
-	state  workspaceLeaseState
-	reused bool
-	keep   time.Duration
+	state   workspaceLeaseState
+	reused  bool
+	keep    time.Duration
+	release func()
 }
 
 type workspaceLeasePrepare struct {
-	state  workspaceLeaseState
-	reused bool
+	state   workspaceLeaseState
+	reused  bool
+	release func()
 }
 
 func (s *Server) prepareRunWorkspace(
@@ -104,11 +106,21 @@ func (s *Server) prepareRunWorkspace(
 	return runWorkspace{
 		workspace: workspaceLeaseWorkspacePath(handle.dataDir, state.ID),
 		lease: &workspaceLeaseRun{
-			state:  state,
-			reused: prepared.reused,
-			keep:   keep,
+			state:   state,
+			reused:  prepared.reused,
+			keep:    keep,
+			release: prepared.release,
 		},
 	}, nil
+}
+
+func (r *workspaceLeaseRun) releaseActive() {
+	if r == nil || r.release == nil {
+		return
+	}
+
+	r.release()
+	r.release = nil
 }
 
 func parseWorkspaceKeepDuration(value string) (time.Duration, error) {
@@ -155,18 +167,29 @@ func (s *Server) prepareReusedWorkspaceLease(
 		return workspaceLeasePrepare{}, err
 	}
 
-	state, err := loadWorkspaceLease(handle.dataDir, id)
+	release, err := s.acquireWorkspaceLease(request.ContextID, id)
 	if err != nil {
 		return workspaceLeasePrepare{}, err
 	}
 
+	state, err := loadWorkspaceLease(handle.dataDir, id)
+	if err != nil {
+		release()
+
+		return workspaceLeasePrepare{}, err
+	}
+
 	if state.Dirty {
+		release()
+
 		return workspaceLeasePrepare{},
 			fmt.Errorf("workspace lease %s is dirty; delete it or create a new lease", id)
 	}
 
 	if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
 		_ = removeWorkspaceLease(handle.dataDir, id)
+
+		release()
 
 		return workspaceLeasePrepare{}, fmt.Errorf("workspace lease %s expired", id)
 	}
@@ -175,6 +198,8 @@ func (s *Server) prepareReusedWorkspaceLease(
 		state.Dirty = true
 		state.UpdatedAt = now
 		_ = saveWorkspaceLease(handle.dataDir, state)
+
+		release()
 
 		return workspaceLeasePrepare{},
 			fmt.Errorf("workspace lease %s workspace missing: %w", id, err)
@@ -188,8 +213,13 @@ func (s *Server) prepareReusedWorkspaceLease(
 	state.LastSession = request.Session
 	state.Dirty = true
 
-	return workspaceLeasePrepare{state: state, reused: true},
-		saveWorkspaceLease(handle.dataDir, state)
+	if err := saveWorkspaceLease(handle.dataDir, state); err != nil {
+		release()
+
+		return workspaceLeasePrepare{}, err
+	}
+
+	return workspaceLeasePrepare{state: state, reused: true, release: release}, nil
 }
 
 func (s *Server) prepareNewWorkspaceLease(
@@ -207,6 +237,11 @@ func (s *Server) prepareNewWorkspaceLease(
 		return workspaceLeasePrepare{}, err
 	}
 
+	release, err := s.acquireWorkspaceLease(request.ContextID, id)
+	if err != nil {
+		return workspaceLeasePrepare{}, err
+	}
+
 	state := workspaceLeaseState{
 		ID:          id,
 		ContextID:   request.ContextID,
@@ -217,6 +252,8 @@ func (s *Server) prepareNewWorkspaceLease(
 		LastSession: request.Session,
 	}
 	if err := saveWorkspaceLease(handle.dataDir, state); err != nil {
+		release()
+
 		return workspaceLeasePrepare{}, err
 	}
 
@@ -226,10 +263,12 @@ func (s *Server) prepareNewWorkspaceLease(
 	); err != nil {
 		_ = removeWorkspaceLease(handle.dataDir, id)
 
+		release()
+
 		return workspaceLeasePrepare{}, fmt.Errorf("create workspace lease: %w", err)
 	}
 
-	return workspaceLeasePrepare{state: state}, nil
+	return workspaceLeasePrepare{state: state, release: release}, nil
 }
 
 func newWorkspaceLeaseID(contextDir string) (string, error) {
@@ -487,8 +526,15 @@ func (s *Server) deleteWorkspaceLeases(
 			return nil, nil, err
 		}
 
+		releaseDelete, err := s.beginWorkspaceLeaseDelete(contextID, id)
+		if err != nil {
+			return nil, nil, err
+		}
+
 		state, _, loadErr := loadWorkspaceLeaseMetadata(contextDir, id)
 		if loadErr != nil {
+			releaseDelete()
+
 			if errors.Is(loadErr, errWorkspaceLeaseNotFound) {
 				_ = removeWorkspaceLease(contextDir, id)
 				notFound = append(notFound, id)
@@ -501,8 +547,12 @@ func (s *Server) deleteWorkspaceLeases(
 
 		summary := s.workspaceLeaseSummary(contextDir, contextID, state)
 		if err := removeWorkspaceLease(contextDir, id); err != nil {
+			releaseDelete()
+
 			return nil, nil, err
 		}
+
+		releaseDelete()
 
 		deleted = append(deleted, summary)
 	}
