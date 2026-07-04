@@ -23,6 +23,8 @@ import (
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
+const trueCommand = "true"
+
 func TestPrepareUploadItemsUsesRelativeDisplayPath(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "dir", "file.txt")
@@ -101,6 +103,23 @@ func TestBuildRunRequestRejectsInvalidSyncBack(t *testing.T) {
 	}
 
 	if !strings.Contains(err.Error(), "sync_back path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateExecOptionsRejectsNegativeKeepWorkspace(t *testing.T) {
+	err := validateExecOptions(&ExecOptions{
+		Address:       "127.0.0.1:33221",
+		Host:          clientstate.HostRecord{Fingerprint: "sha256:abc"},
+		Command:       []string{trueCommand},
+		ContextID:     "ctx",
+		KeepWorkspace: -time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected keep-workspace error")
+	}
+
+	if !strings.Contains(err.Error(), "keep-workspace duration must be positive") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -576,7 +595,7 @@ func TestRunHandshakeStreamsSetupOutput(t *testing.T) {
 	ready, err := runHandshake(
 		context.Background(),
 		protocol.NewConn(clientConn),
-		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{"true"}},
+		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{trueCommand}},
 		nil,
 		ExecOptions{Stderr: &stderr},
 		newRunLogger(&bytes.Buffer{}),
@@ -624,7 +643,7 @@ func TestRunHandshakeCancelAfterSyncCompleteStreamsOutputAndSendsCancel(t *testi
 	ready, stopSession, err := runHandshakeWithLiveness(
 		ctx,
 		protocol.NewConn(clientConn),
-		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{"true"}},
+		protocol.RunRequest{ContextID: "ctx", WorkDir: ".", Command: []string{trueCommand}},
 		nil,
 		ExecOptions{Stderr: &stderr},
 		newRunLogger(&bytes.Buffer{}),

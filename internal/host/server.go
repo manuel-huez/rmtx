@@ -27,21 +27,22 @@ import (
 )
 
 const (
-	defaultDirMode          = 0o755
-	streamBufferSize        = 32 * 1024
-	splitNEquals            = 2
-	pipeCount               = 2
-	exitCodeNotFound        = 127
-	defaultFileMode         = 0o644
-	noneValue               = "none"
-	reverseDialTimeout      = 5 * time.Second
-	progressEvery           = 3 * time.Second
-	maxBlobTransferParallel = 16
-	materializeParallel     = 4
-	hostUpdateTimeout       = 5 * time.Minute
-	startupCleanupTimeout   = 15 * time.Second
-	restartPollEvery        = 100 * time.Millisecond
-	tcpKeepAliveEvery       = 15 * time.Second
+	defaultDirMode           = 0o755
+	streamBufferSize         = 32 * 1024
+	splitNEquals             = 2
+	pipeCount                = 2
+	exitCodeNotFound         = 127
+	defaultFileMode          = 0o644
+	noneValue                = "none"
+	reverseDialTimeout       = 5 * time.Second
+	progressEvery            = 3 * time.Second
+	maxBlobTransferParallel  = 16
+	materializeParallel      = 4
+	hostUpdateTimeout        = 5 * time.Minute
+	startupCleanupTimeout    = 15 * time.Second
+	restartPollEvery         = 100 * time.Millisecond
+	tcpKeepAliveEvery        = 15 * time.Second
+	workspaceLeasePruneEvery = time.Minute
 )
 
 var (
@@ -101,6 +102,7 @@ type Server struct {
 	contextLocks    map[string]*sync.Mutex
 	activeMu        sync.Mutex
 	activeContexts  map[string]int
+	activeLeases    map[string]int
 	blobTransfersMu sync.Mutex
 	blobTransfers   map[string]*blobTransferSession
 	// Hold during pre-run sync so blob GC cannot remove hashes before manifest commit.
@@ -155,6 +157,7 @@ func New(opts Options) (*Server, error) {
 		fingerprint:    fingerprint,
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
+		activeLeases:   map[string]int{},
 		blobTransfers:  map[string]*blobTransferSession{},
 		updateRunner:   defaultUpdateRunner,
 	}
@@ -171,6 +174,8 @@ func (s *Server) cleanupStartupCaches(ctx context.Context) {
 		temps, err := pruneStartupTempFiles(root)
 		logCleanupResult(s.logger, "temp", "files", temps, err)
 	}
+
+	s.cleanupExpiredWorkspaceLeases(time.Now().UTC())
 
 	// WSL can stall while distros initialize or update; startup cleanup is best-effort.
 	cleanupCtx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
@@ -190,6 +195,11 @@ func logCleanupResult(logger *log.Logger, name string, unit string, removed []st
 	if len(removed) > 0 {
 		logger.Printf("%s cleanup removed: %s=%d", name, unit, len(removed))
 	}
+}
+
+func (s *Server) cleanupExpiredWorkspaceLeases(now time.Time) {
+	leases, err := s.pruneExpiredWorkspaceLeasesInAllContexts(now)
+	logCleanupResult(s.logger, "workspace lease", "dirs", leases, err)
 }
 
 func logArtifactCleanupResult(
@@ -457,6 +467,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 
 	s.logger.Printf("listening on %s", ln.Addr().String())
+	stopLeaseCleanup := s.startWorkspaceLeaseCleanup(ctx)
+
+	defer stopLeaseCleanup()
 
 	if !s.opts.DisableDiscovery {
 		if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
@@ -506,6 +519,32 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 
 		go s.handleConn(ctx, conn)
+	}
+}
+
+func (s *Server) startWorkspaceLeaseCleanup(ctx context.Context) func() {
+	cleanupCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(workspaceLeasePruneEvery)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-cleanupCtx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupExpiredWorkspaceLeases(time.Now().UTC())
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
 	}
 }
 
@@ -677,6 +716,18 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
+	runWorkspace, err := s.prepareRunWorkspace(handle, request, runLogs)
+	if err != nil {
+		return err
+	}
+
+	handle.workspace = runWorkspace.workspace
+
+	if runWorkspace.lease != nil {
+		releaseLease := s.acquireWorkspaceLease(request.ContextID, runWorkspace.lease.state.ID)
+		defer releaseLease()
+	}
+
 	runtimePrep, hasPreparedRuntime, err := s.prepareRuntimeBeforeSync(
 		parent,
 		handle,
@@ -692,7 +743,14 @@ func (s *Server) handleRunRequest(
 		preparedRuntimeRef = &runtimePrep
 	}
 
-	if err := s.syncClientManifestAndSave(parent, conn, request, handle, runLogs); err != nil {
+	if err := s.syncClientManifestAndSave(
+		parent,
+		conn,
+		request,
+		handle,
+		&runWorkspace,
+		runLogs,
+	); err != nil {
 		return err
 	}
 
@@ -700,11 +758,21 @@ func (s *Server) handleRunRequest(
 
 	runLogs.Flush()
 
-	if err := writeWorkspaceReady(conn, request.ContextID, handle); err != nil {
+	if err := writeWorkspaceReady(conn, request.ContextID, handle, runWorkspace); err != nil {
 		return err
 	}
 
-	if err := s.executeAndSyncRun(parent, conn, handle, request, preparedRuntimeRef, runLogs); err != nil {
+	if err := s.executeAndSyncRun(
+		parent,
+		conn,
+		handle,
+		request,
+		preparedRuntimeRef,
+		runWorkspace,
+		runLogs,
+	); err != nil {
+		s.markWorkspaceLeaseDirty(handle.dataDir, runWorkspace.lease)
+
 		return err
 	}
 
@@ -739,28 +807,18 @@ func (s *Server) syncClientManifestAndSave(
 	conn *protocol.Conn,
 	request protocol.RunRequest,
 	handle contextHandle,
+	runWorkspace *runWorkspace,
 	runLogs *hostLogSubscription,
 ) error {
 	s.blobGCMu.RLock()
 	defer s.blobGCMu.RUnlock()
 
-	currentManifest, err := s.loadTrackedManifest(request.ContextID)
+	currentManifest, err := s.currentManifestForRun(request, handle, runWorkspace)
 	if err != nil {
 		return err
 	}
 
-	if s.workspaceWasCleaned(request.ContextID) {
-		// Cleanup marker may mean cleanup completed or was interrupted.
-		if err := removeContextSetupCache(handle.dataDir); err != nil {
-			return err
-		}
-
-		if err := cleanWorkspace(handle.workspace); err != nil {
-			return err
-		}
-
-		currentManifest = nil
-	}
+	runWorkspace.beforeManifest = request.Manifest
 
 	if err := s.syncContextFromClient(
 		parent,
@@ -776,11 +834,45 @@ func (s *Server) syncClientManifestAndSave(
 		return err
 	}
 
-	if err := s.saveTrackedManifest(request.ContextID, request.Manifest); err != nil {
-		return err
+	if runWorkspace.lease == nil {
+		if err := s.saveTrackedManifest(request.ContextID, request.Manifest); err != nil {
+			return err
+		}
+
+		return s.clearWorkspaceCleaned(request.ContextID)
 	}
 
-	return s.clearWorkspaceCleaned(request.ContextID)
+	return nil
+}
+
+func (s *Server) currentManifestForRun(
+	request protocol.RunRequest,
+	handle contextHandle,
+	runWorkspace *runWorkspace,
+) ([]syncfs.Entry, error) {
+	if runWorkspace.lease != nil {
+		return runWorkspace.lease.state.WorkspaceManifest, nil
+	}
+
+	currentManifest, err := s.loadTrackedManifest(request.ContextID)
+	if err != nil {
+		return nil, err
+	}
+
+	if !s.workspaceWasCleaned(request.ContextID) {
+		return currentManifest, nil
+	}
+
+	// Cleanup marker may mean cleanup completed or was interrupted.
+	if err := removeContextSetupCache(handle.dataDir); err != nil {
+		return nil, err
+	}
+
+	if err := cleanWorkspace(handle.workspace); err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }
 
 //nolint:cyclop // Protocol dispatch is deliberately centralized.
@@ -821,6 +913,8 @@ func (s *Server) dispatchSessionRequest(
 		return s.discardAndHandle(head, conn, func(conn *protocol.Conn) error {
 			return s.handleListContexts(conn, requestLogs)
 		})
+	case protocol.MsgWorkspaceLeasesRequest:
+		return s.dispatchWorkspaceLeases(conn, head, requestLogs)
 	case protocol.MsgDeleteContextsRequest:
 		return s.dispatchDeleteContexts(parent, conn, head, requestLogs)
 	case protocol.MsgContextArtifactsRequest:
@@ -919,6 +1013,19 @@ func (s *Server) dispatchDeleteContexts(
 	return s.handleDeleteContexts(parent, conn, req, requestLogs)
 }
 
+func (s *Server) dispatchWorkspaceLeases(
+	conn *protocol.Conn,
+	head protocol.Header,
+	requestLogs *hostLogSubscription,
+) error {
+	req, err := protocol.DecodeData[protocol.WorkspaceLeasesRequest](head)
+	if err != nil {
+		return err
+	}
+
+	return s.handleWorkspaceLeases(conn, req, requestLogs)
+}
+
 func (s *Server) dispatchContextArtifacts(
 	conn *protocol.Conn,
 	head protocol.Header,
@@ -957,17 +1064,39 @@ func validateRunRequest(request protocol.RunRequest) error {
 		return err
 	}
 
+	if _, err := parseWorkspaceKeepDuration(request.KeepWorkspace); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(request.ReuseWorkspace) != "" {
+		if _, err := normalizeWorkspaceLeaseID(request.ReuseWorkspace); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func writeWorkspaceReady(conn *protocol.Conn, contextID string, handle contextHandle) error {
+func writeWorkspaceReady(
+	conn *protocol.Conn,
+	contextID string,
+	handle contextHandle,
+	runWorkspace runWorkspace,
+) error {
+	ready := protocol.WorkspaceReady{
+		ContextID: contextID,
+		Created:   handle.created,
+		Workspace: handle.workspace,
+	}
+	if runWorkspace.lease != nil {
+		ready.WorkspaceLeaseID = runWorkspace.lease.state.ID
+		ready.WorkspaceReused = runWorkspace.lease.reused
+		ready.WorkspaceExpiresAt = runWorkspace.lease.state.ExpiresAt
+	}
+
 	return conn.WriteJSON(
 		protocol.MsgWorkspaceReady,
-		protocol.WorkspaceReady{
-			ContextID: contextID,
-			Created:   handle.created,
-			Workspace: handle.workspace,
-		},
+		ready,
 	)
 }
 
@@ -988,12 +1117,13 @@ func (s *Server) executeAndSyncRun(
 	handle contextHandle,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
+	runWorkspace runWorkspace,
 	runLogs *hostLogSubscription,
 ) error {
 	code, runErr := s.executeRequest(
 		parent,
 		conn,
-		handle.workspace,
+		handle,
 		request,
 		preparedRuntime,
 		runLogs,
@@ -1052,7 +1182,7 @@ func (s *Server) executeAndSyncRun(
 		handle.workspace,
 		handle.storage.blobStore,
 		post.BlobSources,
-		request.Manifest,
+		runWorkspace.beforeManifest,
 		postEntries,
 		request.SyncBack,
 		ignoreMode,
@@ -1060,7 +1190,7 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
-	if err := s.saveTrackedManifest(request.ContextID, postEntries); err != nil {
+	if err := s.savePostRunWorkspaceState(handle, request, runWorkspace, postEntries); err != nil {
 		return err
 	}
 
@@ -1073,7 +1203,7 @@ func (s *Server) executeAndSyncRun(
 
 	runLogs.Flush()
 
-	if err := s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs); err != nil {
+	if err := s.finishRunWorkspace(handle, request, runWorkspace, runLogs); err != nil {
 		return err
 	}
 
@@ -1082,6 +1212,41 @@ func (s *Server) executeAndSyncRun(
 	if err := conn.WriteJSON(protocol.MsgChangesDone, nil); err != nil {
 		return err
 	}
+
+	return nil
+}
+
+func (s *Server) savePostRunWorkspaceState(
+	handle contextHandle,
+	request protocol.RunRequest,
+	runWorkspace runWorkspace,
+	postEntries []syncfs.Entry,
+) error {
+	if runWorkspace.lease != nil {
+		return s.finalizeWorkspaceLease(handle.dataDir, runWorkspace.lease, request, postEntries)
+	}
+
+	return s.saveTrackedManifest(request.ContextID, postEntries)
+}
+
+func (s *Server) finishRunWorkspace(
+	handle contextHandle,
+	request protocol.RunRequest,
+	runWorkspace runWorkspace,
+	runLogs *hostLogSubscription,
+) error {
+	if runWorkspace.lease == nil {
+		return s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs)
+	}
+
+	s.logRun(
+		runLogs,
+		"workspace lease kept: context=%s session=%s id=%s expires=%s",
+		request.ContextID,
+		request.Session,
+		runWorkspace.lease.state.ID,
+		runWorkspace.lease.state.ExpiresAt.Format(time.RFC3339),
+	)
 
 	return nil
 }
@@ -1202,7 +1367,7 @@ func (s *Server) handleDeleteContexts(
 func (s *Server) executeRequest(
 	parent context.Context,
 	conn *protocol.Conn,
-	workspace string,
+	handle contextHandle,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
 	runLogs *hostLogSubscription,
@@ -1214,7 +1379,7 @@ func (s *Server) executeRequest(
 		sessionCtx,
 		cancel,
 		conn,
-		workspace,
+		handle,
 		request,
 		preparedRuntime,
 		runLogs,
@@ -1799,11 +1964,12 @@ func (s *Server) runCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
-	workspace string,
+	handle contextHandle,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
 	runLogs *hostLogSubscription,
 ) (int, error) {
+	workspace := handle.workspace
 	workdir, err := secureJoin(workspace, request.WorkDir)
 	if err != nil {
 		return 1, err
@@ -1829,6 +1995,7 @@ func (s *Server) runCommand(
 			ctx,
 			cancel,
 			conn,
+			handle.dataDir,
 			workspace,
 			workdir,
 			request,
@@ -1840,6 +2007,7 @@ func (s *Server) runCommand(
 			ctx,
 			cancel,
 			conn,
+			handle.dataDir,
 			workspace,
 			workdir,
 			request,

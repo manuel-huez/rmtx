@@ -131,6 +131,43 @@ func (s *Server) contextIsActive(id string) bool {
 	return s.activeContexts[id] > 0
 }
 
+func (s *Server) acquireWorkspaceLease(contextID, leaseID string) func() {
+	if strings.TrimSpace(leaseID) == "" {
+		return func() {}
+	}
+
+	key := workspaceLeaseActiveKey(contextID, leaseID)
+
+	s.activeMu.Lock()
+	if s.activeLeases == nil {
+		s.activeLeases = map[string]int{}
+	}
+
+	s.activeLeases[key]++
+	s.activeMu.Unlock()
+
+	return func() {
+		s.activeMu.Lock()
+		if s.activeLeases[key] <= 1 {
+			delete(s.activeLeases, key)
+		} else {
+			s.activeLeases[key]--
+		}
+		s.activeMu.Unlock()
+	}
+}
+
+func (s *Server) workspaceLeaseIsActive(contextID, leaseID string) bool {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+
+	return s.activeLeases[workspaceLeaseActiveKey(contextID, leaseID)] > 0
+}
+
+func workspaceLeaseActiveKey(contextID, leaseID string) string {
+	return contextID + "\x00" + leaseID
+}
+
 func (s *Server) ensureContext(
 	id, name, rootHint string,
 	storage runtimeStorage,
@@ -290,7 +327,7 @@ func resetContextDataAfterRootChange(metaDir, oldDataDir, newDataDir string) err
 
 func removeContextRuntimeData(metaDir, dataDir string) error {
 	if samePath(dataDir, metaDir) {
-		for _, name := range []string{contextWorkspaceDir, "volumes", runtimeDirName} {
+		for _, name := range []string{contextWorkspaceDir, workspaceLeasesDir, "volumes", runtimeDirName} {
 			if err := pathutil.RemoveAll(filepath.Join(dataDir, name)); err != nil {
 				return fmt.Errorf("%s: %w", name, err)
 			}

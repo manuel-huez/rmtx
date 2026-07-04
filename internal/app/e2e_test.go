@@ -320,8 +320,8 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 	}
 
 	deleteResult, err := RunDeleteContexts(ctx, project, ContextDeleteParams{
-		AddressOverride: addr,
-		Current:         true,
+		RemoteParams: RemoteParams{AddressOverride: addr},
+		Current:      true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -613,6 +613,258 @@ func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {
 
 	cancel()
 	waitForServerShutdown(t, "noop-host", errCh)
+}
+
+func TestRunExecWorkspaceLeaseReusesKeptWorkspace(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	lease := startWorkspaceLeaseE2E(t, "lease-context", "")
+	defer lease.stop(t, "lease-host")
+
+	writeTestFile(t, filepath.Join(lease.project, "hello.txt"), "hello\n")
+
+	_, firstErr, code := lease.run(
+		t,
+		`mkdir -p cache; echo warm > cache/marker; echo ok`,
+		time.Hour,
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("first run exit code=%d stderr=%s", code, firstErr)
+	}
+
+	leaseID := parseWorkspaceLeaseID(t, firstErr)
+
+	requireWorkspaceLeaseClean(t, lease, leaseID)
+
+	reusedOut, reusedErr, code := lease.run(t, `cat cache/marker`, 0, leaseID)
+	if code != 0 {
+		t.Fatalf("reuse run exit code=%d stderr=%s", code, reusedErr)
+	}
+
+	if reusedOut != "warm\n" {
+		t.Fatalf("reuse stdout=%q want warm", reusedOut)
+	}
+
+	defaultOut, defaultErr, code := lease.run(t, `test ! -e cache/marker && echo clean`, 0, "")
+	if code != 0 {
+		t.Fatalf("default run exit code=%d stderr=%s", code, defaultErr)
+	}
+
+	if strings.TrimSpace(defaultOut) != "clean" {
+		t.Fatalf("default workspace unexpectedly reused lease: stdout=%q", defaultOut)
+	}
+
+	deleteWorkspaceLease(t, lease, leaseID)
+}
+
+func TestRunExecWorkspaceLeaseRestoresNonSyncBackInputs(t *testing.T) {
+	if testIsWindows() {
+		t.Skip("shell-based integration test")
+	}
+
+	lease := startWorkspaceLeaseE2E(t, "lease-sync-back-context", `  "sync_back": ["out/"],
+`)
+	defer lease.stop(t, "lease-sync-back-host")
+
+	writeTestFile(t, filepath.Join(lease.project, "hello.txt"), "local\n")
+
+	_, firstErr, code := lease.run(
+		t,
+		`echo remote > hello.txt; mkdir -p out; echo synced > out/result.txt`,
+		time.Hour,
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("first run exit code=%d stderr=%s", code, firstErr)
+	}
+
+	leaseID := parseWorkspaceLeaseID(t, firstErr)
+
+	content, err := os.ReadFile(filepath.Join(lease.project, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(content) != "local\n" {
+		t.Fatalf("local non-sync_back file changed: %q", string(content))
+	}
+
+	reusedOut, reusedErr, code := lease.run(t, `cat hello.txt`, 0, leaseID)
+	if code != 0 {
+		t.Fatalf("reuse run exit code=%d stderr=%s", code, reusedErr)
+	}
+
+	if reusedOut != "local\n" {
+		t.Fatalf("reuse saw stale workspace file: stdout=%q", reusedOut)
+	}
+}
+
+type workspaceLeaseE2E struct {
+	cancel     context.CancelFunc
+	errCh      chan error
+	addr       string
+	project    string
+	configPath string
+	context    func() context.Context
+}
+
+func startWorkspaceLeaseE2E(
+	t *testing.T,
+	contextName string,
+	configExtra string,
+) workspaceLeaseE2E {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir := t.TempDir()
+
+	server, err := host.New(host.Options{
+		ListenAddr:       "127.0.0.1:0",
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+	})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ctx) }()
+
+	addr := waitForAddr(t, server)
+	project := t.TempDir()
+	configPath := filepath.Join(project, ".rmtx.json")
+
+	writeTestFile(t, configPath, `{
+  "version": 1,
+  "context": {"name": "`+contextName+`"},
+  "tls": {"host_fingerprint": "`+server.Fingerprint()+`"},
+  "mounts": [{"path": "."}],
+  "ignore": ["cache/**"],
+`+configExtra+`  "discovery": {"enabled": false}
+}`)
+
+	pairCode, err := RunHostPairCode(HostPairCodeParams{StateDir: stateDir})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	if _, err := RunPair(ctx, project, PairParams{
+		AddressOverride: addr,
+		ConfigPath:      configPath,
+		Code:            pairCode.Code,
+		ClientLabel:     "lease-client",
+	}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	return workspaceLeaseE2E{
+		cancel:     cancel,
+		errCh:      errCh,
+		addr:       addr,
+		project:    project,
+		configPath: configPath,
+		context:    func() context.Context { return ctx },
+	}
+}
+
+func (w workspaceLeaseE2E) stop(t *testing.T, hostName string) {
+	t.Helper()
+
+	w.cancel()
+	waitForServerShutdown(t, hostName, w.errCh)
+}
+
+func (w workspaceLeaseE2E) run(
+	t *testing.T,
+	command string,
+	keepWorkspace time.Duration,
+	reuseWorkspace string,
+) (string, string, int) {
+	t.Helper()
+
+	var stdout, stderr bytes.Buffer
+
+	code, err := RunExec(w.context(), w.project, ExecParams{
+		AddressOverride: w.addr,
+		ConfigPath:      w.configPath,
+		Command:         []string{"sh", "-c", command},
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+		KeepWorkspace:   keepWorkspace,
+		ReuseWorkspace:  reuseWorkspace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return stdout.String(), stderr.String(), code
+}
+
+func requireWorkspaceLeaseClean(t *testing.T, lease workspaceLeaseE2E, leaseID string) {
+	t.Helper()
+
+	listed, err := RunWorkspaceLeases(lease.context(), lease.project, WorkspaceLeasesParams{
+		RemoteParams: RemoteParams{
+			AddressOverride: lease.addr,
+			ConfigPath:      lease.configPath,
+		},
+		Current: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(listed.Workspaces) != 1 || listed.Workspaces[0].ID != leaseID {
+		t.Fatalf("unexpected workspace leases: %#v want %s", listed.Workspaces, leaseID)
+	}
+
+	if listed.Workspaces[0].Dirty {
+		t.Fatalf("workspace lease should be clean after successful sync: %#v", listed.Workspaces[0])
+	}
+}
+
+func deleteWorkspaceLease(t *testing.T, lease workspaceLeaseE2E, leaseID string) {
+	t.Helper()
+
+	deleted, err := RunWorkspaceLeases(lease.context(), lease.project, WorkspaceLeasesParams{
+		RemoteParams: RemoteParams{
+			AddressOverride: lease.addr,
+			ConfigPath:      lease.configPath,
+		},
+		Current: true,
+		Delete:  true,
+		IDs:     []string{leaseID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(deleted.Deleted) != 1 || deleted.Deleted[0].ID != leaseID {
+		t.Fatalf("unexpected deleted leases: %#v", deleted)
+	}
+}
+
+func parseWorkspaceLeaseID(t *testing.T, stderr string) string {
+	t.Helper()
+
+	for _, field := range strings.Fields(stderr) {
+		if strings.HasPrefix(field, "id=ws_") {
+			return strings.TrimPrefix(field, "id=")
+		}
+	}
+
+	t.Fatalf("workspace lease id not found in stderr: %s", stderr)
+
+	return ""
 }
 
 func TestRunExecEndToEndReportsCommandStartFailure(t *testing.T) {

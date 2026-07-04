@@ -56,6 +56,29 @@ func TestRunCacheRequiresPruneSubcommand(t *testing.T) {
 	}
 }
 
+func TestRunExecWithFlagsRejectsNegativeKeepWorkspace(t *testing.T) {
+	code, stderr := captureRunStderr(t, func() int {
+		return runExecWithFlags(
+			context.Background(),
+			[]string{"--keep-workspace=-1s", "--", "true"},
+		)
+	})
+	if code != exitUsage {
+		t.Fatalf("exit code=%d want %d", code, exitUsage)
+	}
+
+	if !strings.Contains(stderr, "keep-workspace duration must be positive") {
+		t.Fatalf("stderr missing keep-workspace error: %q", stderr)
+	}
+}
+
+func TestContextTargetFromFlagsRejectsCurrentAndContext(t *testing.T) {
+	_, _, err := contextTargetFromFlags(true, "ctx")
+	if err == nil {
+		t.Fatal("expected conflict error")
+	}
+}
+
 func TestRunRejectsUnknownCommandInsteadOfExec(t *testing.T) {
 	for _, args := range [][]string{
 		{"echo", "test"},
@@ -180,6 +203,31 @@ func TestPrintArtifactsIncludesTotalListedSize(t *testing.T) {
 	}
 
 	t.Fatalf("artifact output missing total size: %q", got)
+}
+
+func TestPrintWorkspaceLeases(t *testing.T) {
+	var out bytes.Buffer
+	printWorkspaceLeases(&out, []client.WorkspaceLeaseInfo{{
+		ID:        "ws_1234",
+		Path:      "/tmp/workspace",
+		ExpiresAt: time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
+		Dirty:     true,
+		Active:    true,
+	}})
+
+	got := out.String()
+	for _, want := range []string{
+		"ID",
+		"EXPIRES",
+		"ws_1234",
+		"2026-07-04T12:00:00Z",
+		labelYes,
+		"/tmp/workspace",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("workspace output missing %q: %s", want, got)
+		}
+	}
 }
 
 func TestSelectWSLProfileByFlag(t *testing.T) {

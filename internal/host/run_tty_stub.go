@@ -15,6 +15,7 @@ func (s *Server) runTTYCommand(
 	_ *protocol.Conn,
 	_ string,
 	_ string,
+	_ string,
 	_ protocol.RunRequest,
 	_ *preparedRuntime,
 	_ *hostLogSubscription,

@@ -163,6 +163,35 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 	)
 }
 
+func WorkspaceLeases(
+	ctx context.Context,
+	opts WorkspaceLeasesOptions,
+) (WorkspaceLeasesResult, error) {
+	conn, err := updatedRemoteConn(ctx, opts.Remote)
+	if err != nil {
+		return WorkspaceLeasesResult{}, err
+	}
+	defer closeQuietly(conn.Raw())
+
+	req := protocol.WorkspaceLeasesRequest{
+		ContextID: opts.ContextID,
+		Delete:    opts.Delete,
+		IDs:       append([]string(nil), opts.IDs...),
+	}
+	if err := conn.WriteJSON(protocol.MsgWorkspaceLeasesRequest, req); err != nil {
+		return WorkspaceLeasesResult{}, err
+	}
+
+	stopLiveness := startConnectionLiveness(ctx, conn, false)
+	defer stopLiveness()
+
+	return expectDataFrameWithOutput[protocol.WorkspaceLeasesResponse](
+		conn,
+		protocol.MsgWorkspaceLeasesResponse,
+		opts.Remote.Stderr,
+	)
+}
+
 func ContextArtifacts(
 	ctx context.Context,
 	opts ContextArtifactsOptions,

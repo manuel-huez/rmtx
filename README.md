@@ -14,6 +14,7 @@
 - `rmtx ping`: verify host connectivity/auth.
 - `rmtx stats`: report host CPU/RAM/core/per-core usage.
 - `rmtx context ...`: list/delete/prune host contexts.
+- `rmtx context workspaces ...`: list/delete kept host workspaces.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
 - `rmtx cache prune`: delete unreferenced host cache data.
 
@@ -120,6 +121,16 @@ When omitted, all mounted paths are eligible for sync-back. Only paths whose
 metadata or content changed are sent back to the client. After each run, the
 host workspace is cleaned and rehydrated from synced blobs on the next run;
 use runtime volumes for state that should persist only on the host.
+
+For expensive repeated runs, `rmtx exec --keep-workspace 2h -- <command>` keeps
+that run workspace on the host until its TTL expires and prints the workspace
+lease id to stderr. Reuse it with
+`rmtx exec --reuse-workspace ws_... --keep-workspace 2h -- <command>`. Reused
+workspaces apply only client-side manifest changes before the command, avoiding
+full rehydration for unchanged large data. If sync or sync-back fails, the
+workspace lease is marked dirty and cannot be reused. List or delete leases with
+`rmtx context workspaces list --current` and
+`rmtx context workspaces delete --current ws_...`.
 
 Remote commands receive these rmtx environment variables:
 
@@ -255,14 +266,16 @@ rmtx stats
 rmtx context list
 rmtx context delete --current
 rmtx context prune --older-than 168h
+rmtx context workspaces list --current
 rmtx context artifacts list --current
 rmtx cache prune
 ```
 
 ## Notes
 
-- Contexts keep manifests and shared blobs on the host; workspaces are scratch
-  copies cleaned after each run.
+- Contexts keep manifests and shared blobs on the host; default workspaces are
+  scratch copies cleaned after each run. `--keep-workspace` keeps opt-in
+  workspace leases until TTL expiry.
 - OCI prepared rootfs data is a per-context runtime cache. Runtime config changes
   replace older prepared rootfs refs; context delete removes the cache.
 - Discovery uses UDP broadcast on port `33222`; hosts also send outbound announcements so clients can discover Windows hosts even when inbound UDP is blocked.

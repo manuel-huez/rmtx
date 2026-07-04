@@ -55,6 +55,8 @@ type ExecParams struct {
 	StdoutFile       *os.File
 	StderrFile       *os.File
 	TTYMode          TTYMode
+	KeepWorkspace    time.Duration
+	ReuseWorkspace   string
 }
 
 type RemoteParams struct {
@@ -65,26 +67,28 @@ type RemoteParams struct {
 }
 
 type ContextDeleteParams struct {
-	AddressOverride  string
-	ConfigPath       string
-	DiscoveryTimeout time.Duration
-	Stderr           io.Writer
-	IDs              []string
-	All              bool
-	OlderThan        time.Duration
-	Current          bool
+	RemoteParams
+	IDs       []string
+	All       bool
+	OlderThan time.Duration
+	Current   bool
 }
 
 type ContextArtifactsParams struct {
-	AddressOverride  string
-	ConfigPath       string
-	DiscoveryTimeout time.Duration
-	Stderr           io.Writer
-	ContextID        string
-	Current          bool
-	Prune            bool
-	Delete           bool
-	Volume           string
+	RemoteParams
+	ContextID string
+	Current   bool
+	Prune     bool
+	Delete    bool
+	Volume    string
+}
+
+type WorkspaceLeasesParams struct {
+	RemoteParams
+	ContextID string
+	Current   bool
+	Delete    bool
+	IDs       []string
 }
 
 type HostParams struct {
@@ -235,6 +239,8 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		ContextID:        loaded.ContextID(),
 		ContextName:      loaded.ContextName(),
 		TTY:              useTTY,
+		KeepWorkspace:    params.KeepWorkspace,
+		ReuseWorkspace:   params.ReuseWorkspace,
 	})
 }
 
@@ -386,12 +392,7 @@ func RunDeleteContexts(
 	remote, loaded, err := resolveClientRemoteOptions(
 		ctx,
 		cwd,
-		RemoteParams{
-			AddressOverride:  params.AddressOverride,
-			ConfigPath:       params.ConfigPath,
-			DiscoveryTimeout: params.DiscoveryTimeout,
-			Stderr:           params.Stderr,
-		},
+		params.RemoteParams,
 	)
 	if err != nil {
 		return client.DeleteContextsResult{}, err
@@ -422,35 +423,44 @@ func RunDeleteContexts(
 	return client.DeleteContexts(ctx, req)
 }
 
+func RunWorkspaceLeases(
+	ctx context.Context,
+	cwd string,
+	params WorkspaceLeasesParams,
+) (client.WorkspaceLeasesResult, error) {
+	remote, contextID, err := resolveContextScopedRemote(
+		ctx,
+		cwd,
+		params.RemoteParams,
+		params.ContextID,
+		params.Current,
+	)
+	if err != nil {
+		return client.WorkspaceLeasesResult{}, err
+	}
+
+	return client.WorkspaceLeases(ctx, client.WorkspaceLeasesOptions{
+		Remote:    remote,
+		ContextID: contextID,
+		Delete:    params.Delete,
+		IDs:       append([]string(nil), params.IDs...),
+	})
+}
+
 func RunContextArtifacts(
 	ctx context.Context,
 	cwd string,
 	params ContextArtifactsParams,
 ) (client.ContextArtifactsResult, error) {
-	remote, loaded, err := resolveClientRemoteOptions(
+	remote, contextID, err := resolveContextScopedRemote(
 		ctx,
 		cwd,
-		RemoteParams{
-			AddressOverride:  params.AddressOverride,
-			ConfigPath:       params.ConfigPath,
-			DiscoveryTimeout: params.DiscoveryTimeout,
-			Stderr:           params.Stderr,
-		},
+		params.RemoteParams,
+		params.ContextID,
+		params.Current,
 	)
 	if err != nil {
 		return client.ContextArtifactsResult{}, err
-	}
-
-	contextID := strings.TrimSpace(params.ContextID)
-	if params.Current || contextID == "" {
-		if loaded == nil {
-			loaded, err = config.ResolveRequired(cwd, params.ConfigPath)
-			if err != nil {
-				return client.ContextArtifactsResult{}, err
-			}
-		}
-
-		contextID = loaded.ContextID()
 	}
 
 	return client.ContextArtifacts(ctx, client.ContextArtifactsOptions{
@@ -460,6 +470,43 @@ func RunContextArtifacts(
 		Delete:    params.Delete,
 		Volume:    params.Volume,
 	})
+}
+
+func resolveContextScopedRemote(
+	ctx context.Context,
+	cwd string,
+	params RemoteParams,
+	contextID string,
+	current bool,
+) (client.RemoteOptions, string, error) {
+	remote, loaded, err := resolveClientRemoteOptions(
+		ctx,
+		cwd,
+		params,
+	)
+	if err != nil {
+		return client.RemoteOptions{}, "", err
+	}
+
+	contextID = strings.TrimSpace(contextID)
+	if current && contextID != "" {
+		return client.RemoteOptions{},
+			"",
+			errors.New("--current and --context cannot be used together")
+	}
+
+	if current || contextID == "" {
+		if loaded == nil {
+			loaded, err = config.ResolveRequired(cwd, params.ConfigPath)
+			if err != nil {
+				return client.RemoteOptions{}, "", err
+			}
+		}
+
+		contextID = loaded.ContextID()
+	}
+
+	return remote, contextID, nil
 }
 
 func RunCachePrune(

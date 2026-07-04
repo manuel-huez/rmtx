@@ -50,6 +50,8 @@ type ExecOptions struct {
 	ContextID        string
 	ContextName      string
 	TTY              bool
+	KeepWorkspace    time.Duration
+	ReuseWorkspace   string
 }
 
 type RemoteOptions struct {
@@ -65,6 +67,8 @@ type PingInfo = protocol.PingResponse
 type HostStatsInfo = protocol.HostStatsResponse
 type HostUpdateResult = protocol.HostUpdateResponse
 type ContextInfo = protocol.ContextSummary
+type WorkspaceLeaseInfo = protocol.WorkspaceLeaseSummary
+type WorkspaceLeasesResult = protocol.WorkspaceLeasesResponse
 type DeleteContextsResult = protocol.DeleteContextsResponse
 type ContextArtifactsResult = protocol.ContextArtifactsResponse
 type ContextArtifact = protocol.ContextArtifact
@@ -83,6 +87,13 @@ type ContextArtifactsOptions struct {
 	Prune     bool
 	Delete    bool
 	Volume    string
+}
+
+type WorkspaceLeasesOptions struct {
+	Remote    RemoteOptions
+	ContextID string
+	Delete    bool
+	IDs       []string
 }
 
 const stdinBufferSize = 32 * 1024
@@ -350,6 +361,15 @@ func Run(ctx context.Context, opts ExecOptions) (int, error) {
 		ready.ContextID,
 		ready.Workspace,
 	)
+
+	if ready.WorkspaceLeaseID != "" {
+		logger.Printf(
+			"workspace lease ready: id=%s reused=%t expires=%s",
+			ready.WorkspaceLeaseID,
+			ready.WorkspaceReused,
+			ready.WorkspaceExpiresAt.Format(time.RFC3339),
+		)
+	}
 	logger.Stage("execute remote command")
 	logger.Printf("command: %s", formatCommand(opts.Command))
 
@@ -401,6 +421,10 @@ func validateExecOptions(opts *ExecOptions) error {
 
 	if strings.TrimSpace(opts.ContextID) == "" {
 		return errors.New("context id is required")
+	}
+
+	if opts.KeepWorkspace < 0 {
+		return errors.New("keep-workspace duration must be positive")
 	}
 
 	return nil
@@ -529,22 +553,29 @@ func buildRunRequest(
 		}
 	}
 
+	keepWorkspace := ""
+	if opts.KeepWorkspace > 0 {
+		keepWorkspace = opts.KeepWorkspace.String()
+	}
+
 	request := protocol.RunRequest{
-		ContextID:   opts.ContextID,
-		ContextName: opts.ContextName,
-		WorkDir:     workdir,
-		Command:     append([]string(nil), opts.Command...),
-		Env:         env,
-		Runtime:     cloneRuntimeSpec(opts.Runtime),
-		Mounts:      append([]syncfs.MountSpec(nil), opts.Mounts...),
-		Manifest:    manifest.Entries,
-		SyncBack:    cloneStringSlice(opts.SyncBack),
-		Session:     opts.Session,
-		Project:     opts.Project,
-		RootHint:    filepath.Base(root),
-		TTY:         opts.TTY,
-		TTYRows:     rows,
-		TTYCols:     cols,
+		ContextID:      opts.ContextID,
+		ContextName:    opts.ContextName,
+		WorkDir:        workdir,
+		Command:        append([]string(nil), opts.Command...),
+		Env:            env,
+		Runtime:        cloneRuntimeSpec(opts.Runtime),
+		Mounts:         append([]syncfs.MountSpec(nil), opts.Mounts...),
+		Manifest:       manifest.Entries,
+		SyncBack:       cloneStringSlice(opts.SyncBack),
+		Session:        opts.Session,
+		Project:        opts.Project,
+		RootHint:       filepath.Base(root),
+		TTY:            opts.TTY,
+		TTYRows:        rows,
+		TTYCols:        cols,
+		KeepWorkspace:  keepWorkspace,
+		ReuseWorkspace: strings.TrimSpace(opts.ReuseWorkspace),
 	}
 
 	return manifest, request, nil

@@ -103,6 +103,7 @@ func (s *Server) runOCIPipeCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
+	contextDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -114,6 +115,7 @@ func (s *Server) runOCIPipeCommand(
 
 	if err := s.prepareOCIContextSetup(
 		ctx,
+		contextDir,
 		workspace,
 		request,
 		preparedRuntime,
@@ -124,7 +126,15 @@ func (s *Server) runOCIPipeCommand(
 	}
 	runLogs.Flush()
 
-	cmd, cleanup, err := s.newOCICommand(ctx, workspace, workdir, request, preparedRuntime, runLogs)
+	cmd, cleanup, err := s.newOCICommand(
+		ctx,
+		contextDir,
+		workspace,
+		workdir,
+		request,
+		preparedRuntime,
+		runLogs,
+	)
 	if err != nil {
 		_ = stopPipeInputReader(conn, input)
 		return 1, err
@@ -403,6 +413,7 @@ func (s *Server) runImageSetupCommands(
 
 func (s *Server) prepareOCIContextSetup(
 	ctx context.Context,
+	contextDir string,
 	workspace string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
@@ -418,7 +429,7 @@ func (s *Server) prepareOCIContextSetup(
 	}
 
 	handle := contextHandle{
-		dataDir:   filepath.Dir(workspace),
+		dataDir:   contextDir,
 		workspace: workspace,
 	}
 	prepared, err := s.ensurePreparedOCIRuntime(
@@ -448,6 +459,7 @@ func (s *Server) prepareOCIContextSetup(
 
 	if err := s.runOCIContextSetupCommands(
 		ctx,
+		handle.dataDir,
 		workspace,
 		workdir,
 		request,
@@ -462,6 +474,7 @@ func (s *Server) prepareOCIContextSetup(
 
 func (s *Server) runOCIContextSetupCommands(
 	ctx context.Context,
+	contextDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -488,6 +501,7 @@ func (s *Server) runOCIContextSetupCommands(
 
 		cmd, cleanup, err := s.newOCICommand(
 			ctx,
+			contextDir,
 			workspace,
 			workdir,
 			setupReq,
@@ -545,6 +559,7 @@ func saveContextSetupCache(path string, key string) error {
 
 func (s *Server) newOCICommand(
 	ctx context.Context,
+	contextDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -552,7 +567,7 @@ func (s *Server) newOCICommand(
 	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	handle := contextHandle{
-		dataDir:   filepath.Dir(workspace),
+		dataDir:   contextDir,
 		workspace: workspace,
 	}
 

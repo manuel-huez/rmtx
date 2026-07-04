@@ -451,6 +451,7 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 				storage:   storage,
 				workspace: workspace,
 			},
+			&runWorkspace{workspace: workspace},
 			nil,
 		)
 	}()

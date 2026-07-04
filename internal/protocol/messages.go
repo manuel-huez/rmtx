@@ -36,6 +36,8 @@ const (
 	MsgHostUpdateResponse       = "host_update_response"
 	MsgListContextsRequest      = "list_contexts_request"
 	MsgListContextsResponse     = "list_contexts_response"
+	MsgWorkspaceLeasesRequest   = "workspace_leases_request"
+	MsgWorkspaceLeasesResponse  = "workspace_leases_response"
 	MsgDeleteContextsRequest    = "delete_contexts_request"
 	MsgDeleteContextsResponse   = "delete_contexts_response"
 	MsgContextArtifactsRequest  = "context_artifacts_request"
@@ -120,27 +122,32 @@ type TTYSize struct {
 }
 
 type WorkspaceReady struct {
-	ContextID string `json:"context_id,omitempty"`
-	Created   bool   `json:"created,omitempty"`
-	Workspace string `json:"workspace,omitempty"`
+	ContextID          string    `json:"context_id,omitempty"`
+	Created            bool      `json:"created,omitempty"`
+	Workspace          string    `json:"workspace,omitempty"`
+	WorkspaceLeaseID   string    `json:"workspace_lease_id,omitempty"`
+	WorkspaceReused    bool      `json:"workspace_reused,omitempty"`
+	WorkspaceExpiresAt time.Time `json:"workspace_expires_at,omitempty"`
 }
 
 type RunRequest struct {
-	ContextID   string             `json:"context_id"`
-	ContextName string             `json:"context_name,omitempty"`
-	WorkDir     string             `json:"work_dir"`
-	Command     []string           `json:"command"`
-	Env         map[string]string  `json:"env"`
-	Runtime     RuntimeSpec        `json:"runtime,omitempty"`
-	Mounts      []syncfs.MountSpec `json:"mounts"`
-	Manifest    []syncfs.Entry     `json:"manifest"`
-	SyncBack    []string           `json:"sync_back"`
-	Session     string             `json:"session"`
-	Project     string             `json:"project,omitempty"`
-	RootHint    string             `json:"root_hint,omitempty"`
-	TTY         bool               `json:"tty,omitempty"`
-	TTYRows     int                `json:"tty_rows,omitempty"`
-	TTYCols     int                `json:"tty_cols,omitempty"`
+	ContextID      string             `json:"context_id"`
+	ContextName    string             `json:"context_name,omitempty"`
+	WorkDir        string             `json:"work_dir"`
+	Command        []string           `json:"command"`
+	Env            map[string]string  `json:"env"`
+	Runtime        RuntimeSpec        `json:"runtime,omitempty"`
+	Mounts         []syncfs.MountSpec `json:"mounts"`
+	Manifest       []syncfs.Entry     `json:"manifest"`
+	SyncBack       []string           `json:"sync_back"`
+	Session        string             `json:"session"`
+	Project        string             `json:"project,omitempty"`
+	RootHint       string             `json:"root_hint,omitempty"`
+	TTY            bool               `json:"tty,omitempty"`
+	TTYRows        int                `json:"tty_rows,omitempty"`
+	TTYCols        int                `json:"tty_cols,omitempty"`
+	KeepWorkspace  string             `json:"keep_workspace,omitempty"`
+	ReuseWorkspace string             `json:"reuse_workspace,omitempty"`
 }
 
 type RuntimeSpec = config.RuntimeConfig
@@ -218,6 +225,29 @@ type ContextSummary struct {
 
 type ListContextsResponse struct {
 	Contexts []ContextSummary `json:"contexts"`
+}
+
+type WorkspaceLeaseSummary struct {
+	ID        string    `json:"id"`
+	ContextID string    `json:"context_id"`
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	Dirty     bool      `json:"dirty,omitempty"`
+	Active    bool      `json:"active,omitempty"`
+}
+
+type WorkspaceLeasesRequest struct {
+	ContextID string   `json:"context_id"`
+	Delete    bool     `json:"delete,omitempty"`
+	IDs       []string `json:"ids,omitempty"`
+}
+
+type WorkspaceLeasesResponse struct {
+	Workspaces []WorkspaceLeaseSummary `json:"workspaces,omitempty"`
+	Deleted    []WorkspaceLeaseSummary `json:"deleted,omitempty"`
+	NotFound   []string                `json:"not_found,omitempty"`
 }
 
 type DeleteContextsRequest struct {

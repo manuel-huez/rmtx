@@ -27,7 +27,12 @@ const exitUsage = 2
 const tabWriterTabWidth = 8
 const tabWriterPadding = 2
 const defaultPairCodeTTL = 5 * time.Minute
+const commandList = "list"
+const commandDelete = "delete"
 const commandPrune = "prune"
+const commandRemove = "remove"
+const labelNo = "no"
+const labelYes = "yes"
 
 var errSelectionCancelled = errors.New("selection cancelled")
 
@@ -35,6 +40,14 @@ type remoteFlags struct {
 	hostAddr         *string
 	cfgPath          *string
 	discoveryTimeout *time.Duration
+}
+
+type contextCommandFlags struct {
+	params   app.RemoteParams
+	cwd      string
+	context  string
+	current  bool
+	exitCode int
 }
 
 type pairLikeFlags struct {
@@ -193,9 +206,20 @@ func runExecWithFlags(ctx context.Context, args []string) int {
 	cfgPath := fs.String("config", "", "path to .rmtx.json")
 	discoveryTimeout := fs.Duration("discovery-timeout", 0, "override discovery timeout")
 	ttyFlag := fs.Bool("tty", false, "force interactive TTY")
+	keepWorkspace := fs.Duration(
+		"keep-workspace",
+		0,
+		"keep host workspace lease for duration after run",
+	)
+	reuseWorkspace := fs.String("reuse-workspace", "", "reuse kept host workspace lease id")
 
 	noTTYFlag := fs.Bool("no-tty", false, "disable interactive TTY")
 	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	if *keepWorkspace < 0 {
+		fmt.Fprintln(os.Stderr, "error: keep-workspace duration must be positive")
 		return exitUsage
 	}
 
@@ -224,6 +248,8 @@ func runExecWithFlags(ctx context.Context, args []string) int {
 			StdoutFile:       os.Stdout,
 			StderrFile:       os.Stderr,
 			TTYMode:          ttyMode,
+			KeepWorkspace:    *keepWorkspace,
+			ReuseWorkspace:   *reuseWorkspace,
 		},
 	)
 }
@@ -459,12 +485,14 @@ func runContext(ctx context.Context, args []string) int {
 	}
 
 	switch args[0] {
-	case "list", "ls":
+	case commandList, "ls":
 		return runContextList(ctx, args[1:])
-	case "delete", "rm", "remove":
+	case commandDelete, "rm", commandRemove:
 		return runContextDelete(ctx, args[1:])
 	case commandPrune:
 		return runContextPrune(ctx, args[1:])
+	case "workspaces", "workspace":
+		return runContextWorkspaces(ctx, args[1:])
 	case "artifacts":
 		return runContextArtifacts(ctx, args[1:])
 	default:
@@ -498,9 +526,9 @@ func runContextList(ctx context.Context, args []string) int {
 			updated = context.UpdatedAt.Format(time.RFC3339)
 		}
 
-		active := "no"
+		active := labelNo
 		if context.Active {
-			active = "yes"
+			active = labelYes
 		}
 
 		_, _ = fmt.Fprintf(
@@ -538,7 +566,7 @@ func runContextDelete(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	params := remote.deleteParams()
+	params := app.ContextDeleteParams{RemoteParams: remote.params()}
 	params.IDs = ids
 	params.Current = useCurrent
 
@@ -580,7 +608,7 @@ func runContextPrune(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	params := remote.deleteParams()
+	params := app.ContextDeleteParams{RemoteParams: remote.params()}
 	params.All = *all
 	params.OlderThan = *olderThan
 
@@ -599,17 +627,116 @@ func runContextPrune(ctx context.Context, args []string) int {
 	return 0
 }
 
+func runContextWorkspaces(ctx context.Context, args []string) int {
+	if len(args) == 0 {
+		return runContextWorkspacesList(ctx, nil)
+	}
+
+	switch args[0] {
+	case commandList, "ls":
+		return runContextWorkspacesList(ctx, args[1:])
+	case commandDelete, "rm", commandRemove:
+		return runContextWorkspacesDelete(ctx, args[1:])
+	default:
+		return runContextWorkspacesList(ctx, args)
+	}
+}
+
+func runContextWorkspacesList(ctx context.Context, args []string) int {
+	return runContextWorkspacesCommand(
+		ctx,
+		args,
+		commandList,
+		false,
+		func(result client.WorkspaceLeasesResult) { printWorkspaceLeases(os.Stdout, result.Workspaces) },
+	)
+}
+
+func runContextWorkspacesDelete(ctx context.Context, args []string) int {
+	return runContextWorkspacesCommand(
+		ctx,
+		args,
+		commandDelete,
+		true,
+		func(result client.WorkspaceLeasesResult) {
+			for _, workspace := range result.Deleted {
+				_, _ = fmt.Fprintf(
+					os.Stdout,
+					"deleted\tworkspace\t%s\t%s\n",
+					workspace.ID,
+					workspace.Path,
+				)
+			}
+
+			if len(result.NotFound) > 0 {
+				fmt.Fprintf(os.Stderr, "not found: %s\n", strings.Join(result.NotFound, ", "))
+			}
+		},
+	)
+}
+
+func runContextWorkspacesCommand(
+	ctx context.Context,
+	args []string,
+	subcommand string,
+	delete bool,
+	printResult func(client.WorkspaceLeasesResult),
+) int {
+	fs := flag.NewFlagSet("rmtx context workspaces "+subcommand, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	remote := bindRemoteFlags(fs)
+	current := fs.Bool("current", false, "use the current context")
+	contextID := fs.String("context", "", "context id")
+
+	parsed := parseContextCommandFlags(fs, args, remote, current, contextID)
+	if parsed.exitCode != 0 {
+		return parsed.exitCode
+	}
+
+	workspaceParams := app.WorkspaceLeasesParams{
+		RemoteParams: parsed.params,
+		Delete:       delete,
+	}
+	workspaceParams.ContextID = parsed.context
+	workspaceParams.Current = parsed.current
+	workspaceParams.IDs = fs.Args()
+
+	if workspaceParams.Delete && len(workspaceParams.IDs) == 0 {
+		fmt.Fprintln(os.Stderr, "error: workspace delete requires at least one id")
+		return exitUsage
+	}
+
+	if !workspaceParams.Delete && len(workspaceParams.IDs) > 0 {
+		fmt.Fprintln(os.Stderr, "error: workspace list does not accept ids")
+		return exitUsage
+	}
+
+	result, err := app.RunWorkspaceLeases(ctx, parsed.cwd, workspaceParams)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	printResult(result)
+
+	if len(result.NotFound) > 0 {
+		return 1
+	}
+
+	return 0
+}
+
 func runContextArtifacts(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		return runContextArtifactsList(ctx, nil)
 	}
 
 	switch args[0] {
-	case "list", "ls":
+	case commandList, "ls":
 		return runContextArtifactsList(ctx, args[1:])
 	case commandPrune:
 		return runContextArtifactsPrune(ctx, args[1:])
-	case "delete", "rm", "remove":
+	case commandDelete, "rm", commandRemove:
 		return runContextArtifactsDelete(ctx, args[1:])
 	default:
 		return runContextArtifactsList(ctx, args)
@@ -620,7 +747,7 @@ func runContextArtifactsList(ctx context.Context, args []string) int {
 	return runContextArtifactsCommand(
 		ctx,
 		args,
-		"list",
+		commandList,
 		func(_ *app.ContextArtifactsParams, _ *flag.FlagSet) {},
 		func(result client.ContextArtifactsResult) { printArtifacts(os.Stdout, result.Artifacts) },
 	)
@@ -640,7 +767,7 @@ func runContextArtifactsDelete(ctx context.Context, args []string) int {
 	return runContextArtifactsCommand(
 		ctx,
 		args,
-		"delete",
+		commandDelete,
 		func(params *app.ContextArtifactsParams, fs *flag.FlagSet) {
 			fs.String("volume", "", "volume name to delete")
 
@@ -666,23 +793,20 @@ func runContextArtifactsCommand(
 	artifactParams := app.ContextArtifactsParams{}
 	configure(&artifactParams, fs)
 
-	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
-	if code != 0 {
-		return code
+	parsed := parseContextCommandFlags(fs, args, remote, current, contextID)
+	if parsed.exitCode != 0 {
+		return parsed.exitCode
 	}
 
-	artifactParams.AddressOverride = params.AddressOverride
-	artifactParams.ConfigPath = params.ConfigPath
-	artifactParams.DiscoveryTimeout = params.DiscoveryTimeout
-	artifactParams.Stderr = params.Stderr
-	artifactParams.ContextID = *contextID
-	artifactParams.Current = *current || *contextID == ""
+	artifactParams.RemoteParams = parsed.params
+	artifactParams.ContextID = parsed.context
+	artifactParams.Current = parsed.current
 
 	if volume := fs.Lookup("volume"); volume != nil {
 		artifactParams.Volume = volume.Value.String()
 	}
 
-	result, err := app.RunContextArtifacts(ctx, cwd, artifactParams)
+	result, err := app.RunContextArtifacts(ctx, parsed.cwd, artifactParams)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -691,6 +815,41 @@ func runContextArtifactsCommand(
 	printResult(result)
 
 	return 0
+}
+
+func parseContextCommandFlags(
+	fs *flag.FlagSet,
+	args []string,
+	remote remoteFlags,
+	current *bool,
+	contextID *string,
+) contextCommandFlags {
+	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
+	if code != 0 {
+		return contextCommandFlags{exitCode: code}
+	}
+
+	targetContextID, useCurrent, err := contextTargetFromFlags(*current, *contextID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return contextCommandFlags{exitCode: exitUsage}
+	}
+
+	return contextCommandFlags{
+		params:  params,
+		cwd:     cwd,
+		context: targetContextID,
+		current: useCurrent,
+	}
+}
+
+func contextTargetFromFlags(current bool, contextID string) (string, bool, error) {
+	contextID = strings.TrimSpace(contextID)
+	if current && contextID != "" {
+		return "", false, errors.New("--current and --context cannot be used together")
+	}
+
+	return contextID, current || contextID == "", nil
 }
 
 func runCache(ctx context.Context, args []string) int {
@@ -1070,7 +1229,7 @@ Usage:
   rmtx pair [flags]
   rmtx ping [flags]
   rmtx stats [flags]
-  rmtx context [list|delete|prune|artifacts] [flags]
+  rmtx context [list|delete|prune|workspaces|artifacts] [flags]
   rmtx cache prune [flags]
   rmtx wsl config [flags]
   rmtx version
@@ -1089,6 +1248,7 @@ Examples:
   rmtx version
   rmtx context list
   rmtx context delete --current
+  rmtx context workspaces list --current
   rmtx context artifacts list --current
   rmtx cache prune
   rmtx wsl config
@@ -1152,9 +1312,12 @@ Command reference:
       Output: paired<TAB><name><TAB><addr><TAB><fingerprint>
 
   rmtx exec [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
-            [--tty|--no-tty] -- <command> [args...]
+            [--tty|--no-tty] [--keep-workspace DURATION]
+            [--reuse-workspace ID] -- <command> [args...]
       Run command remotely. Use --tty for interactive shells/programs. Ctrl+C
       cancels the remote command but keeps the connection open for sync-back.
+      --keep-workspace keeps the host workspace until TTL expiry and prints the
+      lease id to stderr. --reuse-workspace reuses a clean kept workspace.
 
   rmtx ping [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Verify host reachability, TLS fingerprint, and pairing.
@@ -1173,6 +1336,13 @@ Command reference:
 
   rmtx context prune (--all|--older-than DURATION) [--host ADDR] [--config PATH]
       Delete old/all contexts.
+
+  rmtx context workspaces list [--current|--context ID] [remote flags]
+      List kept workspace leases for a context. Columns: ID, EXPIRES, DIRTY,
+      ACTIVE, PATH.
+
+  rmtx context workspaces delete [--current|--context ID] ID ... [remote flags]
+      Delete kept workspace leases.
 
   rmtx context artifacts list [--current|--context ID] [remote flags]
       List context artifacts and total listed size. Columns: KIND, NAME, REF, SIZE, PATH, DETAIL.
@@ -1332,7 +1502,8 @@ Runtime behavior:
   image_commands affect isolated rootfs, not host OS.
   context_commands run in synced workspace. If context_inputs omitted, they run
   before every command. If set, they rerun only when listed inputs change.
-  workspaces are cleaned after each run and rehydrated from synced blobs.
+  workspaces are cleaned after each run unless exec uses --keep-workspace.
+  kept workspace leases expire by TTL and can be reused by id.
   volumes persist on host, do not sync, do not enter manifests, do not sync back.
 
 Validation:
@@ -1354,15 +1525,6 @@ func bindRemoteFlags(fs *flag.FlagSet) remoteFlags {
 
 func (r remoteFlags) params() app.RemoteParams {
 	return app.RemoteParams{
-		AddressOverride:  *r.hostAddr,
-		ConfigPath:       *r.cfgPath,
-		DiscoveryTimeout: *r.discoveryTimeout,
-		Stderr:           os.Stderr,
-	}
-}
-
-func (r remoteFlags) deleteParams() app.ContextDeleteParams {
-	return app.ContextDeleteParams{
 		AddressOverride:  *r.hostAddr,
 		ConfigPath:       *r.cfgPath,
 		DiscoveryTimeout: *r.discoveryTimeout,
@@ -1400,6 +1562,40 @@ func printDeletedContexts(deleted []client.ContextInfo) {
 	for _, context := range deleted {
 		_, _ = fmt.Fprintf(os.Stdout, "deleted\t%s\t%s\n", context.ID, context.Name)
 	}
+}
+
+func printWorkspaceLeases(w io.Writer, workspaces []client.WorkspaceLeaseInfo) {
+	tw := tabwriter.NewWriter(w, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "ID\tEXPIRES\tDIRTY\tACTIVE\tPATH")
+
+	for _, workspace := range workspaces {
+		expires := "-"
+		if !workspace.ExpiresAt.IsZero() {
+			expires = workspace.ExpiresAt.Format(time.RFC3339)
+		}
+
+		dirty := labelNo
+		if workspace.Dirty {
+			dirty = labelYes
+		}
+
+		active := labelNo
+		if workspace.Active {
+			active = labelYes
+		}
+
+		_, _ = fmt.Fprintf(
+			tw,
+			"%s\t%s\t%s\t%s\t%s\n",
+			workspace.ID,
+			expires,
+			dirty,
+			active,
+			workspace.Path,
+		)
+	}
+
+	_ = tw.Flush()
 }
 
 func printArtifacts(w io.Writer, artifacts []client.ContextArtifact) {
