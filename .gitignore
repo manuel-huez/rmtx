@@ -1,4 +1,5 @@
 /rmtx
+/version
 *.test
 coverage.out
 
