@@ -215,6 +215,42 @@ func TestHandleConnIgnoresDisconnectBeforeRequestHeader(t *testing.T) {
 	}
 }
 
+func TestHandleConnSessionIgnoresTopLevelHeartbeat(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+
+	var logs bytes.Buffer
+	s := &Server{logger: log.New(&logs, "", 0)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.handleConnSession(ctx, cancel, protocol.NewConn(serverConn))
+	}()
+
+	client := protocol.NewConn(clientConn)
+	if err := client.WriteJSON(protocol.MsgHeartbeat, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session did not finish after client disconnect")
+	}
+
+	if logs.Len() != 0 {
+		t.Fatalf("expected no request log for heartbeat, got %q", logs.String())
+	}
+}
+
 func TestDiffWorkspaceChangesCanIgnoreModeOnlyChanges(t *testing.T) {
 	before := []syncfs.Entry{{
 		Path: "file.txt",

@@ -19,6 +19,7 @@ import (
 
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/oci"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/version"
 )
@@ -192,7 +193,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		}
 
 		if err := writeRootFSInstanceMarker(rootfs); err != nil {
-			_ = os.RemoveAll(rootfs)
+			_ = pathutil.RemoveAll(rootfs)
 			return preparedRuntime{}, err
 		}
 
@@ -203,7 +204,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 			image.Env,
 			runLogs,
 		); err != nil {
-			_ = os.RemoveAll(rootfs)
+			_ = pathutil.RemoveAll(rootfs)
 			return preparedRuntime{}, err
 		}
 

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 type BlobStore struct{ root string }
@@ -269,7 +271,7 @@ func replaceMaterializedFile(tmp, dest string, mode fs.FileMode, modTime int64) 
 		return err
 	}
 
-	_ = os.RemoveAll(dest)
+	_ = pathutil.RemoveAll(dest)
 	if err := os.Rename(tmp, dest); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename destination file: %w", err)

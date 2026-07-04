@@ -254,7 +254,7 @@ func (s *Server) clearWorkspaceCleaned(id string) error {
 }
 
 func cleanWorkspace(path string) error {
-	if err := os.RemoveAll(path); err != nil {
+	if err := pathutil.RemoveAll(path); err != nil {
 		return fmt.Errorf("delete workspace: %w", err)
 	}
 
@@ -291,7 +291,7 @@ func resetContextDataAfterRootChange(metaDir, oldDataDir, newDataDir string) err
 func removeContextRuntimeData(metaDir, dataDir string) error {
 	if samePath(dataDir, metaDir) {
 		for _, name := range []string{contextWorkspaceDir, "volumes", runtimeDirName} {
-			if err := os.RemoveAll(filepath.Join(dataDir, name)); err != nil {
+			if err := pathutil.RemoveAll(filepath.Join(dataDir, name)); err != nil {
 				return fmt.Errorf("%s: %w", name, err)
 			}
 		}
@@ -299,7 +299,7 @@ func removeContextRuntimeData(metaDir, dataDir string) error {
 		return nil
 	}
 
-	return os.RemoveAll(dataDir)
+	return pathutil.RemoveAll(dataDir)
 }
 
 func samePath(a, b string) bool {
@@ -734,17 +734,17 @@ func (s *Server) removeContext(id string) error {
 
 	metaPath := s.contextMetaDir(id)
 	if samePath(metaPath, dataPath) {
-		if err := os.RemoveAll(metaPath); err != nil {
+		if err := pathutil.RemoveAll(metaPath); err != nil {
 			return fmt.Errorf("delete context %s: %w", id, err)
 		}
 
 		return nil
 	}
 
-	if err := os.RemoveAll(dataPath); err != nil {
+	if err := pathutil.RemoveAll(dataPath); err != nil {
 		return fmt.Errorf("delete context %s data: %w", id, err)
 	}
-	if err := os.RemoveAll(metaPath); err != nil {
+	if err := pathutil.RemoveAll(metaPath); err != nil {
 		return fmt.Errorf("delete context %s metadata: %w", id, err)
 	}
 

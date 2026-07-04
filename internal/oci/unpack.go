@@ -46,19 +46,19 @@ func (s *Store) UnpackImageContext(ctx context.Context, target string, image Ima
 	}
 
 	tmp := target + ".tmp"
-	_ = os.RemoveAll(tmp)
+	_ = pathutil.RemoveAll(tmp)
 	if err := os.MkdirAll(tmp, dirMode); err != nil {
 		return fmt.Errorf("create rootfs temp: %w", err)
 	}
 
 	for _, layer := range image.Layers {
 		if err := ctx.Err(); err != nil {
-			_ = os.RemoveAll(tmp)
+			_ = pathutil.RemoveAll(tmp)
 			return err
 		}
 
 		if err := s.unpackLayer(ctx, tmp, layer.Digest); err != nil {
-			_ = os.RemoveAll(tmp)
+			_ = pathutil.RemoveAll(tmp)
 			return err
 		}
 	}
@@ -66,13 +66,13 @@ func (s *Store) UnpackImageContext(ctx context.Context, target string, image Ima
 	markerContent := []byte(image.ManifestDigest + "\n")
 	markerPath := filepath.Join(tmp, rootfsMarker)
 	if err := os.WriteFile(markerPath, markerContent, storeFileMode); err != nil {
-		_ = os.RemoveAll(tmp)
+		_ = pathutil.RemoveAll(tmp)
 		return err
 	}
 
-	_ = os.RemoveAll(target)
+	_ = pathutil.RemoveAll(target)
 	if err := os.Rename(tmp, target); err != nil {
-		_ = os.RemoveAll(tmp)
+		_ = pathutil.RemoveAll(tmp)
 		return fmt.Errorf("commit rootfs: %w", err)
 	}
 
@@ -148,7 +148,7 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
-		_ = os.RemoveAll(target)
+		_ = pathutil.RemoveAll(target)
 		mode := fileMode(hdr.FileInfo().Mode(), storeFileMode)
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 		if err != nil {
@@ -174,7 +174,7 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
-		_ = os.RemoveAll(target)
+		_ = pathutil.RemoveAll(target)
 		if err := pathutil.Symlink(hdr.Linkname, target); err != nil {
 			if isUnsupportedWindowsSymlink(err) {
 				return nil
@@ -194,7 +194,7 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
-		_ = os.RemoveAll(target)
+		_ = pathutil.RemoveAll(target)
 		return pathutil.Link(linkTarget, target)
 	default:
 		return nil
@@ -238,7 +238,7 @@ func applyWhiteout(root, dir, base string) error {
 		}
 
 		for _, entry := range entries {
-			if err := os.RemoveAll(filepath.Join(target, entry.Name())); err != nil {
+			if err := pathutil.RemoveAll(filepath.Join(target, entry.Name())); err != nil {
 				return err
 			}
 		}
@@ -252,7 +252,7 @@ func applyWhiteout(root, dir, base string) error {
 		return err
 	}
 
-	return os.RemoveAll(target)
+	return pathutil.RemoveAll(target)
 }
 
 func secureLayerPath(root, name string) (string, error) {

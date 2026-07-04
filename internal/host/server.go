@@ -592,6 +592,14 @@ func (s *Server) handleConnRequest(
 	conn *protocol.Conn,
 	head protocol.Header,
 ) (bool, error) {
+	if head.Type == protocol.MsgHeartbeat {
+		if err := conn.DiscardPayload(head); err != nil {
+			return false, err
+		}
+
+		return true, nil
+	}
+
 	var requestLogs *hostLogSubscription
 	if streamsHostLogs(head.Type) {
 		requestLogs = s.logHub.Subscribe(conn)

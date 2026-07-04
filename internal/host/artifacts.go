@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/manuel-huez/rmtx/internal/oci"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
@@ -99,7 +100,7 @@ func (s *Server) deleteContextArtifact(
 
 	path := filepath.Join(contextDir, "volumes", volume)
 	artifact := protocol.ContextArtifact{Kind: "volume", Name: volume, Path: path}
-	if err := os.RemoveAll(path); err != nil {
+	if err := pathutil.RemoveAll(path); err != nil {
 		return nil, err
 	}
 
@@ -238,7 +239,7 @@ func pruneStalePreparedRuntimes(contextDir string) ([]protocol.ContextArtifact, 
 			Size: size,
 		})
 
-		if err := os.RemoveAll(path); err != nil {
+		if err := pathutil.RemoveAll(path); err != nil {
 			return deleted, err
 		}
 	}

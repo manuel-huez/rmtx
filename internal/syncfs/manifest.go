@@ -852,7 +852,7 @@ func DeletePaths(root string, paths []string) error {
 			return err
 		}
 
-		if err := os.RemoveAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := pathutil.RemoveAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("delete %s: %w", rel, err)
 		}
 	}
@@ -907,7 +907,7 @@ func applyNonFileEntry(entry Entry, target string) error {
 			return fmt.Errorf("mkdir symlink parent %s: %w", entry.Path, err)
 		}
 
-		_ = os.RemoveAll(target)
+		_ = pathutil.RemoveAll(target)
 		if err := pathutil.Symlink(entry.Linkname, target); err != nil {
 			if isUnsupportedWindowsSymlink(err) {
 				return nil
@@ -971,7 +971,7 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return fmt.Errorf("chmod file %s: %w", entry.Path, err)
 	}
 
-	if err := os.RemoveAll(target); err != nil {
+	if err := pathutil.RemoveAll(target); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace file %s: %w", entry.Path, err)
 	}
