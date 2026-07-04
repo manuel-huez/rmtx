@@ -48,6 +48,14 @@ func (s *Server) platformOCIChildCommand(
 		return nil, noopCommandCleanup, err
 	}
 
+	s.logRun(
+		run.runLogs,
+		"starting WSL OCI launcher: distro=%s script=%s rootfs=%s",
+		spec.WSLDistro,
+		wslScript,
+		spec.RootFS,
+	)
+
 	args := wslCommandArgs(spec.WSLDistro, "--user", "root", "--exec", "sh", wslScript)
 	cmd := exec.CommandContext(ctx, "wsl.exe", args...)
 	cmd.Env = os.Environ()
@@ -565,14 +573,14 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	b.WriteString("  if command -v unshare >/dev/null 2>&1; then\n")
 
 	if strings.EqualFold(strings.TrimSpace(spec.Network), noneValue) {
-		b.WriteString("    exec unshare -m -n --fork \"$0\" inner\n")
+		b.WriteString("    exec unshare -m -n --fork sh \"$0\" inner\n")
 		b.WriteString("  fi\n")
 		b.WriteString(
 			"  echo 'error: runtime.network=none requires unshare with network namespace support' >&2\n",
 		)
 		b.WriteString("  exit 1\n")
 	} else {
-		b.WriteString("    exec unshare -m --fork \"$0\" inner\n")
+		b.WriteString("    exec unshare -m --fork sh \"$0\" inner\n")
 		b.WriteString("  fi\n")
 		b.WriteString(
 			"  echo 'error: OCI runtime on WSL requires unshare with mount namespace support' >&2\n",

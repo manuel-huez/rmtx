@@ -178,8 +178,5 @@ func (s *Server) hostOnlyLogger() *log.Logger {
 
 func (s *Server) logRun(runLogs io.Writer, format string, args ...any) {
 	s.logger.Printf(format, args...)
-	if _, streamedByHostLogger := runLogs.(*hostLogSubscription); streamedByHostLogger {
-		return
-	}
 	writeRunLogLine(runLogs, format, args...)
 }

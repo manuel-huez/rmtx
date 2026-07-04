@@ -19,11 +19,11 @@ func TestWSLChildScriptUsesNetworkNamespaceForNone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(script, "exec unshare -m -n --fork \"$0\" inner") {
+	if !strings.Contains(script, "exec unshare -m -n --fork sh \"$0\" inner") {
 		t.Fatalf("script does not request network namespace:\n%s", script)
 	}
 
-	if strings.Contains(script, "exec sh \"$0\" inner") {
+	if strings.Contains(script, "exec unshare -m -n --fork \"$0\" inner") {
 		t.Fatalf("script must not fall back without network isolation:\n%s", script)
 	}
 }
@@ -39,11 +39,11 @@ func TestWSLChildScriptRequiresMountNamespaceForHostNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(script, "exec unshare -m --fork \"$0\" inner") {
+	if !strings.Contains(script, "exec unshare -m --fork sh \"$0\" inner") {
 		t.Fatalf("script does not keep mount namespace attempt:\n%s", script)
 	}
 
-	if strings.Contains(script, "exec sh \"$0\" inner") {
+	if strings.Contains(script, "exec unshare -m --fork \"$0\" inner") {
 		t.Fatalf("script must not fall back without mount namespace:\n%s", script)
 	}
 

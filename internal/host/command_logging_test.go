@@ -184,6 +184,50 @@ func TestHostLogHubDoesNotStreamGeneralLogs(t *testing.T) {
 	}
 }
 
+func TestLogRunStreamsToClientSubscription(t *testing.T) {
+	serverRaw, clientRaw := net.Pipe()
+
+	defer func() { _ = serverRaw.Close() }()
+	defer func() { _ = clientRaw.Close() }()
+
+	var hostLogs bytes.Buffer
+
+	hub := newHostLogHub(&hostLogs)
+	sub := hub.Subscribe(protocol.NewConn(serverRaw))
+	defer sub.Close()
+
+	server := &Server{logger: log.New(hub, "", 0)}
+	server.logRun(sub, "preparing OCI runtime: context=%s image=%s", "ctx", "image")
+
+	if err := clientRaw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	client := protocol.NewConn(clientRaw)
+	head, err := client.ReadHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Type != protocol.MsgExecOutput {
+		t.Fatalf("frame type=%s want %s", head.Type, protocol.MsgExecOutput)
+	}
+
+	payload, err := io.ReadAll(client.PayloadReader(head))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantRunLog := "rmtx: preparing OCI runtime: context=ctx image=image\n"
+	if string(payload) != wantRunLog {
+		t.Fatalf("payload=%q want %q", string(payload), wantRunLog)
+	}
+
+	wantHostLog := "preparing OCI runtime: context=ctx image=image\n"
+	if hostLogs.String() != wantHostLog {
+		t.Fatalf("host logs=%q want %q", hostLogs.String(), wantHostLog)
+	}
+}
+
 func TestPullOCIImageWritesRunLogs(t *testing.T) {
 	var (
 		hostLogs bytes.Buffer
