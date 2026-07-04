@@ -224,12 +224,7 @@ func liveWSLStagedRootFS(
 		)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				rootfsEntries, readErr := os.ReadDir(
-					filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName),
-				)
-				if errors.Is(readErr, os.ErrNotExist) {
-					continue
-				}
+				rootfsPaths, readErr := preparedRootFSPaths(contextDir)
 				if readErr != nil {
 					return nil, fmt.Errorf(
 						"list context rootfs for WSL prune context %s: %w",
@@ -237,18 +232,13 @@ func liveWSLStagedRootFS(
 						readErr,
 					)
 				}
-
-				hasPrepared := false
-				for _, rootfsEntry := range rootfsEntries {
-					if rootfsEntry.IsDir() {
-						hasPrepared = true
-
-						break
+				for _, rootfsPath := range rootfsPaths {
+					if err := addLiveWSLStagedRootFS(ctx, distros, rootfsPath, out); err != nil {
+						return nil, err
 					}
 				}
-				if !hasPrepared {
-					continue
-				}
+
+				continue
 			}
 
 			return nil, fmt.Errorf(
@@ -303,6 +293,26 @@ func addLiveWSLStagedRootFS(
 	}
 
 	return nil
+}
+
+func preparedRootFSPaths(contextDir string) ([]string, error) {
+	root := filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName)
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			out = append(out, filepath.Join(root, entry.Name()))
+		}
+	}
+
+	return out, nil
 }
 
 func pruneWSLStagedRootFSInDistro(
