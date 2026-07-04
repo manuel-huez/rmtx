@@ -89,6 +89,26 @@ func TestApplyTarEntryUnpacksLegacyRegularFile(t *testing.T) {
 	}
 }
 
+func TestApplyTarEntryPreservesExecutableMode(t *testing.T) {
+	root := t.TempDir()
+	if err := applyTarEntry(context.Background(), root, &tar.Header{
+		Name:     "bin/tool",
+		Typeflag: tar.TypeReg,
+		Mode:     0o755,
+		Size:     int64(len("#!/bin/sh\n")),
+	}, strings.NewReader("#!/bin/sh\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(filepath.Join(root, "bin", "tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("mode=%#o want 0755", got)
+	}
+}
+
 type tarEntry struct {
 	Name string
 	Body string

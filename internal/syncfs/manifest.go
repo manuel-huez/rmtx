@@ -899,7 +899,7 @@ func applyNonFileEntry(entry Entry, target string) error {
 			return fmt.Errorf("mkdir %s: %w", entry.Path, err)
 		}
 
-		if err := os.Chmod(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
+		if err := pathutil.Chmod(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
 			return fmt.Errorf("chmod dir %s: %w", entry.Path, err)
 		}
 	case KindSymlink:
@@ -966,7 +966,7 @@ func WriteFile(root string, entry Entry, src io.Reader) error {
 		return fmt.Errorf("close file %s: %w", entry.Path, err)
 	}
 
-	if err := os.Chmod(tmp, fileMode(entry.Mode, defaultFileMode)); err != nil {
+	if err := pathutil.Chmod(tmp, fileMode(entry.Mode, defaultFileMode)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("chmod file %s: %w", entry.Path, err)
 	}

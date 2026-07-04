@@ -164,6 +164,10 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
+		if err := pathutil.Chmod(target, mode); err != nil {
+			return err
+		}
+
 		return os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 	case tar.TypeSymlink:
 		if err := validateSymlinkTarget(root, name, hdr.Linkname); err != nil {

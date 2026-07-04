@@ -266,7 +266,7 @@ func materializeTempPath(dest string) (string, error) {
 }
 
 func replaceMaterializedFile(tmp, dest string, mode fs.FileMode, modTime int64) error {
-	if err := os.Chmod(tmp, mode); err != nil {
+	if err := pathutil.Chmod(tmp, mode); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

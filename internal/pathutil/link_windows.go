@@ -4,8 +4,10 @@ package pathutil
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -49,6 +51,36 @@ func Link(oldname, newname string) error {
 	}
 
 	return runWSLLink(link.Distro, "", target.LinuxPath, link.LinuxPath)
+}
+
+// Chmod changes path mode, using WSL when executable bits matter inside WSL storage.
+func Chmod(path string, mode fs.FileMode) error {
+	target, ok, err := ParseWSLUNCPath(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return os.Chmod(path, mode)
+	}
+	if mode.Perm()&0o111 == 0 {
+		return nil
+	}
+
+	out, err := exec.Command(
+		"wsl.exe",
+		"--distribution",
+		target.Distro,
+		"--exec",
+		"chmod",
+		strconv.FormatUint(uint64(mode.Perm()), 8),
+		"--",
+		target.LinuxPath,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("chmod WSL path in %s: %s: %w", target.Distro, strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
 }
 
 func runWSLLink(distro, mode, oldname, newname string) error {

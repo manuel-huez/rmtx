@@ -501,6 +501,32 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 	}
 }
 
+func TestBlobStoreMaterializePreservesExecutableMode(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	const hash = "abcdef"
+	const content = "#!/bin/sh\n"
+	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "script.sh")
+	if err := store.Materialize(hash, dest, 0o755, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("mode=%#o want 0755", got)
+	}
+}
+
 func TestBlobStoreStorePathKeepsBlobIndependentFromSource(t *testing.T) {
 	store := NewBlobStore(t.TempDir())
 	if err := store.Ensure(); err != nil {
