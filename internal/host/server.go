@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -76,8 +75,14 @@ type Options struct {
 }
 
 type runtimeStorage struct {
-	root      string
-	blobStore *syncfs.BlobStore
+	dataRoot    string
+	runtimeRoot string
+	blobStore   *syncfs.BlobStore
+}
+
+type contextStateRoots struct {
+	data    []string
+	runtime []string
 }
 
 type Server struct {
@@ -172,7 +177,7 @@ func (s *Server) cleanupStartupCaches(ctx context.Context) {
 	updates, err := pruneOldUpdateDirs(s.opts.StateDir)
 	logCleanupResult(s.logger, "update", "dirs", updates, err)
 
-	for _, root := range s.runtimeStateRootsOrDefault() {
+	for _, root := range s.stateRootsOrDefault() {
 		temps, err := pruneStartupTempFiles(root)
 		logCleanupResult(s.logger, "temp", "files", temps, err)
 	}
@@ -256,46 +261,92 @@ func (s *Server) runtimeStorage(
 	runtime protocol.RuntimeSpec,
 	runLogs *hostLogSubscription,
 ) (runtimeStorage, error) {
-	root, err := s.platformRuntimeStateDir(ctx, runtime, runLogs)
+	runtimeRoot, err := s.platformRuntimeStateDir(ctx, runtime, runLogs)
 	if err != nil {
 		return runtimeStorage{}, err
 	}
-	root = filepath.Clean(root)
+	dataRoot := filepath.Clean(s.opts.StateDir)
+	runtimeRoot = filepath.Clean(runtimeRoot)
 
-	if err := os.MkdirAll(filepath.Join(root, contextDirName), defaultDirMode); err != nil {
-		return runtimeStorage{}, fmt.Errorf("create runtime context dir: %w", err)
+	if err := os.MkdirAll(filepath.Join(dataRoot, contextDirName), defaultDirMode); err != nil {
+		return runtimeStorage{}, fmt.Errorf("create context data dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(runtimeRoot, contextDirName), defaultDirMode); err != nil {
+		return runtimeStorage{}, fmt.Errorf("create context runtime dir: %w", err)
 	}
 
-	store := syncfs.NewBlobStore(filepath.Join(root, "blobs"))
+	store := syncfs.NewBlobStore(filepath.Join(dataRoot, "blobs"))
 	if err := store.Ensure(); err != nil {
 		return runtimeStorage{}, fmt.Errorf("prepare blob store: %w", err)
 	}
 
-	return runtimeStorage{root: root, blobStore: store}, nil
+	return runtimeStorage{
+		dataRoot:    dataRoot,
+		runtimeRoot: runtimeRoot,
+		blobStore:   store,
+	}, nil
 }
 
 func (s *Server) defaultRuntimeStorage() (runtimeStorage, error) {
 	return s.runtimeStorage(context.Background(), protocol.RuntimeSpec{}, nil)
 }
 
-func (s *Server) runtimeStateRootsOrDefault() []string {
-	roots, err := s.runtimeStateRoots()
-	if err != nil || len(roots) == 0 {
+func (s *Server) stateRootsOrDefault() []string {
+	roots, err := s.contextStateRoots()
+	if err != nil {
 		return []string{s.opts.StateDir}
 	}
 
-	return roots
+	all := uniqueCleanPaths(append(roots.data, roots.runtime...))
+	if len(all) == 0 {
+		return []string{s.opts.StateDir}
+	}
+
+	return all
 }
 
-func (s *Server) runtimeStateRoots() ([]string, error) {
-	roots := map[string]struct{}{filepath.Clean(s.opts.StateDir): {}}
+func (s *Server) contextStateRoots() (contextStateRoots, error) {
+	contexts, err := s.listContexts()
+	if err != nil {
+		return contextStateRoots{}, err
+	}
+
+	return s.stateRootsForContexts(contexts)
+}
+
+func (s *Server) stateRootsForContexts(contexts []protocol.ContextSummary) (contextStateRoots, error) {
+	roots := contextStateRoots{
+		data:    []string{filepath.Clean(s.opts.StateDir)},
+		runtime: []string{filepath.Clean(s.opts.StateDir)},
+	}
+	for _, context := range contexts {
+		meta, err := loadContextMetadata(s.contextMetaDir(context.ID))
+		if err != nil {
+			return contextStateRoots{}, err
+		}
+
+		roots.data = append(roots.data, filepath.Clean(contextDataRoot(meta, s.opts.StateDir)))
+		roots.runtime = append(
+			roots.runtime,
+			filepath.Clean(contextRuntimeRoot(meta, s.opts.StateDir)),
+		)
+	}
+
+	roots.data = uniqueCleanPaths(roots.data)
+	roots.runtime = uniqueCleanPaths(roots.runtime)
+
+	return roots, nil
+}
+
+func (s *Server) contextRuntimeDirs() ([]string, error) {
+	roots := []string{}
 
 	entries, err := os.ReadDir(s.contextsRoot())
 	if errors.Is(err, os.ErrNotExist) {
-		return sortedMapKeys(roots), nil
+		return roots, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("list context metadata roots: %w", err)
+		return nil, fmt.Errorf("list context metadata: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -308,21 +359,13 @@ func (s *Server) runtimeStateRoots() ([]string, error) {
 			return nil, err
 		}
 
-		roots[filepath.Clean(contextDataRoot(meta, s.opts.StateDir))] = struct{}{}
+		roots = append(
+			roots,
+			contextDataDir(contextRuntimeRoot(meta, s.opts.StateDir), entry.Name()),
+		)
 	}
 
-	return sortedMapKeys(roots), nil
-}
-
-func sortedMapKeys(values map[string]struct{}) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-
-	sort.Strings(out)
-
-	return out
+	return uniqueCleanPaths(roots), nil
 }
 
 func (s *Server) Addr() string {
@@ -781,6 +824,7 @@ func (s *Server) handleRunRequest(
 func (s *Server) cleanRunWorkspace(
 	contextID string,
 	workspace string,
+	runtimeDir string,
 	runLogs *hostLogSubscription,
 ) error {
 	// Marker first makes interrupted cleanup recoverable on the next sync.
@@ -788,7 +832,7 @@ func (s *Server) cleanRunWorkspace(
 		return err
 	}
 
-	if err := removeContextSetupCache(filepath.Dir(workspace)); err != nil {
+	if err := removeContextSetupCache(runtimeDir); err != nil {
 		return err
 	}
 
@@ -863,7 +907,7 @@ func (s *Server) currentManifestForRun(
 	}
 
 	// Cleanup marker may mean cleanup completed or was interrupted.
-	if err := removeContextSetupCache(handle.dataDir); err != nil {
+	if err := removeContextSetupCache(handle.runtimeDir); err != nil {
 		return nil, err
 	}
 
@@ -1233,7 +1277,12 @@ func (s *Server) finishRunWorkspace(
 	runLogs *hostLogSubscription,
 ) error {
 	if runWorkspace.lease == nil {
-		return s.cleanRunWorkspace(request.ContextID, handle.workspace, runLogs)
+		return s.cleanRunWorkspace(
+			request.ContextID,
+			handle.workspace,
+			handle.runtimeDir,
+			runLogs,
+		)
 	}
 
 	s.logRun(
@@ -1958,7 +2007,7 @@ func (s *Server) runCommand(
 			ctx,
 			cancel,
 			conn,
-			handle.dataDir,
+			handle.runtimeDir,
 			workspace,
 			workdir,
 			request,
@@ -1970,7 +2019,7 @@ func (s *Server) runCommand(
 			ctx,
 			cancel,
 			conn,
-			handle.dataDir,
+			handle.runtimeDir,
 			workspace,
 			workdir,
 			request,
@@ -2025,11 +2074,10 @@ func (s *Server) runPipeExecCommandWithInput(
 	input *pipeInputForwarding,
 	cancelRunHandle *runCancelHandle,
 ) (int, error) {
-	cancelRun := s.commandCancel(cmd, cancel)
-	if cancelRunHandle != nil {
-		cancelRunHandle.Set(cancelRun)
-	}
-	defer cancelRun()
+	cancelRun := context.CancelFunc(cancel)
+	defer func() {
+		cancelRun()
+	}()
 
 	inputStopped := false
 	stopInput := func() {
@@ -2051,6 +2099,15 @@ func (s *Server) runPipeExecCommandWithInput(
 
 	if err := cmd.Start(); err != nil {
 		return exitCode(err), fmt.Errorf("start command: %w", err)
+	}
+
+	cancelCommand := s.commandCancel(cmd, cancel)
+	cancelRun = cancelCommand
+	if cancelRunHandle != nil {
+		cancelRunHandle.Set(cancelCommand)
+	}
+	if ctx.Err() != nil {
+		cancelCommand()
 	}
 
 	go func() {

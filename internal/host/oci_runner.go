@@ -107,7 +107,7 @@ func (s *Server) runOCIPipeCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -119,7 +119,7 @@ func (s *Server) runOCIPipeCommand(
 
 	if err := s.prepareOCIContextSetup(
 		ctx,
-		contextDir,
+		runtimeDir,
 		workspace,
 		request,
 		preparedRuntime,
@@ -132,7 +132,7 @@ func (s *Server) runOCIPipeCommand(
 
 	cmd, cleanup, err := s.newOCICommand(
 		ctx,
-		contextDir,
+		runtimeDir,
 		workspace,
 		workdir,
 		request,
@@ -187,7 +187,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	runtimeRoot := runtimeRootForContextDataDir(handle.dataDir)
+	runtimeRoot := runtimeRootForContextRuntimeDir(handle.runtimeDir)
 	store := ociStore(runtimeRoot)
 	if err := store.Ensure(); err != nil {
 		return preparedRuntime{}, err
@@ -200,7 +200,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 
 	key := runtimeCacheKey(image.ManifestDigest, request.Runtime)
 	baseRootFS := sharedRootFSPath(runtimeRoot, key)
-	rootfs := contextRootFSPath(handle.dataDir, key)
+	rootfs := contextRootFSPath(handle.runtimeDir, key)
 
 	setupMarker := filepath.Join(baseRootFS, runtimeSetupMarker)
 	if _, err := os.Stat(setupMarker); errors.Is(err, os.ErrNotExist) {
@@ -276,11 +276,11 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	if err := s.ensureOCIVolumes(handle.dataDir, request.Runtime.Volumes); err != nil {
+	if err := s.ensureOCIVolumes(handle.runtimeDir, request.Runtime.Volumes); err != nil {
 		return preparedRuntime{}, err
 	}
 
-	if err := savePreparedRuntimeState(handle.dataDir, image, key, rootfs, baseRootFS); err != nil {
+	if err := savePreparedRuntimeState(handle.runtimeDir, image, key, rootfs, baseRootFS); err != nil {
 		return preparedRuntime{}, err
 	}
 
@@ -288,17 +288,17 @@ func (s *Server) prepareOCIRuntimeLocked(
 }
 
 func savePreparedRuntimeState(
-	contextDir string,
+	runtimeDir string,
 	image oci.Image,
 	key string,
 	rootfs string,
 	baseRootFS string,
 ) error {
-	if err := saveArtifactState(contextDir, image, key, rootfs, baseRootFS); err != nil {
+	if err := saveArtifactState(runtimeDir, image, key, rootfs, baseRootFS); err != nil {
 		return err
 	}
 
-	_, err := pruneStalePreparedRuntimes(contextDir)
+	_, err := pruneStalePreparedRuntimes(runtimeDir)
 
 	return err
 }
@@ -534,7 +534,7 @@ func unpackProgressBytes(done, total int64) string {
 
 func (s *Server) prepareOCIContextSetup(
 	ctx context.Context,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	request protocol.RunRequest,
 	preparedRuntime *preparedRuntime,
@@ -550,8 +550,8 @@ func (s *Server) prepareOCIContextSetup(
 	}
 
 	handle := contextHandle{
-		dataDir:   contextDir,
-		workspace: workspace,
+		runtimeDir: runtimeDir,
+		workspace:  workspace,
 	}
 	prepared, err := s.ensurePreparedOCIRuntime(
 		ctx,
@@ -570,7 +570,7 @@ func (s *Server) prepareOCIContextSetup(
 	}
 
 	statePath := filepath.Join(
-		handle.dataDir,
+		handle.runtimeDir,
 		runtimeDirName,
 		contextSetupFile,
 	)
@@ -586,7 +586,7 @@ func (s *Server) prepareOCIContextSetup(
 
 	if err := s.runOCIContextSetupCommands(
 		ctx,
-		handle.dataDir,
+		handle.runtimeDir,
 		workspace,
 		workdir,
 		request,
@@ -601,7 +601,7 @@ func (s *Server) prepareOCIContextSetup(
 
 func (s *Server) runOCIContextSetupCommands(
 	ctx context.Context,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -628,7 +628,7 @@ func (s *Server) runOCIContextSetupCommands(
 
 		cmd, cleanup, err := s.newOCICommand(
 			ctx,
-			contextDir,
+			runtimeDir,
 			workspace,
 			workdir,
 			setupReq,
@@ -692,7 +692,7 @@ func saveContextSetupCache(path string, key string) error {
 
 func (s *Server) newOCICommand(
 	ctx context.Context,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -700,8 +700,8 @@ func (s *Server) newOCICommand(
 	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	handle := contextHandle{
-		dataDir:   contextDir,
-		workspace: workspace,
+		runtimeDir: runtimeDir,
+		workspace:  workspace,
 	}
 
 	prepared, err := s.ensurePreparedOCIRuntime(ctx, handle, request, preparedRuntime, runLogs)
@@ -723,7 +723,7 @@ func (s *Server) newOCICommand(
 	}
 	for _, volume := range request.Runtime.Volumes {
 		binds = append(binds, ociBind{
-			Source: filepath.Join(handle.dataDir, "volumes", volume.Name),
+			Source: filepath.Join(handle.runtimeDir, "volumes", volume.Name),
 			Target: volume.Target,
 		})
 	}
@@ -747,7 +747,7 @@ func (s *Server) newOCICommand(
 		WSLDistro:   request.Runtime.WSLDistro,
 	}
 
-	return s.ociChildCommand(ctx, spec, handle.dataDir, runLogs)
+	return s.ociChildCommand(ctx, spec, handle.runtimeDir, runLogs)
 }
 
 func finishCommandWithCleanup(code int, runErr error, cleanup commandCleanup) (int, error) {
@@ -1001,9 +1001,9 @@ func saveContextSetupState(path string, state contextSetupState) error {
 	return writeIndentedJSON(path, state)
 }
 
-func (s *Server) ensureOCIVolumes(contextDir string, volumes []protocol.RuntimeVolume) error {
+func (s *Server) ensureOCIVolumes(runtimeDir string, volumes []protocol.RuntimeVolume) error {
 	for _, volume := range volumes {
-		path := filepath.Join(contextDir, "volumes", volume.Name)
+		path := filepath.Join(runtimeDir, "volumes", volume.Name)
 		if err := os.MkdirAll(path, defaultDirMode); err != nil {
 			return fmt.Errorf("create runtime volume %s: %w", volume.Name, err)
 		}
@@ -1013,13 +1013,13 @@ func (s *Server) ensureOCIVolumes(contextDir string, volumes []protocol.RuntimeV
 }
 
 func saveArtifactState(
-	contextDir string,
+	runtimeDir string,
 	image oci.Image,
 	key string,
 	rootfs string,
 	baseRootFS string,
 ) error {
-	path := filepath.Join(contextDir, runtimeDirName, artifactStateFile)
+	path := filepath.Join(runtimeDir, runtimeDirName, artifactStateFile)
 
 	img := artifactImage{
 		Reference: image.Reference,

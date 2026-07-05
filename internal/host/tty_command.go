@@ -13,7 +13,7 @@ func (s *Server) runTTYCommand(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	conn *protocol.Conn,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -25,7 +25,7 @@ func (s *Server) runTTYCommand(
 
 	cmd, cleanup, err := s.newTTYSessionCommand(
 		ctx,
-		contextDir,
+		runtimeDir,
 		workspace,
 		workdir,
 		request,
@@ -45,7 +45,7 @@ func (s *Server) runTTYCommand(
 
 func (s *Server) newTTYSessionCommand(
 	ctx context.Context,
-	contextDir string,
+	runtimeDir string,
 	workspace string,
 	workdir string,
 	request protocol.RunRequest,
@@ -55,7 +55,7 @@ func (s *Server) newTTYSessionCommand(
 	if isOCIRuntime(request.Runtime) {
 		if err := s.prepareOCIContextSetup(
 			ctx,
-			contextDir,
+			runtimeDir,
 			workspace,
 			request,
 			preparedRuntime,
@@ -66,7 +66,7 @@ func (s *Server) newTTYSessionCommand(
 
 		runLogs.Flush()
 
-		return s.newOCICommand(ctx, contextDir, workspace, workdir, request, preparedRuntime, runLogs)
+		return s.newOCICommand(ctx, runtimeDir, workspace, workdir, request, preparedRuntime, runLogs)
 	}
 
 	return s.newSessionCommand(ctx, workspace, workdir, request), noopCommandCleanup, nil

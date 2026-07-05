@@ -8,14 +8,14 @@ import (
 
 type ociChildCommandRequest struct {
 	spec       ociChildSpec
-	contextDir string
+	runtimeDir string
 	runLogs    *hostLogSubscription
 }
 
 func (s *Server) ociChildCommand(
 	ctx context.Context,
 	spec ociChildSpec,
-	contextDir string,
+	runtimeDir string,
 	runLogs *hostLogSubscription,
 ) (*exec.Cmd, commandCleanup, error) {
 	if len(spec.Command) == 0 {
@@ -24,7 +24,7 @@ func (s *Server) ociChildCommand(
 
 	return s.platformOCIChildCommand(ctx, ociChildCommandRequest{
 		spec:       spec,
-		contextDir: contextDir,
+		runtimeDir: runtimeDir,
 		runLogs:    runLogs,
 	})
 }

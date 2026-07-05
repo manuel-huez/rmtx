@@ -319,7 +319,7 @@ func TestListContextArtifactsIncludesWorkspaceVolumesAndImageRefs(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	artifacts, err := s.listContextArtifacts(contextID, contextDir)
+	artifacts, err := s.listContextArtifacts(contextID, contextDir, contextDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestCleanRunWorkspaceInvalidatesContextSetupCache(t *testing.T) {
 		opts:   Options{StateDir: stateDir},
 		logger: log.New(io.Discard, "", 0),
 	}
-	if err := s.cleanRunWorkspace(contextID, workspace, nil); err != nil {
+	if err := s.cleanRunWorkspace(contextID, workspace, contextDir, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -448,10 +448,11 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 				Manifest:  manifest,
 			},
 			contextHandle{
-				metaDir:   contextDir,
-				dataDir:   contextDir,
-				storage:   storage,
-				workspace: workspace,
+				metaDir:    contextDir,
+				dataDir:    contextDir,
+				runtimeDir: contextDir,
+				storage:    storage,
+				workspace:  workspace,
 			},
 			&runWorkspace{workspace: workspace},
 			nil,
@@ -622,7 +623,7 @@ func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	assertPathMissing(t, storage.blobStore.Path(staleHash))
 }
 
-func TestEnsureContextReplacesOldRuntimeDataRoot(t *testing.T) {
+func TestEnsureContextSplitsWorkspaceAndRuntimeRoots(t *testing.T) {
 	stateDir := t.TempDir()
 	runtimeRoot := t.TempDir()
 	s, err := New(Options{
@@ -636,22 +637,22 @@ func TestEnsureContextReplacesOldRuntimeDataRoot(t *testing.T) {
 
 	contextID := "ctx"
 	metaDir := s.contextMetaDir(contextID)
-	oldWorkspace := filepath.Join(metaDir, contextWorkspaceDir)
-	oldVolume := filepath.Join(metaDir, "volumes", "cache")
-	oldRuntime := filepath.Join(metaDir, runtimeDirName)
-	newPartialFile := filepath.Join(
+	oldWorkspace := filepath.Join(stateDir, contextDirName, contextID, contextWorkspaceDir)
+	oldVolume := filepath.Join(stateDir, contextDirName, contextID, "volumes", "cache")
+	oldRuntime := filepath.Join(stateDir, contextDirName, contextID, runtimeDirName)
+	staleRuntimeWorkspace := filepath.Join(
 		runtimeRoot,
 		contextDirName,
 		contextID,
 		contextWorkspaceDir,
 		"stale.txt",
 	)
-	for _, path := range []string{oldWorkspace, oldVolume, oldRuntime, filepath.Dir(newPartialFile)} {
+	for _, path := range []string{oldWorkspace, oldVolume, oldRuntime, filepath.Dir(staleRuntimeWorkspace)} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(newPartialFile, []byte("stale"), 0o644); err != nil {
+	if err := os.WriteFile(staleRuntimeWorkspace, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := saveContextMetadata(metaDir, contextMetadata{
@@ -678,27 +679,119 @@ func TestEnsureContextReplacesOldRuntimeDataRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle, err := s.ensureContext(contextID, "ctx", "", runtimeStorage{
-		root:      runtimeRoot,
-		blobStore: store,
+		dataRoot:    stateDir,
+		runtimeRoot: runtimeRoot,
+		blobStore:   store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertPathMissing(t, oldWorkspace)
 	assertPathMissing(t, oldVolume)
 	assertPathMissing(t, oldRuntime)
-	assertPathMissing(t, newPartialFile)
-	assertPathMissing(t, filepath.Join(metaDir, contextManifestFile))
-	assertPathMissing(t, filepath.Join(metaDir, contextCleanFile))
+	assertPathMissing(t, staleRuntimeWorkspace)
 	assertPathExists(t, handle.workspace)
-	if handle.dataDir != filepath.Join(runtimeRoot, contextDirName, contextID) {
-		t.Fatalf("dataDir=%s want runtime root context dir", handle.dataDir)
+	if handle.dataDir != filepath.Join(stateDir, contextDirName, contextID) {
+		t.Fatalf("dataDir=%s want data root context dir", handle.dataDir)
 	}
-	if handle.meta.DataRoot != runtimeRoot {
-		t.Fatalf("DataRoot=%s want %s", handle.meta.DataRoot, runtimeRoot)
+	if handle.runtimeDir != filepath.Join(runtimeRoot, contextDirName, contextID) {
+		t.Fatalf("runtimeDir=%s want runtime root context dir", handle.runtimeDir)
+	}
+	if handle.meta.DataRoot != "" {
+		t.Fatalf("DataRoot=%s want empty host StateDir marker", handle.meta.DataRoot)
+	}
+	if handle.meta.RuntimeRoot != runtimeRoot {
+		t.Fatalf("RuntimeRoot=%s want %s", handle.meta.RuntimeRoot, runtimeRoot)
 	}
 	assertPathExists(t, filepath.Join(metaDir, contextMetaFile))
+}
+
+func TestEnsureContextMigratesLegacyRuntimeDataRoot(t *testing.T) {
+	stateDir := t.TempDir()
+	legacyRuntimeRoot := t.TempDir()
+	s, err := New(Options{
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contextID := "ctx"
+	metaDir := s.contextMetaDir(contextID)
+	legacyContextDir := filepath.Join(legacyRuntimeRoot, contextDirName, contextID)
+	legacyWorkspaceFile := filepath.Join(legacyContextDir, contextWorkspaceDir, "stale.txt")
+	legacyLease := filepath.Join(legacyContextDir, workspaceLeasesDir, "ws_old")
+	legacyVolumeFile := filepath.Join(legacyContextDir, "volumes", "cache", "data")
+	legacyRuntimeFile := filepath.Join(legacyContextDir, runtimeDirName, "state")
+	legacySetupCache := filepath.Join(legacyContextDir, runtimeDirName, contextSetupFile)
+	for _, path := range []string{
+		filepath.Dir(legacyWorkspaceFile),
+		legacyLease,
+		filepath.Dir(legacyVolumeFile),
+		filepath.Dir(legacyRuntimeFile),
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{legacyWorkspaceFile, legacyVolumeFile, legacyRuntimeFile} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveContextMetadata(metaDir, contextMetadata{
+		ID:       contextID,
+		Name:     "ctx",
+		DataRoot: legacyRuntimeRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveTrackedManifest(contextID, []syncfs.Entry{{
+		Path: "stale.txt",
+		Kind: syncfs.KindFile,
+		Hash: "aa-stale",
+		Size: 5,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveContextSetupState(legacySetupCache, contextSetupState{Key: "old-workspace"}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := syncfs.NewBlobStore(filepath.Join(stateDir, "blobs"))
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := s.ensureContext(contextID, "ctx", "", runtimeStorage{
+		dataRoot:    stateDir,
+		runtimeRoot: legacyRuntimeRoot,
+		blobStore:   store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertPathMissing(t, legacyWorkspaceFile)
+	assertPathMissing(t, legacyLease)
+	assertPathMissing(t, legacySetupCache)
+	assertPathExists(t, legacyVolumeFile)
+	assertPathExists(t, legacyRuntimeFile)
+	assertPathMissing(t, filepath.Join(metaDir, contextManifestFile))
+	assertPathExists(t, handle.workspace)
+	if handle.dataDir != filepath.Join(stateDir, contextDirName, contextID) {
+		t.Fatalf("dataDir=%s want host data root context dir", handle.dataDir)
+	}
+	if handle.runtimeDir != legacyContextDir {
+		t.Fatalf("runtimeDir=%s want legacy runtime dir", handle.runtimeDir)
+	}
+	if handle.meta.DataRoot != "" {
+		t.Fatalf("DataRoot=%s want empty host StateDir marker", handle.meta.DataRoot)
+	}
+	if handle.meta.RuntimeRoot != legacyRuntimeRoot {
+		t.Fatalf("RuntimeRoot=%s want %s", handle.meta.RuntimeRoot, legacyRuntimeRoot)
+	}
 }
 
 func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
@@ -746,6 +839,48 @@ func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
 
 	assertPathMissing(t, defaultStorage.blobStore.Path(hash))
 	assertPathExists(t, runtimeStore.Path(hash))
+}
+
+func TestPruneUnreferencedBlobsScansLegacyRuntimeRoot(t *testing.T) {
+	stateDir := t.TempDir()
+	legacyRuntimeRoot := t.TempDir()
+	s, err := New(Options{
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := saveContextMetadata(s.contextMetaDir("ctx"), contextMetadata{
+		ID:          "ctx",
+		Name:        "ctx",
+		RuntimeRoot: legacyRuntimeRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	staleHash := "aa-stale"
+	legacyStore := syncfs.NewBlobStore(filepath.Join(legacyRuntimeRoot, "blobs"))
+	if err := legacyStore.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, bytesDeleted, err := s.pruneUnreferencedBlobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bytesDeleted != 5 {
+		t.Fatalf("deleted bytes=%d want 5", bytesDeleted)
+	}
+	if len(deleted) != 1 || deleted[0].Kind != "blob" || deleted[0].Ref != staleHash {
+		t.Fatalf("unexpected deleted blobs: %#v", deleted)
+	}
+	assertPathMissing(t, legacyStore.Path(staleHash))
 }
 
 func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {

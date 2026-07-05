@@ -37,7 +37,7 @@ func (s *Server) platformOCIChildCommand(
 		return nil, noopCommandCleanup, err
 	}
 
-	script, err := writeWSLChildScript(run.contextDir, spec)
+	script, err := writeWSLChildScript(run.runtimeDir, spec)
 	if err != nil {
 		return nil, noopCommandCleanup, err
 	}
@@ -210,9 +210,9 @@ func wslRootFSNeedsStage(rootfs string) bool {
 
 func pruneWSLStagedRootFS(
 	ctx context.Context,
-	contextDataDirs []string,
+	contextRuntimeDirs []string,
 ) ([]protocol.ContextArtifact, int64, error) {
-	live, err := liveWSLStagedRootFS(ctx, contextDataDirs)
+	live, err := liveWSLStagedRootFS(ctx, contextRuntimeDirs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -237,7 +237,7 @@ func pruneWSLStagedRootFS(
 
 func liveWSLStagedRootFS(
 	ctx context.Context,
-	contextDataDirs []string,
+	contextRuntimeDirs []string,
 ) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	distros, err := wslInstalledDistros()
@@ -245,17 +245,17 @@ func liveWSLStagedRootFS(
 		return nil, err
 	}
 
-	for _, contextDir := range contextDataDirs {
+	for _, runtimeDir := range contextRuntimeDirs {
 		state, err := loadArtifactState(
-			filepath.Join(contextDir, runtimeDirName, artifactStateFile),
+			filepath.Join(runtimeDir, runtimeDirName, artifactStateFile),
 		)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				rootfsPaths, readErr := preparedRootFSPaths(contextDir)
+				rootfsPaths, readErr := preparedRootFSPaths(runtimeDir)
 				if readErr != nil {
 					return nil, fmt.Errorf(
 						"list context rootfs for WSL prune context %s: %w",
-						filepath.Base(contextDir),
+						filepath.Base(runtimeDir),
 						readErr,
 					)
 				}
@@ -270,7 +270,7 @@ func liveWSLStagedRootFS(
 
 			return nil, fmt.Errorf(
 				"read artifact state for WSL prune context %s: %w",
-				filepath.Base(contextDir),
+				filepath.Base(runtimeDir),
 				err,
 			)
 		}
@@ -322,8 +322,8 @@ func addLiveWSLStagedRootFS(
 	return nil
 }
 
-func preparedRootFSPaths(contextDir string) ([]string, error) {
-	root := filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName)
+func preparedRootFSPaths(runtimeDir string) ([]string, error) {
+	root := filepath.Join(runtimeDir, runtimeDirName, runtimeRootFSDirName)
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -534,8 +534,8 @@ func installWSLDistro(
 	return nil
 }
 
-func writeWSLChildScript(contextDir string, spec ociChildSpec) (string, error) {
-	specDir := filepath.Join(contextDir, runtimeDirName, runtimeSpecDirName)
+func writeWSLChildScript(runtimeDir string, spec ociChildSpec) (string, error) {
+	specDir := filepath.Join(runtimeDir, runtimeDirName, runtimeSpecDirName)
 	if err := os.MkdirAll(specDir, defaultDirMode); err != nil {
 		return "", err
 	}

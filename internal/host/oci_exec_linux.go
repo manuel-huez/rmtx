@@ -18,7 +18,7 @@ func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
 	run ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	specDir := filepath.Join(run.contextDir, runtimeDirName, runtimeSpecDirName)
+	specDir := filepath.Join(run.runtimeDir, runtimeDirName, runtimeSpecDirName)
 	if err := os.MkdirAll(specDir, defaultDirMode); err != nil {
 		return nil, noopCommandCleanup, err
 	}

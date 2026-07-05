@@ -210,13 +210,13 @@ command. When `setup.context_inputs` is set, `rmtx` hashes those workspace files
 and reruns context setup only when they change. If `context_inputs` is omitted,
 context setup runs every command.
 
-Synced file blobs, OCI image blobs, manifests, and refs are stored once in host
-global caches, while contexts keep references to the data they use.
-On Windows OCI runs, hot runtime data (synced blobs, OCI cache, workspaces,
-volumes, shared rootfs bases, private overlays, and setup cache) is stored
-inside the configured WSL distro under
-`${XDG_STATE_HOME:-$HOME/.local/state}/rmtx`; host identity,
-pairing, trust, and update data stay in the Windows host state directory.
+Synced file blobs, OCI image blobs, manifests, and refs are stored once in
+global caches, while contexts keep references to the data they use. On Windows
+OCI runs, synced workspaces and synced file blobs stay in the Windows host state
+directory. OCI runtime data (image cache, volumes, shared rootfs bases, private
+overlays, specs, and setup cache) is stored inside the configured WSL distro
+under `${XDG_STATE_HOME:-$HOME/.local/state}/rmtx`; host identity, pairing,
+trust, and update data stay in the Windows host state directory.
 Context artifact commands show the project-owned view and list total bytes:
 
 ```bash
@@ -239,8 +239,10 @@ execution. `network=none` adds a network namespace. Windows hosts delegate OCI
 execution to WSL2 through `wsl.exe`. Set `runtime.wsl_distro` in the project
 config; rmtx uses that distro and auto-installs it if missing.
 Windows OCI runtime storage uses that distro's Linux filesystem by default, so
-commands avoid `/mnt/c` hot paths. If a context changes WSL distro, rmtx drops
-the old runtime data for that context and syncs into the new distro.
+rootfs, volumes, and runtime setup avoid `/mnt/c` hot paths. The synced
+workspace is bound from the Windows host state directory to avoid copying large
+project data into WSL. If a context changes WSL distro, rmtx drops the old
+runtime data for that context and reuses the host-side synced workspace state.
 
 `gpu=nvidia` requires NVIDIA/WSL GPU devices and fails clearly when unavailable.
 Linux binds `/dev/nvidia*`, NVIDIA driver libraries discovered through

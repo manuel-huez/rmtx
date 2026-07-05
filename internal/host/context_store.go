@@ -30,19 +30,22 @@ type contextMetadata struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	RootHint string `json:"root_hint,omitempty"`
-	// DataRoot is the runtime data root; empty means the host StateDir.
-	DataRoot  string    `json:"data_root,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	// DataRoot stores synced workspace data; empty means the host StateDir.
+	DataRoot string `json:"data_root,omitempty"`
+	// RuntimeRoot stores OCI runtime data; empty means DataRoot.
+	RuntimeRoot string    `json:"runtime_root,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type contextHandle struct {
-	meta      contextMetadata
-	metaDir   string
-	dataDir   string
-	storage   runtimeStorage
-	workspace string
-	created   bool
+	meta       contextMetadata
+	metaDir    string
+	dataDir    string
+	runtimeDir string
+	storage    runtimeStorage
+	workspace  string
+	created    bool
 }
 
 func (s *Server) contextsRoot() string {
@@ -69,11 +72,27 @@ func (s *Server) contextDataDir(id string) (string, error) {
 	return contextDataDir(contextDataRoot(meta, s.opts.StateDir), id), nil
 }
 
+func (s *Server) contextRuntimeDir(id string) (string, error) {
+	metaDir := s.contextMetaDir(id)
+	if _, err := os.Stat(metaDir); errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("context %s not found", id)
+	} else if err != nil {
+		return "", fmt.Errorf("stat context metadata: %w", err)
+	}
+
+	meta, err := loadContextMetadata(metaDir)
+	if err != nil {
+		return "", err
+	}
+
+	return contextDataDir(contextRuntimeRoot(meta, s.opts.StateDir), id), nil
+}
+
 func contextDataDir(root, id string) string {
 	return filepath.Join(root, contextDirName, id)
 }
 
-func runtimeRootForContextDataDir(dir string) string {
+func runtimeRootForContextRuntimeDir(dir string) string {
 	return filepath.Dir(filepath.Dir(dir))
 }
 
@@ -84,6 +103,15 @@ func contextDataRoot(meta contextMetadata, fallback string) string {
 	}
 
 	return root
+}
+
+func contextRuntimeRoot(meta contextMetadata, fallback string) string {
+	root := strings.TrimSpace(meta.RuntimeRoot)
+	if root != "" {
+		return root
+	}
+
+	return contextDataRoot(meta, fallback)
 }
 
 func (s *Server) acquireContext(id string) func() {
@@ -210,11 +238,13 @@ func (s *Server) ensureContext(
 	}
 
 	metaDir := s.contextMetaDir(id)
-	dataDir := contextDataDir(storage.root, id)
+	dataDir := contextDataDir(storage.dataRoot, id)
+	runtimeDir := contextDataDir(storage.runtimeRoot, id)
 	handle := contextHandle{
-		metaDir: metaDir,
-		dataDir: dataDir,
-		storage: storage,
+		metaDir:    metaDir,
+		dataDir:    dataDir,
+		runtimeDir: runtimeDir,
+		storage:    storage,
 	}
 	handle.workspace = filepath.Join(handle.dataDir, contextWorkspaceDir)
 
@@ -224,14 +254,26 @@ func (s *Server) ensureContext(
 	}
 
 	oldDataDir := contextDataDir(contextDataRoot(meta, s.opts.StateDir), id)
+	oldRuntimeDir := contextDataDir(contextRuntimeRoot(meta, s.opts.StateDir), id)
 	meta = hydrateContextMetadata(meta, id, name, rootHint, time.Now().UTC())
-	if samePath(storage.root, s.opts.StateDir) {
+	if samePath(storage.dataRoot, s.opts.StateDir) {
 		meta.DataRoot = ""
 	} else {
-		meta.DataRoot = storage.root
+		meta.DataRoot = storage.dataRoot
+	}
+	if samePath(storage.runtimeRoot, storage.dataRoot) {
+		meta.RuntimeRoot = ""
+	} else {
+		meta.RuntimeRoot = storage.runtimeRoot
 	}
 
-	if err := resetContextDataAfterRootChange(metaDir, oldDataDir, handle.dataDir); err != nil {
+	if err := resetContextStorageAfterRootChange(
+		metaDir,
+		oldDataDir,
+		handle.dataDir,
+		oldRuntimeDir,
+		handle.runtimeDir,
+	); err != nil {
 		return contextHandle{}, err
 	}
 
@@ -242,6 +284,9 @@ func (s *Server) ensureContext(
 
 	if err := os.MkdirAll(handle.workspace, defaultDirMode); err != nil {
 		return contextHandle{}, fmt.Errorf("create context workspace: %w", err)
+	}
+	if err := os.MkdirAll(handle.runtimeDir, defaultDirMode); err != nil {
+		return contextHandle{}, fmt.Errorf("create context runtime dir: %w", err)
 	}
 
 	if err := saveContextMetadata(metaDir, meta); err != nil {
@@ -334,41 +379,82 @@ func cleanWorkspace(path string) error {
 	return nil
 }
 
-func resetContextDataAfterRootChange(metaDir, oldDataDir, newDataDir string) error {
-	if samePath(oldDataDir, newDataDir) {
+func resetContextStorageAfterRootChange(
+	metaDir, oldDataDir, newDataDir string,
+	oldRuntimeDir, newRuntimeDir string,
+) error {
+	dataRootChanged := !samePath(oldDataDir, newDataDir)
+	runtimeRootChanged := !samePath(oldRuntimeDir, newRuntimeDir)
+	if !dataRootChanged && !runtimeRootChanged {
 		return nil
 	}
 
-	// Manifest and runtime data share one correctness boundary: changing roots
-	// means the next sync must rehydrate the target from scratch.
-	if err := removeContextRuntimeData(metaDir, oldDataDir); err != nil {
-		return fmt.Errorf("delete replaced context data: %w", err)
+	if dataRootChanged {
+		// Changing workspace storage invalidates the tracked manifest; next sync
+		// rehydrates the new workspace instead of trusting stale files.
+		if err := removeContextWorkspaceData(oldDataDir); err != nil {
+			return fmt.Errorf("delete replaced context workspace data: %w", err)
+		}
+		if err := removeContextWorkspaceData(newDataDir); err != nil {
+			return fmt.Errorf("delete replacement context workspace data: %w", err)
+		}
+		for _, name := range []string{contextManifestFile, contextCleanFile} {
+			if err := os.Remove(filepath.Join(metaDir, name)); err != nil &&
+				!errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("delete replaced context metadata %s: %w", name, err)
+			}
+		}
+		for _, runtimeDir := range uniqueCleanPaths([]string{oldRuntimeDir, newRuntimeDir}) {
+			if err := removeContextSetupCache(runtimeDir); err != nil {
+				return fmt.Errorf("delete replaced context setup cache: %w", err)
+			}
+		}
 	}
-	if err := removeContextRuntimeData(metaDir, newDataDir); err != nil {
-		return fmt.Errorf("delete replacement context data: %w", err)
-	}
-	for _, name := range []string{contextManifestFile, contextCleanFile} {
-		if err := os.Remove(filepath.Join(metaDir, name)); err != nil &&
-			!errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("delete replaced context metadata %s: %w", name, err)
+
+	if runtimeRootChanged {
+		if !samePath(oldRuntimeDir, oldDataDir) {
+			if err := removeContextWorkspaceData(oldRuntimeDir); err != nil {
+				return fmt.Errorf("delete replaced context runtime workspace data: %w", err)
+			}
+		}
+		if err := removeContextRuntimeData(oldRuntimeDir); err != nil {
+			return fmt.Errorf("delete replaced context runtime data: %w", err)
+		}
+		if !samePath(newRuntimeDir, newDataDir) {
+			if err := removeContextWorkspaceData(newRuntimeDir); err != nil {
+				return fmt.Errorf("delete replacement context runtime workspace data: %w", err)
+			}
+		}
+		if err := removeContextRuntimeData(newRuntimeDir); err != nil {
+			return fmt.Errorf("delete replacement context runtime data: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func removeContextRuntimeData(metaDir, dataDir string) error {
-	if samePath(dataDir, metaDir) {
-		for _, name := range []string{contextWorkspaceDir, workspaceLeasesDir, "volumes", runtimeDirName} {
-			if err := pathutil.RemoveAll(filepath.Join(dataDir, name)); err != nil {
-				return fmt.Errorf("%s: %w", name, err)
-			}
+func removeContextWorkspaceData(dataDir string) error {
+	for _, name := range []string{contextWorkspaceDir, workspaceLeasesDir} {
+		if err := pathutil.RemoveAll(filepath.Join(dataDir, name)); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
 		}
-
-		return nil
 	}
 
-	return pathutil.RemoveAll(dataDir)
+	_ = removeDirIfEmpty(dataDir)
+
+	return nil
+}
+
+func removeContextRuntimeData(dataDir string) error {
+	for _, name := range []string{"volumes", runtimeDirName} {
+		if err := pathutil.RemoveAll(filepath.Join(dataDir, name)); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+
+	_ = removeDirIfEmpty(dataDir)
+
+	return nil
 }
 
 func samePath(a, b string) bool {
@@ -556,7 +642,10 @@ func (s *Server) deleteContexts(
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
 	}
-	roots := runtimeRootsForContexts(s.opts.StateDir, contexts)
+	roots, err := s.stateRootsForContexts(contexts)
+	if err != nil {
+		return protocol.DeleteContextsResponse{}, err
+	}
 
 	s.logger.Printf(
 		"context delete targets selected: requested_ids=%s all=%t older_than=%q available=%d targets=%s not_found=%s",
@@ -588,15 +677,15 @@ func (s *Server) deleteContexts(
 	}, nil
 }
 
-func (s *Server) pruneCachesAfterContextDelete(ctx context.Context, roots []string) error {
+func (s *Server) pruneCachesAfterContextDelete(ctx context.Context, roots contextStateRoots) error {
 	if err := s.pruneLoggedCache("OCI", func() ([]protocol.ContextArtifact, int64, error) {
-		return s.pruneUnreferencedOCICacheInRoots(roots)
+		return s.pruneUnreferencedOCICacheInRoots(roots.runtime)
 	}); err != nil {
 		return err
 	}
 
 	if err := s.pruneLoggedCache("blob", func() ([]protocol.ContextArtifact, int64, error) {
-		return s.pruneUnreferencedBlobsInRoots(roots)
+		return s.pruneUnreferencedBlobsInRoots(append(roots.data, roots.runtime...))
 	}); err != nil {
 		return err
 	}
@@ -611,33 +700,13 @@ func (s *Server) pruneCachesAfterContextDelete(ctx context.Context, roots []stri
 	return nil
 }
 
-func runtimeRootsForContexts(
-	defaultRoot string,
-	contexts []protocol.ContextSummary,
-) []string {
-	roots := []string{defaultRoot}
-	for _, context := range contexts {
-		if strings.TrimSpace(context.Path) == "" {
-			continue
-		}
-		roots = append(roots, runtimeRootForContextDataDir(context.Path))
-	}
-
-	return uniqueCleanPaths(roots)
-}
-
 func (s *Server) pruneWSLStagedRootFS(ctx context.Context) ([]protocol.ContextArtifact, int64, error) {
-	contexts, err := s.listContexts()
+	dirs, err := s.contextRuntimeDirs()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	dataDirs := make([]string, 0, len(contexts))
-	for _, context := range contexts {
-		dataDirs = append(dataDirs, context.Path)
-	}
-
-	return pruneWSLStagedRootFS(ctx, dataDirs)
+	return pruneWSLStagedRootFS(ctx, dirs)
 }
 
 func (s *Server) pruneLoggedCache(
@@ -820,9 +889,18 @@ func (s *Server) removeContext(id string) error {
 	if err != nil {
 		return err
 	}
+	runtimePath, err := s.contextRuntimeDir(id)
+	if err != nil {
+		return err
+	}
 
 	metaPath := s.contextMetaDir(id)
 	if samePath(metaPath, dataPath) {
+		if !samePath(runtimePath, dataPath) {
+			if err := pathutil.RemoveAll(runtimePath); err != nil {
+				return fmt.Errorf("delete context %s runtime data: %w", id, err)
+			}
+		}
 		if err := pathutil.RemoveAll(metaPath); err != nil {
 			return fmt.Errorf("delete context %s: %w", id, err)
 		}
@@ -832,6 +910,11 @@ func (s *Server) removeContext(id string) error {
 
 	if err := pathutil.RemoveAll(dataPath); err != nil {
 		return fmt.Errorf("delete context %s data: %w", id, err)
+	}
+	if !samePath(runtimePath, dataPath) && !samePath(runtimePath, metaPath) {
+		if err := pathutil.RemoveAll(runtimePath); err != nil {
+			return fmt.Errorf("delete context %s runtime data: %w", id, err)
+		}
 	}
 	if err := pathutil.RemoveAll(metaPath); err != nil {
 		return fmt.Errorf("delete context %s metadata: %w", id, err)

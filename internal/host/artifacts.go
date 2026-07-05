@@ -32,12 +32,16 @@ func (s *Server) handleContextArtifacts(
 		defer release()
 	}
 
-	contextDir, err := s.contextDataDir(contextID)
+	dataDir, err := s.contextDataDir(contextID)
+	if err != nil {
+		return err
+	}
+	runtimeDir, err := s.contextRuntimeDir(contextID)
 	if err != nil {
 		return err
 	}
 
-	if _, err := os.Stat(contextDir); err != nil {
+	if _, err := os.Stat(s.contextMetaDir(contextID)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("context %s not found", contextID)
 		}
@@ -47,14 +51,14 @@ func (s *Server) handleContextArtifacts(
 
 	var deleted []protocol.ContextArtifact
 	if req.Delete {
-		deleted, err = s.deleteContextArtifact(contextDir, req)
+		deleted, err = s.deleteContextArtifact(runtimeDir, req)
 		if err != nil {
 			return err
 		}
 	}
 
 	if req.Prune {
-		pruned, err := s.pruneContextArtifacts(contextDir)
+		pruned, err := s.pruneContextArtifacts(runtimeDir)
 		if err != nil {
 			return err
 		}
@@ -68,7 +72,7 @@ func (s *Server) handleContextArtifacts(
 		deleted = append(deleted, cachePruned...)
 	}
 
-	artifacts, err := s.listContextArtifacts(contextID, contextDir)
+	artifacts, err := s.listContextArtifacts(contextID, dataDir, runtimeDir)
 	if err != nil {
 		return err
 	}
@@ -86,7 +90,7 @@ func (s *Server) handleContextArtifacts(
 }
 
 func (s *Server) deleteContextArtifact(
-	contextDir string,
+	runtimeDir string,
 	req protocol.ContextArtifactsRequest,
 ) ([]protocol.ContextArtifact, error) {
 	volume := strings.TrimSpace(req.Volume)
@@ -98,21 +102,21 @@ func (s *Server) deleteContextArtifact(
 		return nil, fmt.Errorf("invalid volume name %q", volume)
 	}
 
-	path := filepath.Join(contextDir, "volumes", volume)
+	path := filepath.Join(runtimeDir, "volumes", volume)
 	artifact := protocol.ContextArtifact{Kind: "volume", Name: volume, Path: path}
 	if err := pathutil.RemoveAll(path); err != nil {
 		return nil, err
 	}
 
-	if err := removeContextSetupCache(contextDir); err != nil {
+	if err := removeContextSetupCache(runtimeDir); err != nil {
 		return nil, err
 	}
 
 	return []protocol.ContextArtifact{artifact}, nil
 }
 
-func removeContextSetupCache(contextDir string) error {
-	path := filepath.Join(contextDir, runtimeDirName, contextSetupFile)
+func removeContextSetupCache(runtimeDir string) error {
+	path := filepath.Join(runtimeDir, runtimeDirName, contextSetupFile)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -120,20 +124,20 @@ func removeContextSetupCache(contextDir string) error {
 	return nil
 }
 
-func (s *Server) pruneContextArtifacts(contextDir string) ([]protocol.ContextArtifact, error) {
+func (s *Server) pruneContextArtifacts(runtimeDir string) ([]protocol.ContextArtifact, error) {
 	var deleted []protocol.ContextArtifact
 
-	specs, err := pruneRuntimeSpecs(contextDir)
+	specs, err := pruneRuntimeSpecs(runtimeDir)
 	if err != nil {
 		return nil, err
 	}
 	deleted = append(deleted, specs...)
 
-	if err := compactArtifactState(contextDir); err != nil {
+	if err := compactArtifactState(runtimeDir); err != nil {
 		return nil, err
 	}
 
-	prepared, err := pruneStalePreparedRuntimes(contextDir)
+	prepared, err := pruneStalePreparedRuntimes(runtimeDir)
 	if err != nil {
 		return nil, err
 	}
@@ -142,8 +146,8 @@ func (s *Server) pruneContextArtifacts(contextDir string) ([]protocol.ContextArt
 	return deleted, nil
 }
 
-func compactArtifactState(contextDir string) error {
-	path := filepath.Join(contextDir, runtimeDirName, artifactStateFile)
+func compactArtifactState(runtimeDir string) error {
+	path := filepath.Join(runtimeDir, runtimeDirName, artifactStateFile)
 	state, err := loadArtifactState(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -188,9 +192,9 @@ func artifactImagesForDigest(images []artifactImage, digest string) []artifactIm
 	return out
 }
 
-func pruneRuntimeSpecs(contextDir string) ([]protocol.ContextArtifact, error) {
+func pruneRuntimeSpecs(runtimeDir string) ([]protocol.ContextArtifact, error) {
 	var deleted []protocol.ContextArtifact
-	specDir := filepath.Join(contextDir, runtimeDirName, runtimeSpecDirName)
+	specDir := filepath.Join(runtimeDir, runtimeDirName, runtimeSpecDirName)
 
 	err := filepath.WalkDir(specDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
@@ -208,14 +212,14 @@ func pruneRuntimeSpecs(contextDir string) ([]protocol.ContextArtifact, error) {
 	return deleted, nil
 }
 
-func pruneStalePreparedRuntimes(contextDir string) ([]protocol.ContextArtifact, error) {
-	state, _ := loadArtifactState(filepath.Join(contextDir, runtimeDirName, artifactStateFile))
+func pruneStalePreparedRuntimes(runtimeDir string) ([]protocol.ContextArtifact, error) {
+	state, _ := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
 	live := map[string]bool{}
 	for _, prepared := range state.Prepared {
 		live[prepared.Key] = true
 	}
 
-	root := filepath.Join(contextDir, runtimeDirName, runtimeRootFSDirName)
+	root := filepath.Join(runtimeDir, runtimeDirName, runtimeRootFSDirName)
 	var deleted []protocol.ContextArtifact
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -249,11 +253,12 @@ func pruneStalePreparedRuntimes(contextDir string) ([]protocol.ContextArtifact, 
 
 func (s *Server) listContextArtifacts(
 	contextID string,
-	contextDir string,
+	dataDir string,
+	runtimeDir string,
 ) ([]protocol.ContextArtifact, error) {
 	var out []protocol.ContextArtifact
 
-	workspace := filepath.Join(contextDir, contextWorkspaceDir)
+	workspace := filepath.Join(dataDir, contextWorkspaceDir)
 	if size, err := dirSize(workspace); err == nil {
 		out = append(out, protocol.ContextArtifact{
 			Kind: "workspace",
@@ -263,7 +268,7 @@ func (s *Server) listContextArtifacts(
 		})
 	}
 
-	volumeRoot := filepath.Join(contextDir, "volumes")
+	volumeRoot := filepath.Join(runtimeDir, "volumes")
 	volumes, err := os.ReadDir(volumeRoot)
 	if err == nil {
 		for _, volume := range volumes {
@@ -284,13 +289,13 @@ func (s *Server) listContextArtifacts(
 		return nil, err
 	}
 
-	state, _ := loadArtifactState(filepath.Join(contextDir, runtimeDirName, artifactStateFile))
+	state, _ := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
 	for _, image := range state.Images {
 		out = append(out, protocol.ContextArtifact{
 			Kind:   "image",
 			Name:   image.Reference,
 			Ref:    image.Digest,
-			Size:   ociBlobSize(contextDir, image.Blobs),
+			Size:   ociBlobSize(runtimeDir, image.Blobs),
 			Detail: fmt.Sprintf("%d blobs", len(image.Blobs)),
 		})
 	}
@@ -374,12 +379,12 @@ func (s *Server) pruneAllCaches(ctx context.Context) ([]protocol.ContextArtifact
 }
 
 func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64, error) {
-	roots, err := s.runtimeStateRoots()
+	roots, err := s.contextStateRoots()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	return s.pruneUnreferencedOCICacheInRoots(roots)
+	return s.pruneUnreferencedOCICacheInRoots(roots.runtime)
 }
 
 func (s *Server) pruneUnreferencedOCICacheInRoots(
@@ -579,19 +584,31 @@ func readOCIRefManifestDigest(path string) (string, error) {
 
 func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error) {
 	refs := map[string]map[string]bool{}
-	contexts, err := s.listContexts()
+	entries, err := os.ReadDir(s.contextsRoot())
+	if errors.Is(err, os.ErrNotExist) {
+		return refs, nil
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list context metadata: %w", err)
 	}
 
-	for _, context := range contexts {
-		root := filepath.Clean(runtimeRootForContextDataDir(context.Path))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		meta, err := loadContextMetadata(filepath.Join(s.contextsRoot(), entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		root := filepath.Clean(contextRuntimeRoot(meta, s.opts.StateDir))
 		if refs[root] == nil {
 			refs[root] = map[string]bool{}
 		}
+		runtimeDir := contextDataDir(root, entry.Name())
 
 		state, err := loadArtifactState(
-			filepath.Join(context.Path, runtimeDirName, artifactStateFile),
+			filepath.Join(runtimeDir, runtimeDirName, artifactStateFile),
 		)
 		if err != nil {
 			continue
@@ -614,12 +631,12 @@ func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error
 }
 
 func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, error) {
-	roots, err := s.runtimeStateRoots()
+	roots, err := s.contextStateRoots()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	return s.pruneUnreferencedBlobsInRoots(roots)
+	return s.pruneUnreferencedBlobsInRoots(append(roots.data, roots.runtime...))
 }
 
 func (s *Server) pruneUnreferencedBlobsInRoots(
@@ -693,25 +710,36 @@ func pruneUnreferencedBlobsInRoot(
 
 func (s *Server) referencedBlobHashesByRoot() (map[string]map[string]bool, error) {
 	refs := map[string]map[string]bool{}
-	contexts, err := s.listContexts()
+	entries, err := os.ReadDir(s.contextsRoot())
+	if errors.Is(err, os.ErrNotExist) {
+		return refs, nil
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list context metadata: %w", err)
 	}
 
-	for _, context := range contexts {
-		root := filepath.Clean(runtimeRootForContextDataDir(context.Path))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		meta, err := loadContextMetadata(filepath.Join(s.contextsRoot(), entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		root := filepath.Clean(contextDataRoot(meta, s.opts.StateDir))
 		if refs[root] == nil {
 			refs[root] = map[string]bool{}
 		}
 
-		entries, err := s.loadTrackedManifest(context.ID)
+		entries, err := s.loadTrackedManifest(entry.Name())
 		if err != nil {
 			return nil, err
 		}
 
-		for _, entry := range entries {
-			if entry.Kind == syncfs.KindFile && entry.Hash != "" {
-				refs[root][entry.Hash] = true
+		for _, manifestEntry := range entries {
+			if manifestEntry.Kind == syncfs.KindFile && manifestEntry.Hash != "" {
+				refs[root][manifestEntry.Hash] = true
 			}
 		}
 	}
@@ -830,8 +858,8 @@ func isOCICacheTempFile(name string) bool {
 	return strings.Contains(name, ".tmp-")
 }
 
-func ociBlobSize(contextDir string, digests []string) int64 {
-	store := ociStore(runtimeRootForContextDataDir(contextDir))
+func ociBlobSize(runtimeDir string, digests []string) int64 {
+	store := ociStore(runtimeRootForContextRuntimeDir(runtimeDir))
 	var total int64
 
 	for _, digest := range digests {
