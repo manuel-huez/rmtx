@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1079,6 +1080,28 @@ func TestOCIBaseEnvPreservesImagePath(t *testing.T) {
 
 	if env[0] != "PATH=/usr/local/go/bin:/usr/bin" {
 		t.Fatalf("PATH not overridden by image env: %#v", env)
+	}
+}
+
+func TestMergeNvidiaRuntimeEnvPrependsPathWithoutDroppingImagePath(t *testing.T) {
+	env := mergeNvidiaRuntimeEnv(
+		[]string{
+			"PATH=/image/bin:/usr/bin",
+			"FOO=bar",
+		},
+		nvidiaRuntimeSpec{
+			Env:          []string{"LD_LIBRARY_PATH=/driver/lib"},
+			PathPrefixes: []string{"/usr/lib/wsl/lib", "/image/bin"},
+		},
+	)
+
+	want := []string{
+		"PATH=/usr/lib/wsl/lib:/image/bin:/usr/bin",
+		"FOO=bar",
+		"LD_LIBRARY_PATH=/driver/lib",
+	}
+	if !slices.Equal(env, want) {
+		t.Fatalf("env=%#v want %#v", env, want)
 	}
 }
 

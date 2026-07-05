@@ -382,7 +382,7 @@ func (s *Server) runImageSetupCommands(
 		return nvidiaUnavailableError(err)
 	}
 
-	env := append(ociBaseEnv(imageEnv), gpuRuntime.Env...)
+	env := mergeNvidiaRuntimeEnv(ociBaseEnv(imageEnv), gpuRuntime)
 
 	for _, command := range runtimeSpec.Setup.ImageCommands {
 		if strings.TrimSpace(command) == "" {
@@ -638,7 +638,7 @@ func (s *Server) newOCICommand(
 		return nil, noopCommandCleanup, nvidiaUnavailableError(err)
 	}
 	binds = append(binds, gpuRuntime.Binds...)
-	env = append(env, gpuRuntime.Env...)
+	env = mergeNvidiaRuntimeEnv(env, gpuRuntime)
 
 	spec := ociChildSpec{
 		RootFS:    prepared.RootFS,
@@ -673,6 +673,49 @@ func finishCommandWithCleanup(code int, runErr error, cleanup commandCleanup) (i
 
 func ociBaseEnv(imageEnv []string) []string {
 	return mergeEnvEntries([]string{defaultOCIPathEnv}, imageEnv)
+}
+
+func mergeNvidiaRuntimeEnv(env []string, runtime nvidiaRuntimeSpec) []string {
+	env = mergeEnvEntries(env, runtime.Env)
+	if len(runtime.PathPrefixes) == 0 {
+		return env
+	}
+
+	current := ""
+	for _, entry := range env {
+		parts := strings.SplitN(entry, "=", splitNEquals)
+		if parts[0] != "PATH" {
+			continue
+		}
+		if len(parts) == splitNEquals {
+			current = parts[1]
+		}
+		break
+	}
+	if current == "" {
+		current = strings.TrimPrefix(defaultOCIPathEnv, "PATH=")
+	}
+
+	seen := map[string]bool{}
+	paths := make([]string, 0, len(runtime.PathPrefixes)+len(strings.Split(current, ":")))
+	for _, prefix := range runtime.PathPrefixes {
+		prefix = strings.TrimSpace(prefix)
+		if prefix == "" || seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		paths = append(paths, prefix)
+	}
+	for _, path := range strings.Split(current, ":") {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+
+	return mergeEnvEntries(env, []string{"PATH=" + strings.Join(paths, ":")})
 }
 
 func mergeEnvEntries(base []string, overrides []string) []string {

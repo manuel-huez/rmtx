@@ -4,6 +4,7 @@ package host
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,50 @@ func TestWSLChildScriptRequiresMountNamespaceForHostNetwork(t *testing.T) {
 
 	if !strings.Contains(script, "requires unshare with mount namespace support") {
 		t.Fatalf("script should explain missing unshare requirement:\n%s", script)
+	}
+}
+
+func TestWindowsNvidiaRuntimeBindsWSLDriverStore(t *testing.T) {
+	spec, err := nvidiaRuntime("nvidia")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Contains(spec.PathPrefixes, "/usr/lib/wsl/lib") {
+		t.Fatalf("missing PATH prefix in %#v", spec.PathPrefixes)
+	}
+
+	for _, want := range []ociBind{
+		{Source: "/dev/dxg", Target: "/dev/dxg"},
+		{Source: "/usr/lib/wsl/lib", Target: "/usr/lib/wsl/lib", ReadOnly: true},
+		{Source: "/usr/lib/wsl/drivers", Target: "/usr/lib/wsl/drivers", ReadOnly: true},
+	} {
+		if !slices.Contains(spec.Binds, want) {
+			t.Fatalf("missing bind %#v in %#v", want, spec.Binds)
+		}
+	}
+}
+
+func TestWSLChildScriptChecksNvidiaRuntimeInputs(t *testing.T) {
+	script, err := wslChildScript(ociChildSpec{
+		RootFS:  "/rootfs",
+		WorkDir: "/workspace",
+		Command: []string{"sh"},
+		Network: "host",
+		GPU:     "nvidia",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"/dev/dxg",
+		"/usr/lib/wsl/lib",
+		"/usr/lib/wsl/drivers",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q:\n%s", want, script)
+		}
 	}
 }
 

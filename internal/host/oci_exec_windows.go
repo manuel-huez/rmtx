@@ -71,9 +71,13 @@ func nvidiaRuntime(mode string) (nvidiaRuntimeSpec, error) {
 				"NVIDIA_DRIVER_CAPABILITIES=compute,utility",
 				"LD_LIBRARY_PATH=/usr/lib/wsl/lib",
 			},
+			// WSL exposes nvidia-smi and driver libraries outside normal image paths.
+			PathPrefixes: []string{"/usr/lib/wsl/lib"},
 			Binds: []ociBind{
 				{Source: "/dev/dxg", Target: "/dev/dxg"},
 				{Source: "/usr/lib/wsl/lib", Target: "/usr/lib/wsl/lib", ReadOnly: true},
+				// NVML needs the Windows driver store in addition to /usr/lib/wsl/lib.
+				{Source: "/usr/lib/wsl/drivers", Target: "/usr/lib/wsl/drivers", ReadOnly: true},
 			},
 		}, nil
 	}
@@ -82,8 +86,9 @@ func nvidiaRuntime(mode string) (nvidiaRuntimeSpec, error) {
 }
 
 type nvidiaRuntimeSpec struct {
-	Binds []ociBind
-	Env   []string
+	Binds        []ociBind
+	Env          []string
+	PathPrefixes []string
 }
 
 func nvidiaUnavailableError(err error) error {
@@ -605,6 +610,9 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 		)
 		b.WriteString(
 			"if [ ! -d /usr/lib/wsl/lib ]; then echo 'error: NVIDIA CUDA requested but WSL driver libraries were not found' >&2; exit 1; fi\n",
+		)
+		b.WriteString(
+			"if [ ! -d /usr/lib/wsl/drivers ]; then echo 'error: NVIDIA CUDA requested but WSL driver store was not found' >&2; exit 1; fi\n",
 		)
 	}
 

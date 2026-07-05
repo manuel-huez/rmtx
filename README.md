@@ -244,8 +244,9 @@ the old runtime data for that context and syncs into the new distro.
 `gpu=nvidia` requires NVIDIA/WSL GPU devices and fails clearly when unavailable.
 Linux binds `/dev/nvidia*`, NVIDIA driver libraries discovered through
 `ldconfig`, common CUDA driver paths, and `nvidia-smi` when present. Windows
-WSL binds `/dev/dxg` and `/usr/lib/wsl/lib`. This is enough for common CUDA
-images, but it is not full `nvidia-container-runtime` parity.
+WSL binds `/dev/dxg`, `/usr/lib/wsl/lib`, and `/usr/lib/wsl/drivers`. This is
+enough for common CUDA images, but it is not full `nvidia-container-runtime`
+parity.
 
 To ignore everything under a specific directory, use `dir/**`. For example,
 `"ignore": ["data/cache/**"]` skips every file and subdirectory under

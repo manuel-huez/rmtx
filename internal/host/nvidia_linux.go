@@ -66,8 +66,9 @@ func nvidiaRuntime(mode string) (nvidiaRuntimeSpec, error) {
 }
 
 type nvidiaRuntimeSpec struct {
-	Binds []ociBind
-	Env   []string
+	Binds        []ociBind
+	Env          []string
+	PathPrefixes []string
 }
 
 func nvidiaDeviceBinds() ([]ociBind, error) {
