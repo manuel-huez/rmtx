@@ -297,13 +297,17 @@ func (s *Server) listContextArtifacts(
 
 	for _, prepared := range state.Prepared {
 		size, _ := dirSize(prepared.Path)
+		detail := prepared.ImageReference
+		if strings.TrimSpace(prepared.BasePath) != "" {
+			detail = fmt.Sprintf("%s base=%s", prepared.ImageReference, prepared.BasePath)
+		}
 		out = append(out, protocol.ContextArtifact{
 			Kind:   "prepared-runtime",
 			Name:   prepared.Key,
 			Path:   prepared.Path,
 			Ref:    prepared.ImageDigest,
 			Size:   size,
-			Detail: prepared.ImageReference,
+			Detail: detail,
 		})
 	}
 
@@ -370,6 +374,17 @@ func (s *Server) pruneAllCaches(ctx context.Context) ([]protocol.ContextArtifact
 }
 
 func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64, error) {
+	roots, err := s.runtimeStateRoots()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return s.pruneUnreferencedOCICacheInRoots(roots)
+}
+
+func (s *Server) pruneUnreferencedOCICacheInRoots(
+	roots []string,
+) ([]protocol.ContextArtifact, int64, error) {
 	s.ociMu.Lock()
 	defer s.ociMu.Unlock()
 
@@ -377,24 +392,45 @@ func (s *Server) pruneUnreferencedOCICache() ([]protocol.ContextArtifact, int64,
 	if err != nil {
 		return nil, 0, err
 	}
-	roots, err := s.runtimeStateRoots()
-	if err != nil {
-		return nil, 0, err
-	}
 
 	var deleted []protocol.ContextArtifact
 	var bytes int64
 
-	for _, root := range roots {
+	for _, root := range uniqueCleanPaths(roots) {
 		pruned, prunedBytes, err := pruneUnreferencedOCIStore(ociStore(root), refsByRoot[root])
 		if err != nil {
 			return nil, 0, err
 		}
 		deleted = append(deleted, pruned...)
 		bytes += prunedBytes
+
+		rootfsPruned, rootfsBytes, err := pruneUnreferencedSharedRootFS(
+			sharedRootFSRoot(root),
+			refsByRoot[root],
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+		deleted = append(deleted, rootfsPruned...)
+		bytes += rootfsBytes
 	}
 
 	return deleted, bytes, nil
+}
+
+func uniqueCleanPaths(paths []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, value := range paths {
+		value = filepath.Clean(value)
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+
+	return out
 }
 
 func pruneUnreferencedOCIStore(
@@ -489,6 +525,44 @@ func removeCachedOCIArtifact(
 	return os.Remove(path)
 }
 
+func pruneUnreferencedSharedRootFS(
+	root string,
+	refs map[string]bool,
+) ([]protocol.ContextArtifact, int64, error) {
+	var deleted []protocol.ContextArtifact
+	var bytes int64
+
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || refs[entry.Name()] {
+			continue
+		}
+
+		path := filepath.Join(root, entry.Name())
+		size, _ := dirSize(path)
+		deleted = append(deleted, protocol.ContextArtifact{
+			Kind: "cache-rootfs",
+			Name: entry.Name(),
+			Path: path,
+			Size: size,
+		})
+		bytes += size
+
+		if err := pathutil.RemoveAll(path); err != nil {
+			return deleted, bytes, err
+		}
+	}
+
+	return deleted, bytes, nil
+}
+
 func readOCIRefManifestDigest(path string) (string, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -529,12 +603,28 @@ func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error
 				refs[root][blob] = true
 			}
 		}
+		for _, prepared := range state.Prepared {
+			if prepared.Key != "" {
+				refs[root][prepared.Key] = true
+			}
+		}
 	}
 
 	return refs, nil
 }
 
 func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, error) {
+	roots, err := s.runtimeStateRoots()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return s.pruneUnreferencedBlobsInRoots(roots)
+}
+
+func (s *Server) pruneUnreferencedBlobsInRoots(
+	roots []string,
+) ([]protocol.ContextArtifact, int64, error) {
 	s.blobGCMu.Lock()
 	defer s.blobGCMu.Unlock()
 
@@ -542,15 +632,11 @@ func (s *Server) pruneUnreferencedBlobs() ([]protocol.ContextArtifact, int64, er
 	if err != nil {
 		return nil, 0, err
 	}
-	roots, err := s.runtimeStateRoots()
-	if err != nil {
-		return nil, 0, err
-	}
 
 	var deleted []protocol.ContextArtifact
 	var bytes int64
 
-	for _, runtimeRoot := range roots {
+	for _, runtimeRoot := range uniqueCleanPaths(roots) {
 		pruned, prunedBytes, err := pruneUnreferencedBlobsInRoot(
 			filepath.Join(runtimeRoot, "blobs"),
 			refsByRoot[runtimeRoot],

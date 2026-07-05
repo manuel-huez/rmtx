@@ -556,6 +556,7 @@ func (s *Server) deleteContexts(
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
 	}
+	roots := runtimeRootsForContexts(s.opts.StateDir, contexts)
 
 	s.logger.Printf(
 		"context delete targets selected: requested_ids=%s all=%t older_than=%q available=%d targets=%s not_found=%s",
@@ -573,7 +574,7 @@ func (s *Server) deleteContexts(
 	}
 
 	if len(deleted) > 0 {
-		if err := s.pruneCachesAfterContextDelete(ctx); err != nil {
+		if err := s.pruneCachesAfterContextDelete(ctx, roots); err != nil {
 			return protocol.DeleteContextsResponse{}, err
 		}
 	}
@@ -587,12 +588,16 @@ func (s *Server) deleteContexts(
 	}, nil
 }
 
-func (s *Server) pruneCachesAfterContextDelete(ctx context.Context) error {
-	if err := s.pruneLoggedCache("OCI", s.pruneUnreferencedOCICache); err != nil {
+func (s *Server) pruneCachesAfterContextDelete(ctx context.Context, roots []string) error {
+	if err := s.pruneLoggedCache("OCI", func() ([]protocol.ContextArtifact, int64, error) {
+		return s.pruneUnreferencedOCICacheInRoots(roots)
+	}); err != nil {
 		return err
 	}
 
-	if err := s.pruneLoggedCache("blob", s.pruneUnreferencedBlobs); err != nil {
+	if err := s.pruneLoggedCache("blob", func() ([]protocol.ContextArtifact, int64, error) {
+		return s.pruneUnreferencedBlobsInRoots(roots)
+	}); err != nil {
 		return err
 	}
 
@@ -604,6 +609,21 @@ func (s *Server) pruneCachesAfterContextDelete(ctx context.Context) error {
 	s.logContextDeletePrune("WSL rootfs", pruned, bytes)
 
 	return nil
+}
+
+func runtimeRootsForContexts(
+	defaultRoot string,
+	contexts []protocol.ContextSummary,
+) []string {
+	roots := []string{defaultRoot}
+	for _, context := range contexts {
+		if strings.TrimSpace(context.Path) == "" {
+			continue
+		}
+		roots = append(roots, runtimeRootForContextDataDir(context.Path))
+	}
+
+	return uniqueCleanPaths(roots)
 }
 
 func (s *Server) pruneWSLStagedRootFS(ctx context.Context) ([]protocol.ContextArtifact, int64, error) {

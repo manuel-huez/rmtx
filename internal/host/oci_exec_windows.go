@@ -159,6 +159,20 @@ func wslChildSpec(ctx context.Context, spec ociChildSpec) (ociChildSpec, error) 
 		spec.RootFSID = rootfsID
 		spec.StagedRootFS = wslStagedRootFSPath(rootfs)
 	}
+	if strings.TrimSpace(spec.LowerRootFS) != "" {
+		lowerRootfs, err := windowsPathToWSL(ctx, spec.WSLDistro, spec.LowerRootFS)
+		if err != nil {
+			return ociChildSpec{}, err
+		}
+		if wslRootFSNeedsStage(lowerRootfs) {
+			return ociChildSpec{}, fmt.Errorf(
+				"WSL OCI overlay lower rootfs must be stored inside the WSL filesystem, got %s",
+				lowerRootfs,
+			)
+		}
+
+		spec.LowerRootFS = lowerRootfs
+	}
 
 	for i, bind := range spec.Binds {
 		source, err := windowsPathToWSL(ctx, spec.WSLDistro, bind.Source)
@@ -603,6 +617,10 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	} else {
 		b.WriteString("rootfs=\"$source_rootfs\"\n")
 	}
+	if strings.TrimSpace(spec.LowerRootFS) != "" {
+		b.WriteString("lower_rootfs=" + shellQuote(spec.LowerRootFS) + "\n")
+		b.WriteString(wslOverlayRootFSSnippet())
+	}
 
 	if strings.EqualFold(strings.TrimSpace(spec.GPU), "nvidia") {
 		b.WriteString(
@@ -676,6 +694,18 @@ func wslStageRootFSSnippet() string {
 		"  mv \"$tmp\" \"$rootfs\"",
 		"  printf '%s\\n' \"$rootfs_id\" > \"$source_stage_marker\" 2>/dev/null || true",
 		"fi",
+		"",
+	}, "\n")
+}
+
+func wslOverlayRootFSSnippet() string {
+	return strings.Join([]string{
+		"overlay_rootfs=\"$rootfs\"",
+		"if ! command -v mount >/dev/null 2>&1; then echo 'error: WSL OCI overlay rootfs requires mount' >&2; exit 1; fi",
+		"if printf '%s\\n%s\\n' \"$lower_rootfs\" \"$overlay_rootfs\" | grep -q ','; then echo 'error: WSL OCI overlay rootfs paths cannot contain commas' >&2; exit 1; fi",
+		"mkdir -p \"$overlay_rootfs/upper\" \"$overlay_rootfs/work\" \"$overlay_rootfs/merged\"",
+		"mount -t overlay overlay -o \"lowerdir=$lower_rootfs,upperdir=$overlay_rootfs/upper,workdir=$overlay_rootfs/work\" \"$overlay_rootfs/merged\"",
+		"rootfs=\"$overlay_rootfs/merged\"",
 		"",
 	}, "\n")
 }

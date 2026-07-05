@@ -21,7 +21,6 @@ import (
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
-	"github.com/manuel-huez/rmtx/internal/version"
 )
 
 const (
@@ -35,12 +34,16 @@ const (
 	defaultOCIPathEnv    = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	defaultOCIWorkdir    = "/workspace"
 	pullProgressFields   = 2
+	// Rootfs format gates prepared-base reuse; bump only when rootfs contents
+	// produced from the same image/setup/runtime options become incompatible.
+	rootFSCacheFormatVersion = "overlay-v1"
 )
 
 type preparedRuntime struct {
-	RootFS string
-	Image  oci.Image
-	Key    string
+	RootFS      string
+	LowerRootFS string
+	Image       oci.Image
+	Key         string
 }
 
 type artifactState struct {
@@ -58,6 +61,7 @@ type artifactImage struct {
 type artifactPrepared struct {
 	Key            string `json:"key"`
 	Path           string `json:"path"`
+	BasePath       string `json:"base_path,omitempty"`
 	ImageDigest    string `json:"image_digest"`
 	ImageReference string `json:"image_reference"`
 }
@@ -183,7 +187,8 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	store := ociStore(runtimeRootForContextDataDir(handle.dataDir))
+	runtimeRoot := runtimeRootForContextDataDir(handle.dataDir)
+	store := ociStore(runtimeRoot)
 	if err := store.Ensure(); err != nil {
 		return preparedRuntime{}, err
 	}
@@ -194,15 +199,16 @@ func (s *Server) prepareOCIRuntimeLocked(
 	}
 
 	key := runtimeCacheKey(image.ManifestDigest, request.Runtime)
-	rootfs := filepath.Join(handle.dataDir, runtimeDirName, runtimeRootFSDirName, key)
+	baseRootFS := sharedRootFSPath(runtimeRoot, key)
+	rootfs := contextRootFSPath(handle.dataDir, key)
 
-	setupMarker := filepath.Join(rootfs, runtimeSetupMarker)
+	setupMarker := filepath.Join(baseRootFS, runtimeSetupMarker)
 	if _, err := os.Stat(setupMarker); errors.Is(err, os.ErrNotExist) {
 		s.logRun(
 			runLogs,
 			"unpacking OCI image: context=%s rootfs=%s image=%s",
 			request.ContextID,
-			rootfs,
+			baseRootFS,
 			request.Runtime.Image,
 		)
 		runLogs.Flush()
@@ -213,9 +219,9 @@ func (s *Server) prepareOCIRuntimeLocked(
 			"unpacking OCI image still running: context=%s image=%s rootfs=%s",
 			request.ContextID,
 			request.Runtime.Image,
-			rootfs,
+			baseRootFS,
 		)
-		err := store.UnpackImageContext(ctx, rootfs, image)
+		err := store.UnpackImageContext(ctx, baseRootFS, image)
 		stopProgress()
 		if err != nil {
 			return preparedRuntime{}, err
@@ -227,19 +233,19 @@ func (s *Server) prepareOCIRuntimeLocked(
 			request.Runtime.Image,
 		)
 
-		if err := writeRootFSInstanceMarker(rootfs); err != nil {
-			_ = pathutil.RemoveAll(rootfs)
+		if err := writeRootFSInstanceMarker(baseRootFS); err != nil {
+			_ = pathutil.RemoveAll(baseRootFS)
 			return preparedRuntime{}, err
 		}
 
 		if err := s.runImageSetupCommands(
 			ctx,
-			rootfs,
+			baseRootFS,
 			request.Runtime,
 			image.Env,
 			runLogs,
 		); err != nil {
-			_ = pathutil.RemoveAll(rootfs)
+			_ = pathutil.RemoveAll(baseRootFS)
 			return preparedRuntime{}, err
 		}
 
@@ -250,29 +256,39 @@ func (s *Server) prepareOCIRuntimeLocked(
 	} else {
 		s.logRun(
 			runLogs,
-			"using existing OCI runtime setup marker: context=%s image=%s",
+			"using shared OCI runtime setup marker: context=%s image=%s",
 			request.ContextID,
 			request.Runtime.Image,
 		)
 
-		if err := ensureRootFSInstanceMarker(rootfs); err != nil {
+		if err := ensureRootFSInstanceMarker(baseRootFS); err != nil {
 			return preparedRuntime{}, err
 		}
+	}
+
+	if err := ensureOverlayRootFSBundle(rootfs, key, baseRootFS); err != nil {
+		return preparedRuntime{}, err
 	}
 
 	if err := s.ensureOCIVolumes(handle.dataDir, request.Runtime.Volumes); err != nil {
 		return preparedRuntime{}, err
 	}
 
-	if err := savePreparedRuntimeState(handle.dataDir, image, key, rootfs); err != nil {
+	if err := savePreparedRuntimeState(handle.dataDir, image, key, rootfs, baseRootFS); err != nil {
 		return preparedRuntime{}, err
 	}
 
-	return preparedRuntime{RootFS: rootfs, Image: image, Key: key}, nil
+	return preparedRuntime{RootFS: rootfs, LowerRootFS: baseRootFS, Image: image, Key: key}, nil
 }
 
-func savePreparedRuntimeState(contextDir string, image oci.Image, key string, rootfs string) error {
-	if err := saveArtifactState(contextDir, image, key, rootfs); err != nil {
+func savePreparedRuntimeState(
+	contextDir string,
+	image oci.Image,
+	key string,
+	rootfs string,
+	baseRootFS string,
+) error {
+	if err := saveArtifactState(contextDir, image, key, rootfs, baseRootFS); err != nil {
 		return err
 	}
 
@@ -641,14 +657,15 @@ func (s *Server) newOCICommand(
 	env = mergeNvidiaRuntimeEnv(env, gpuRuntime)
 
 	spec := ociChildSpec{
-		RootFS:    prepared.RootFS,
-		WorkDir:   runtimeCommandWorkdir,
-		Command:   append([]string(nil), request.Command...),
-		Env:       env,
-		Binds:     binds,
-		Network:   request.Runtime.Network,
-		GPU:       request.Runtime.GPU,
-		WSLDistro: request.Runtime.WSLDistro,
+		RootFS:      prepared.RootFS,
+		LowerRootFS: prepared.LowerRootFS,
+		WorkDir:     runtimeCommandWorkdir,
+		Command:     append([]string(nil), request.Command...),
+		Env:         env,
+		Binds:       binds,
+		Network:     request.Runtime.Network,
+		GPU:         request.Runtime.GPU,
+		WSLDistro:   request.Runtime.WSLDistro,
 	}
 
 	return s.ociChildCommand(ctx, spec, handle.dataDir, runLogs)
@@ -801,14 +818,14 @@ func runtimeCacheKey(manifestDigest string, runtimeSpec protocol.RuntimeSpec) st
 		Network        string   `json:"network"`
 		User           string   `json:"user"`
 		GPU            string   `json:"gpu"`
-		RuntimeVersion string   `json:"runtime_version"`
+		RootFSFormat   string   `json:"rootfs_format"`
 	}{
 		ManifestDigest: manifestDigest,
 		ImageCommands:  runtimeSpec.Setup.ImageCommands,
 		Network:        network,
 		User:           user,
 		GPU:            gpu,
-		RuntimeVersion: version.String(),
+		RootFSFormat:   rootFSCacheFormatVersion,
 	})
 	sum := sha256.Sum256(payload)
 
@@ -916,7 +933,13 @@ func (s *Server) ensureOCIVolumes(contextDir string, volumes []protocol.RuntimeV
 	return nil
 }
 
-func saveArtifactState(contextDir string, image oci.Image, key string, rootfs string) error {
+func saveArtifactState(
+	contextDir string,
+	image oci.Image,
+	key string,
+	rootfs string,
+	baseRootFS string,
+) error {
 	path := filepath.Join(contextDir, runtimeDirName, artifactStateFile)
 
 	img := artifactImage{
@@ -928,6 +951,7 @@ func saveArtifactState(contextDir string, image oci.Image, key string, rootfs st
 	prepared := artifactPrepared{
 		Key:            key,
 		Path:           rootfs,
+		BasePath:       baseRootFS,
 		ImageDigest:    image.ManifestDigest,
 		ImageReference: image.Reference,
 	}

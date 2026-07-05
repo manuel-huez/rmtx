@@ -14,6 +14,7 @@ type ociBind struct {
 
 type ociChildSpec struct {
 	RootFS       string    `json:"rootfs"`
+	LowerRootFS  string    `json:"lower_rootfs,omitempty"`
 	StagedRootFS string    `json:"staged_rootfs,omitempty"`
 	RootFSID     string    `json:"rootfs_id,omitempty"`
 	WorkDir      string    `json:"workdir"`

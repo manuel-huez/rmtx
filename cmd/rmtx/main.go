@@ -1355,7 +1355,7 @@ Command reference:
 
   rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Delete host global cache data with no remaining context refs, plus stale
-      update installs and WSL staged OCI rootfs data.
+      update installs, shared OCI rootfs bases, and WSL staged OCI rootfs data.
 
   rmtx wsl config [--profile 50|100] [--yes] [--no-restart]
                   [--path PATH] [--dry-run]

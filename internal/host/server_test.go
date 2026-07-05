@@ -314,7 +314,8 @@ func TestListContextArtifactsIncludesWorkspaceVolumesAndImageRefs(t *testing.T) 
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveArtifactState(contextDir, image, "key", rootfs); err != nil {
+	baseRootFS := sharedRootFSPath(stateDir, "key")
+	if err := saveArtifactState(contextDir, image, "key", rootfs, baseRootFS); err != nil {
 		t.Fatal(err)
 	}
 
@@ -518,11 +519,22 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 
 	deletedContextDir := filepath.Join(stateDir, contextDirName, "delete-me")
 	keptContextDir := filepath.Join(stateDir, contextDirName, "keep-me")
+	deletedRootFS := sharedRootFSPath(stateDir, "deleted-key")
+	keptRootFS := sharedRootFSPath(stateDir, "kept-key")
+	for _, path := range []string{deletedRootFS, keptRootFS} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "file"), []byte(path), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := saveArtifactState(
 		deletedContextDir,
 		deletedImage,
 		"deleted-key",
 		filepath.Join(deletedContextDir, runtimeDirName, runtimeRootFSDirName, "deleted-key"),
+		deletedRootFS,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -531,6 +543,7 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 		keptImage,
 		"kept-key",
 		filepath.Join(keptContextDir, runtimeDirName, runtimeRootFSDirName, "kept-key"),
+		keptRootFS,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -550,6 +563,7 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 	assertPathMissing(t, store.ManifestPath(deletedImage.ManifestDigest))
 	assertPathMissing(t, store.BlobPath(deletedImage.ConfigDigest))
 	assertPathMissing(t, store.BlobPath(deletedImage.Layers[0].Digest))
+	assertPathMissing(t, deletedRootFS)
 	if _, err := store.LoadRef(mustOCIReference(t, deletedImage.Reference)); err == nil {
 		t.Fatal("deleted image ref should be pruned")
 	}
@@ -558,6 +572,7 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 	assertPathExists(t, store.ManifestPath(keptImage.ManifestDigest))
 	assertPathExists(t, store.BlobPath(keptImage.ConfigDigest))
 	assertPathExists(t, store.BlobPath(keptImage.Layers[0].Digest))
+	assertPathExists(t, keptRootFS)
 	if _, err := store.LoadRef(mustOCIReference(t, keptImage.Reference)); err != nil {
 		t.Fatalf("kept image ref should remain: %v", err)
 	}
@@ -860,6 +875,63 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	assertPathMissing(t, storage.blobStore.Path(staleHash))
 }
 
+func TestCachePruneDeletesUnreferencedSharedRootFS(t *testing.T) {
+	stateDir := t.TempDir()
+	s := &Server{opts: Options{StateDir: stateDir}}
+	contextID := "ctx"
+	contextDir := filepath.Join(stateDir, contextDirName, contextID)
+	if err := saveContextMetadata(
+		s.contextMetaDir(contextID),
+		contextMetadata{ID: contextID, Name: contextID},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	live := sharedRootFSPath(stateDir, "live-key")
+	stale := sharedRootFSPath(stateDir, "stale-key")
+	for _, path := range []string{live, stale} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "file"), []byte(path), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	image := oci.Image{
+		Reference:      "docker.io/library/alpine:live",
+		ManifestDigest: "sha256:live-manifest",
+		ConfigDigest:   "sha256:live-config",
+		Layers:         []oci.Descriptor{{Digest: "sha256:live-layer"}},
+	}
+	if err := saveArtifactState(
+		contextDir,
+		image,
+		"live-key",
+		contextRootFSPath(contextDir, "live-key"),
+		live,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, _, err := s.pruneUnreferencedOCICache()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, artifact := range deleted {
+		if artifact.Kind == "cache-rootfs" && artifact.Name == "stale-key" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("cache prune did not report stale shared rootfs: %#v", deleted)
+	}
+	assertPathExists(t, live)
+	assertPathMissing(t, stale)
+}
+
 func TestPruneStartupTempFilesKeepsVolumeAndRootFSTemps(t *testing.T) {
 	stateDir := t.TempDir()
 	blobTemp := filepath.Join(stateDir, "blobs", "aa", "aa-live.tmp")
@@ -918,6 +990,7 @@ func TestSaveArtifactStateReplacesStaleRuntimeRefs(t *testing.T) {
 		first,
 		"first",
 		filepath.Join(contextDir, "first"),
+		sharedRootFSPath(contextDir, "first"),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -926,6 +999,7 @@ func TestSaveArtifactStateReplacesStaleRuntimeRefs(t *testing.T) {
 		second,
 		"second",
 		filepath.Join(contextDir, "second"),
+		sharedRootFSPath(contextDir, "second"),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -960,7 +1034,7 @@ func TestPruneStalePreparedRuntimesRemovesUnreferencedRootFS(t *testing.T) {
 		ConfigDigest:   "sha256:live-config",
 		Layers:         []oci.Descriptor{{Digest: "sha256:live-layer"}},
 	}
-	if err := saveArtifactState(contextDir, image, "live", live); err != nil {
+	if err := saveArtifactState(contextDir, image, "live", live, sharedRootFSPath(contextDir, "live")); err != nil {
 		t.Fatal(err)
 	}
 

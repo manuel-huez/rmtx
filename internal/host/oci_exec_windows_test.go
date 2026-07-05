@@ -142,6 +142,31 @@ func TestWSLChildScriptStagesRootFSWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestWSLChildScriptMountsOverlayRootFS(t *testing.T) {
+	script, err := wslChildScript(ociChildSpec{
+		RootFS:      "/state/contexts/ctx/runtime/rootfs/key",
+		LowerRootFS: "/state/cache/rootfs/key",
+		WorkDir:     "/workspace",
+		Command:     []string{"sh"},
+		Network:     "host",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"lower_rootfs='/state/cache/rootfs/key'",
+		"overlay_rootfs=\"$rootfs\"",
+		"mkdir -p \"$overlay_rootfs/upper\" \"$overlay_rootfs/work\" \"$overlay_rootfs/merged\"",
+		"mount -t overlay overlay -o \"lowerdir=$lower_rootfs,upperdir=$overlay_rootfs/upper,workdir=$overlay_rootfs/work\" \"$overlay_rootfs/merged\"",
+		"rootfs=\"$overlay_rootfs/merged\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q:\n%s", want, script)
+		}
+	}
+}
+
 func TestWSLStagedRootFSPathUsesNativeWSLPath(t *testing.T) {
 	first := wslStagedRootFSPath("/mnt/c/state/rootfs/a")
 	second := wslStagedRootFSPath("/mnt/c/state/rootfs/a")

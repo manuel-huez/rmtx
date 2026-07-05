@@ -38,6 +38,12 @@ func TestResolveOCICommandPathKeepsSlashCommand(t *testing.T) {
 	}
 }
 
+func TestValidateOverlayMountPathRejectsComma(t *testing.T) {
+	if err := validateOverlayMountPath("/tmp/root,fs"); err == nil {
+		t.Fatal("expected comma path error")
+	}
+}
+
 func TestOCIChildCommandCleanupRemovesSpecFile(t *testing.T) {
 	s := &Server{}
 

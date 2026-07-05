@@ -49,6 +49,13 @@ func runOCIChild(spec ociChildSpec) error {
 	if err != nil {
 		return err
 	}
+	if err := makeMountsPrivate(); err != nil {
+		return err
+	}
+	rootfs, err = prepareOCIOverlayRoot(rootfs, spec.LowerRootFS)
+	if err != nil {
+		return err
+	}
 
 	if err := prepareOCIChildRoot(rootfs, spec.Network, spec.Binds); err != nil {
 		return err
@@ -88,10 +95,6 @@ func validateOCIChildSpec(spec ociChildSpec) error {
 }
 
 func prepareOCIChildRoot(rootfs string, network string, binds []ociBind) error {
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("make mounts private: %w", err)
-	}
-
 	if err := mountRuntimeFilesystems(rootfs); err != nil {
 		return err
 	}
@@ -104,6 +107,55 @@ func prepareOCIChildRoot(rootfs string, network string, binds []ociBind) error {
 		if err := mountBind(rootfs, bind); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+func makeMountsPrivate() error {
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make mounts private: %w", err)
+	}
+
+	return nil
+}
+
+func prepareOCIOverlayRoot(rootfs, lowerRootfs string) (string, error) {
+	if strings.TrimSpace(lowerRootfs) == "" {
+		return rootfs, nil
+	}
+
+	lowerRootfs, err := filepath.Abs(lowerRootfs)
+	if err != nil {
+		return "", err
+	}
+	if err := validateOverlayMountPath(rootfs); err != nil {
+		return "", err
+	}
+	if err := validateOverlayMountPath(lowerRootfs); err != nil {
+		return "", err
+	}
+
+	upper := filepath.Join(rootfs, "upper")
+	work := filepath.Join(rootfs, "work")
+	merged := filepath.Join(rootfs, "merged")
+	for _, dir := range []string{upper, work, merged} {
+		if err := os.MkdirAll(dir, defaultDirMode); err != nil {
+			return "", err
+		}
+	}
+
+	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerRootfs, upper, work)
+	if err := syscall.Mount("overlay", merged, "overlay", 0, options); err != nil {
+		return "", fmt.Errorf("mount overlay rootfs: %w", err)
+	}
+
+	return merged, nil
+}
+
+func validateOverlayMountPath(path string) error {
+	if strings.ContainsAny(path, ",\x00") {
+		return fmt.Errorf("overlay rootfs path cannot contain comma or NUL: %q", path)
 	}
 
 	return nil
