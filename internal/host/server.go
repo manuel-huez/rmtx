@@ -755,8 +755,6 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	s.pruneUnreferencedBlobsAfterRunSave(request, "pre-run", runLogs)
-
 	runLogs.Flush()
 
 	if err := writeWorkspaceReady(conn, request.ContextID, handle, runWorkspace); err != nil {
@@ -1195,8 +1193,6 @@ func (s *Server) executeAndSyncRun(
 		return err
 	}
 
-	s.pruneUnreferencedBlobsAfterRunSave(request, "post-run", runLogs)
-
 	handle.meta.UpdatedAt = time.Now().UTC()
 	if err := saveContextMetadata(handle.metaDir, handle.meta); err != nil {
 		return err
@@ -1250,40 +1246,6 @@ func (s *Server) finishRunWorkspace(
 	)
 
 	return nil
-}
-
-func (s *Server) pruneUnreferencedBlobsAfterRunSave(
-	request protocol.RunRequest,
-	stage string,
-	runLogs *hostLogSubscription,
-) {
-	deleted, bytes, err := s.pruneUnreferencedBlobs()
-	if err != nil {
-		s.logRun(
-			runLogs,
-			"blob cache prune failed after %s manifest save: context=%s session=%s error=%v",
-			stage,
-			request.ContextID,
-			request.Session,
-			err,
-		)
-
-		return
-	}
-
-	if len(deleted) == 0 {
-		return
-	}
-
-	s.logRun(
-		runLogs,
-		"blob cache pruned after %s manifest save: context=%s session=%s deleted=%d bytes=%d",
-		stage,
-		request.ContextID,
-		request.Session,
-		len(deleted),
-		bytes,
-	)
 }
 
 func (s *Server) handlePing(

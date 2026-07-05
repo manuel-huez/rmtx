@@ -232,8 +232,7 @@ remaining context references. Prepared runtime metadata tracks the current
 runtime only, so older rootfs variants stop pinning OCI data when runtime config
 changes. `rmtx cache prune` can also remove global cache data with no remaining
 context references, old update installs, shared OCI rootfs bases, and stale
-Windows WSL staged rootfs copies. Runs prune unreferenced synced file blobs
-after tracked manifests change.
+Windows WSL staged rootfs copies.
 
 Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI

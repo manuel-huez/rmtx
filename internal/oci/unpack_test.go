@@ -26,10 +26,10 @@ func TestUnpackImageRejectsPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := store.UnpackImage(t.TempDir(), Image{
+	err := store.UnpackImageContext(context.Background(), t.TempDir(), Image{
 		ManifestDigest: "sha256:" + strings.Repeat("a", 64),
 		Layers:         []Descriptor{{Digest: digest}},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected path traversal error")
 	}
@@ -53,18 +53,67 @@ func TestUnpackImageAppliesWhiteout(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	if err := store.UnpackImage(root, Image{
+	if err := store.UnpackImageContext(context.Background(), root, Image{
 		ManifestDigest: "sha256:" + strings.Repeat("b", 64),
 		Layers: []Descriptor{
 			{Digest: firstDigest},
 			{Digest: secondDigest},
 		},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := os.Stat(filepath.Join(root, "gone.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected whiteout to remove file, err=%v", err)
+	}
+}
+
+func TestUnpackImageContextReportsLayerProgress(t *testing.T) {
+	first := tarGzip(t, tarEntry{Name: "first.txt", Body: "first"})
+	second := tarGzip(t, tarEntry{Name: "second.txt", Body: "second"})
+	firstDigest := storeTestBlob(t, first)
+	secondDigest := storeTestBlob(t, second)
+
+	store := NewStore(filepath.Join(t.TempDir(), "oci"))
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreBlob(firstDigest, bytes.NewReader(first)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreBlob(secondDigest, bytes.NewReader(second)); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []UnpackProgress
+	err := store.UnpackImageContext(context.Background(), t.TempDir(), Image{
+		ManifestDigest: "sha256:" + strings.Repeat("c", 64),
+		Layers: []Descriptor{
+			{Digest: firstDigest, Size: int64(len(first))},
+			{Digest: secondDigest, Size: int64(len(second))},
+		},
+	}, func(progress UnpackProgress) {
+		events = append(events, progress)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 4 {
+		t.Fatalf("events=%d want 4: %#v", len(events), events)
+	}
+	if events[0].Event != UnpackProgressLayerStart || events[0].LayerIndex != 1 || events[0].LayerCount != 2 {
+		t.Fatalf("first event=%#v", events[0])
+	}
+	last := events[len(events)-1]
+	if last.Event != UnpackProgressLayerDone || last.LayerIndex != 2 {
+		t.Fatalf("last event=%#v", last)
+	}
+	if last.TotalBytes != int64(len(first)+len(second)) {
+		t.Fatalf("total bytes=%d want %d", last.TotalBytes, len(first)+len(second))
+	}
+	if last.Entries != 1 {
+		t.Fatalf("last entries=%d want 1", last.Entries)
 	}
 }
 

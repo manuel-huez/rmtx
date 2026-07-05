@@ -177,7 +177,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 ) (preparedRuntime, error) {
 	s.logRun(
 		runLogs,
-		"preparing OCI runtime: context=%s image=%s",
+		"checking OCI runtime cache: context=%s image=%s",
 		request.ContextID,
 		request.Runtime.Image,
 	)
@@ -216,12 +216,18 @@ func (s *Server) prepareOCIRuntimeLocked(
 		stopProgress := startRunLogProgress(
 			runLogs,
 			progressEvery,
-			"unpacking OCI image still running: context=%s image=%s rootfs=%s",
+			"unpacking OCI image still running: context=%s image=%s rootfs=%s key=%s",
 			request.ContextID,
 			request.Runtime.Image,
 			baseRootFS,
+			key,
 		)
-		err := store.UnpackImageContext(ctx, baseRootFS, image)
+		err := store.UnpackImageContext(
+			ctx,
+			baseRootFS,
+			image,
+			s.logOCIUnpackProgress(runLogs, request.ContextID, request.Runtime.Image),
+		)
 		stopProgress()
 		if err != nil {
 			return preparedRuntime{}, err
@@ -451,6 +457,79 @@ func (s *Server) runImageSetupCommands(
 	}
 
 	return nil
+}
+
+func (s *Server) logOCIUnpackProgress(
+	runLogs io.Writer,
+	contextID string,
+	image string,
+) oci.UnpackProgressFunc {
+	layerStarted := make(map[int]time.Time)
+
+	return func(progress oci.UnpackProgress) {
+		digest := shortOCIDigest(progress.Digest)
+		layer := fmt.Sprintf("%d/%d", progress.LayerIndex, progress.LayerCount)
+		bytes := unpackProgressBytes(progress.LayerDoneBytes, progress.LayerBytes)
+		total := unpackProgressBytes(progress.TotalDoneBytes, progress.TotalBytes)
+
+		switch progress.Event {
+		case oci.UnpackProgressLayerStart:
+			layerStarted[progress.LayerIndex] = time.Now()
+			s.logRun(
+				runLogs,
+				"unpacking OCI layer start: context=%s image=%s layer=%s digest=%s bytes=%s total=%s",
+				contextID,
+				image,
+				layer,
+				digest,
+				bytes,
+				total,
+			)
+		case oci.UnpackProgressLayerDone:
+			elapsed := time.Since(layerStarted[progress.LayerIndex]).Round(time.Millisecond)
+			s.logRun(
+				runLogs,
+				"unpacking OCI layer done: context=%s image=%s layer=%s digest=%s bytes=%s entries=%d elapsed=%s total=%s",
+				contextID,
+				image,
+				layer,
+				digest,
+				bytes,
+				progress.Entries,
+				elapsed,
+				total,
+			)
+		default:
+			s.logRun(
+				runLogs,
+				"unpacking OCI layer progress: context=%s image=%s layer=%s digest=%s bytes=%s entries=%d total=%s",
+				contextID,
+				image,
+				layer,
+				digest,
+				bytes,
+				progress.Entries,
+				total,
+			)
+		}
+	}
+}
+
+func shortOCIDigest(digest string) string {
+	parts := strings.SplitN(digest, ":", 2)
+	if len(parts) != 2 || len(parts[1]) <= 12 {
+		return digest
+	}
+
+	return parts[0] + ":" + parts[1][:12]
+}
+
+func unpackProgressBytes(done, total int64) string {
+	if total <= 0 {
+		return fmt.Sprintf("%d", done)
+	}
+
+	return fmt.Sprintf("%d/%d", done, total)
 }
 
 func (s *Server) prepareOCIContextSetup(

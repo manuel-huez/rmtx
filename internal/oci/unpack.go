@@ -15,13 +15,44 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
-const rootfsMarker = ".rmtx-rootfs-ready"
-const defaultRootDirMode = 0o755
-const legacyTarRegularFile byte = 0
+const (
+	rootfsMarker                   = ".rmtx-rootfs-ready"
+	defaultRootDirMode             = 0o755
+	legacyTarRegularFile      byte = 0
+	unpackProgressMinBytes         = 64 << 20
+	unpackProgressMinEntries       = 512
+	unpackProgressMinInterval      = 5 * time.Second
+)
+
+// UnpackProgressEvent identifies the stage of one OCI layer extraction.
+type UnpackProgressEvent string
+
+const (
+	UnpackProgressLayerStart    UnpackProgressEvent = "layer_start"
+	UnpackProgressLayerProgress UnpackProgressEvent = "layer_progress"
+	UnpackProgressLayerDone     UnpackProgressEvent = "layer_done"
+)
+
+// UnpackProgress reports compressed layer bytes plus tar entries applied so far.
+type UnpackProgress struct {
+	Event          UnpackProgressEvent
+	LayerIndex     int
+	LayerCount     int
+	Digest         string
+	LayerBytes     int64
+	LayerDoneBytes int64
+	TotalBytes     int64
+	TotalDoneBytes int64
+	Entries        int64
+}
+
+// UnpackProgressFunc receives throttled layer progress during rootfs unpack.
+type UnpackProgressFunc func(UnpackProgress)
 
 type contextReader struct {
 	ctx context.Context
@@ -36,11 +67,13 @@ func (r contextReader) Read(p []byte) (int, error) {
 	return r.src.Read(p)
 }
 
-func (s *Store) UnpackImage(target string, image Image) error {
-	return s.UnpackImageContext(context.Background(), target, image)
-}
-
-func (s *Store) UnpackImageContext(ctx context.Context, target string, image Image) error {
+// UnpackImageContext applies image layers into a rootfs, reporting progress while extracting.
+func (s *Store) UnpackImageContext(
+	ctx context.Context,
+	target string,
+	image Image,
+	progress UnpackProgressFunc,
+) error {
 	if _, err := os.Stat(filepath.Join(target, rootfsMarker)); err == nil {
 		return nil
 	}
@@ -51,16 +84,29 @@ func (s *Store) UnpackImageContext(ctx context.Context, target string, image Ima
 		return fmt.Errorf("create rootfs temp: %w", err)
 	}
 
-	for _, layer := range image.Layers {
+	layerTotal := unpackLayerTotalBytes(image.Layers)
+	doneBytes := int64(0)
+	for index, layer := range image.Layers {
 		if err := ctx.Err(); err != nil {
 			_ = pathutil.RemoveAll(tmp)
 			return err
 		}
 
-		if err := s.unpackLayer(ctx, tmp, layer.Digest); err != nil {
+		layerDone, err := s.unpackLayer(
+			ctx,
+			tmp,
+			layer,
+			index+1,
+			len(image.Layers),
+			doneBytes,
+			layerTotal,
+			progress,
+		)
+		if err != nil {
 			_ = pathutil.RemoveAll(tmp)
 			return err
 		}
+		doneBytes += layerProgressBytes(layer.Size, layerDone)
 	}
 
 	markerContent := []byte(image.ManifestDigest + "\n")
@@ -79,40 +125,186 @@ func (s *Store) UnpackImageContext(ctx context.Context, target string, image Ima
 	return nil
 }
 
-func (s *Store) unpackLayer(ctx context.Context, root string, digest string) error {
+func unpackLayerTotalBytes(layers []Descriptor) int64 {
+	var total int64
+	for _, layer := range layers {
+		if layer.Size > 0 {
+			total += layer.Size
+		}
+	}
+
+	return total
+}
+
+func layerProgressBytes(expected, actual int64) int64 {
+	if expected > 0 {
+		return expected
+	}
+
+	return actual
+}
+
+func (s *Store) unpackLayer(
+	ctx context.Context,
+	root string,
+	layer Descriptor,
+	layerIndex int,
+	layerCount int,
+	totalDoneBeforeLayer int64,
+	totalBytes int64,
+	progress UnpackProgressFunc,
+) (int64, error) {
+	digest := layer.Digest
 	f, err := s.ReadBlob(digest)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = f.Close() }()
 
-	var r io.Reader = f
-	gz, err := gzip.NewReader(f)
+	reporter := newUnpackProgressReporter(
+		progress,
+		layerIndex,
+		layerCount,
+		digest,
+		layer.Size,
+		totalDoneBeforeLayer,
+		totalBytes,
+	)
+	reporter.start()
+
+	metered := &unpackProgressReader{ctx: ctx, src: f, reporter: reporter}
+	var r io.Reader = metered
+	gz, err := gzip.NewReader(metered)
 	if err == nil {
 		defer func() { _ = gz.Close() }()
 		r = gz
 	} else if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-		return seekErr
+		return reporter.bytes(), seekErr
+	} else {
+		reporter.resetBytes()
+		metered = &unpackProgressReader{ctx: ctx, src: f, reporter: reporter}
+		r = metered
 	}
 
 	tr := tar.NewReader(r)
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return reporter.bytes(), err
 		}
 
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return reporter.done(), nil
 		}
 		if err != nil {
-			return fmt.Errorf("read layer %s: %w", digest, err)
+			return reporter.bytes(), fmt.Errorf("read layer %s: %w", digest, err)
 		}
 
 		if err := applyTarEntry(ctx, root, hdr, tr); err != nil {
-			return fmt.Errorf("apply layer %s entry %s: %w", digest, hdr.Name, err)
+			return reporter.bytes(), fmt.Errorf("apply layer %s entry %s: %w", digest, hdr.Name, err)
 		}
+		reporter.addEntry()
 	}
+}
+
+type unpackProgressReader struct {
+	ctx      context.Context
+	src      io.Reader
+	reporter *unpackProgressReporter
+}
+
+func (r *unpackProgressReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.reporter.addBytes(int64(n))
+	}
+
+	return n, err
+}
+
+type unpackProgressReporter struct {
+	progress UnpackProgressFunc
+	state    UnpackProgress
+	last     UnpackProgress
+	lastAt   time.Time
+}
+
+func newUnpackProgressReporter(
+	progress UnpackProgressFunc,
+	layerIndex int,
+	layerCount int,
+	digest string,
+	layerBytes int64,
+	totalDoneBeforeLayer int64,
+	totalBytes int64,
+) *unpackProgressReporter {
+	return &unpackProgressReporter{
+		progress: progress,
+		state: UnpackProgress{
+			LayerIndex:     layerIndex,
+			LayerCount:     layerCount,
+			Digest:         digest,
+			LayerBytes:     layerBytes,
+			TotalBytes:     totalBytes,
+			TotalDoneBytes: totalDoneBeforeLayer,
+		},
+	}
+}
+
+func (r *unpackProgressReporter) start() {
+	r.report(UnpackProgressLayerStart, true)
+}
+
+func (r *unpackProgressReporter) resetBytes() {
+	r.state.TotalDoneBytes -= r.state.LayerDoneBytes
+	r.state.LayerDoneBytes = 0
+	r.last.LayerDoneBytes = 0
+	r.last.TotalDoneBytes = r.state.TotalDoneBytes
+}
+
+func (r *unpackProgressReporter) addBytes(n int64) {
+	r.state.LayerDoneBytes += n
+	r.state.TotalDoneBytes += n
+	r.report(UnpackProgressLayerProgress, false)
+}
+
+func (r *unpackProgressReporter) addEntry() {
+	r.state.Entries++
+	r.report(UnpackProgressLayerProgress, false)
+}
+
+func (r *unpackProgressReporter) done() int64 {
+	r.report(UnpackProgressLayerDone, true)
+
+	return r.bytes()
+}
+
+func (r *unpackProgressReporter) bytes() int64 {
+	return r.state.LayerDoneBytes
+}
+
+func (r *unpackProgressReporter) report(event UnpackProgressEvent, force bool) {
+	if r.progress == nil {
+		return
+	}
+
+	now := time.Now()
+	if !force &&
+		r.state.LayerDoneBytes-r.last.LayerDoneBytes < unpackProgressMinBytes &&
+		r.state.Entries-r.last.Entries < unpackProgressMinEntries &&
+		now.Sub(r.lastAt) < unpackProgressMinInterval {
+		return
+	}
+
+	snapshot := r.state
+	snapshot.Event = event
+	r.progress(snapshot)
+	r.last = snapshot
+	r.lastAt = now
 }
 
 //nolint:cyclop // Tar entry handling must branch by OCI whiteout and entry type.
