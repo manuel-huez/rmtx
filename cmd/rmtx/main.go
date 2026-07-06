@@ -885,7 +885,7 @@ func runCache(ctx context.Context, args []string) int {
 			os.Stdout,
 			"deleted\t%s\t%s\t%s\n",
 			artifact.Kind,
-			artifact.Ref,
+			emptyFallback(artifact.Name, artifact.Ref),
 			artifact.Path,
 		)
 	}
@@ -1355,7 +1355,8 @@ Command reference:
 
   rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
       Delete host global cache data with no remaining context refs, plus stale
-      update installs, shared OCI rootfs bases, and WSL staged OCI rootfs data.
+      update installs, shared OCI rootfs bases, WSL staged OCI rootfs data, and
+      expired kept workspaces.
 
   rmtx wsl config [--profile 50|100] [--yes] [--no-restart]
                   [--path PATH] [--dry-run]

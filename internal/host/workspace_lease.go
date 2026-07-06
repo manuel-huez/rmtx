@@ -569,13 +569,15 @@ func (s *Server) pruneExpiredWorkspaceLeases(contextDir string, now time.Time) e
 	return err
 }
 
-func (s *Server) pruneExpiredWorkspaceLeasesInAllContexts(now time.Time) ([]string, error) {
+func (s *Server) pruneExpiredWorkspaceLeasesInAllContexts(
+	now time.Time,
+) ([]protocol.ContextArtifact, error) {
 	contexts, err := s.listContexts()
 	if err != nil {
 		return nil, err
 	}
 
-	var removed []string
+	var removed []protocol.ContextArtifact
 
 	for _, context := range contexts {
 		release := s.acquireContext(context.ID)
@@ -590,7 +592,13 @@ func (s *Server) pruneExpiredWorkspaceLeasesInAllContexts(now time.Time) ([]stri
 		removed = append(removed, deleted...)
 	}
 
-	sort.Strings(removed)
+	sort.Slice(removed, func(i, j int) bool {
+		if removed[i].Name == removed[j].Name {
+			return removed[i].Path < removed[j].Path
+		}
+
+		return removed[i].Name < removed[j].Name
+	})
 
 	return removed, nil
 }
@@ -598,18 +606,19 @@ func (s *Server) pruneExpiredWorkspaceLeasesInAllContexts(now time.Time) ([]stri
 func (s *Server) pruneExpiredWorkspaceLeasesInContext(
 	contextDir string,
 	now time.Time,
-) ([]string, error) {
-	var removed []string
+) ([]protocol.ContextArtifact, error) {
+	var removed []protocol.ContextArtifact
 
 	err := forEachWorkspaceLeaseDir(contextDir, func(id string) error {
 		state, _, err := loadWorkspaceLeaseMetadata(contextDir, id)
 		if err != nil {
 			if errors.Is(err, errWorkspaceLeaseNotFound) {
+				artifact := workspaceLeaseArtifact(contextDir, id)
 				if removeErr := removeWorkspaceLease(contextDir, id); removeErr != nil {
 					return removeErr
 				}
 
-				removed = append(removed, id)
+				removed = append(removed, artifact)
 
 				return nil
 			}
@@ -625,11 +634,12 @@ func (s *Server) pruneExpiredWorkspaceLeasesInContext(
 			return nil
 		}
 
+		artifact := workspaceLeaseArtifact(contextDir, state.ID)
 		if err := removeWorkspaceLease(contextDir, state.ID); err != nil {
 			return err
 		}
 
-		removed = append(removed, state.ID)
+		removed = append(removed, artifact)
 
 		return nil
 	})
@@ -637,9 +647,23 @@ func (s *Server) pruneExpiredWorkspaceLeasesInContext(
 		return removed, fmt.Errorf("prune workspace leases: %w", err)
 	}
 
-	sort.Strings(removed)
+	sort.Slice(removed, func(i, j int) bool {
+		return removed[i].Name < removed[j].Name
+	})
 
 	return removed, nil
+}
+
+func workspaceLeaseArtifact(contextDir, id string) protocol.ContextArtifact {
+	path := workspaceLeaseDir(contextDir, id)
+	size, _ := dirSize(path)
+
+	return protocol.ContextArtifact{
+		Kind: "workspace",
+		Name: id,
+		Path: path,
+		Size: size,
+	}
 }
 
 func forEachWorkspaceLeaseDir(contextDir string, fn func(id string) error) error {

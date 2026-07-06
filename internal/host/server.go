@@ -206,7 +206,7 @@ func logCleanupResult(logger *log.Logger, name string, unit string, removed []st
 
 func (s *Server) cleanupExpiredWorkspaceLeases(now time.Time) {
 	leases, err := s.pruneExpiredWorkspaceLeasesInAllContexts(now)
-	logCleanupResult(s.logger, "workspace lease", "dirs", leases, err)
+	logArtifactCleanupResult(s.logger, "workspace lease", "dirs", leases, err)
 }
 
 func logArtifactCleanupResult(

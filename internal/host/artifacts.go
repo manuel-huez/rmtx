@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
@@ -374,6 +375,15 @@ func (s *Server) pruneAllCaches(ctx context.Context) ([]protocol.ContextArtifact
 	}
 	deleted = append(deleted, wslDeleted...)
 	bytes += wslBytes
+
+	workspaceDeleted, err := s.pruneExpiredWorkspaceLeasesInAllContexts(time.Now().UTC())
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, artifact := range workspaceDeleted {
+		bytes += artifact.Size
+	}
+	deleted = append(deleted, workspaceDeleted...)
 
 	return deleted, bytes, nil
 }

@@ -55,7 +55,10 @@ func TestPruneExpiredWorkspaceLeases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(removed) != 1 || removed[0] != expired.ID {
+	if len(removed) != 1 ||
+		removed[0].Kind != "workspace" ||
+		removed[0].Name != expired.ID ||
+		removed[0].Path != workspaceLeaseDir(contextDir, expired.ID) {
 		t.Fatalf("removed=%#v want %s", removed, expired.ID)
 	}
 
@@ -256,7 +259,10 @@ func TestPruneExpiredWorkspaceLeasesRemovesPartialDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(removed) != 1 || removed[0] != id {
+	if len(removed) != 1 ||
+		removed[0].Kind != "workspace" ||
+		removed[0].Name != id ||
+		removed[0].Path != workspaceLeaseDir(contextDir, id) {
 		t.Fatalf("removed=%#v want %s", removed, id)
 	}
 

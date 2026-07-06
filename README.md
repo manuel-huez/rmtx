@@ -16,7 +16,7 @@
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context workspaces ...`: list/delete kept host workspaces.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
-- `rmtx cache prune`: delete unreferenced host cache data.
+- `rmtx cache prune`: delete unreferenced host cache data and expired kept workspaces.
 
 ## Install
 
@@ -231,8 +231,8 @@ rootfs overlay, prepared runtime references, and global cache data that has no
 remaining context references. Prepared runtime metadata tracks the current
 runtime only, so older rootfs variants stop pinning OCI data when runtime config
 changes. `rmtx cache prune` can also remove global cache data with no remaining
-context references, old update installs, shared OCI rootfs bases, and stale
-Windows WSL staged rootfs copies.
+context references, old update installs, shared OCI rootfs bases, stale Windows
+WSL staged rootfs copies, and expired kept workspaces.
 
 Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI
@@ -279,7 +279,8 @@ rmtx cache prune
 
 - Contexts keep manifests and shared blobs on the host; default workspaces are
   scratch copies cleaned after each run. `--keep-workspace` keeps opt-in
-  workspace leases until TTL expiry.
+  workspace leases until TTL expiry; background cleanup and `rmtx cache prune`
+  remove expired leases.
 - OCI prepared rootfs uses shared read-only bases plus per-context writable
   overlays. Runtime config changes replace older prepared refs; cache prune
   removes shared bases with no remaining context refs.

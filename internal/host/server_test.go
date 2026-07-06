@@ -1010,6 +1010,70 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	assertPathMissing(t, storage.blobStore.Path(staleHash))
 }
 
+func TestCachePruneDeletesExpiredWorkspaceLeases(t *testing.T) {
+	stateDir := t.TempDir()
+	s, err := New(Options{
+		StateDir:         stateDir,
+		DisableDiscovery: true,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contextID := "ctx"
+	contextDir := s.contextMetaDir(contextID)
+	if err := saveContextMetadata(
+		contextDir,
+		contextMetadata{ID: contextID, Name: contextID},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	leaseID := "ws_expired"
+	if err := saveWorkspaceLease(contextDir, workspaceLeaseState{
+		ID:        leaseID,
+		ContextID: contextID,
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+		ExpiresAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	workspacePath := workspaceLeaseWorkspacePath(contextDir, leaseID)
+	if err := os.MkdirAll(workspacePath, defaultDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspacePath, "marker"), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, bytesDeleted, err := s.pruneAllCaches(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found protocol.ContextArtifact
+	for _, artifact := range deleted {
+		if artifact.Kind == "workspace" && artifact.Name == leaseID {
+			found = artifact
+			break
+		}
+	}
+	if found.Path == "" {
+		t.Fatalf("cache prune did not report expired workspace lease: %#v", deleted)
+	}
+	if found.Path != workspaceLeaseDir(contextDir, leaseID) {
+		t.Fatalf("workspace path=%q want %q", found.Path, workspaceLeaseDir(contextDir, leaseID))
+	}
+	if found.Size == 0 || bytesDeleted < found.Size {
+		t.Fatalf("deleted bytes=%d artifact=%#v", bytesDeleted, found)
+	}
+	assertPathMissing(t, workspaceLeaseDir(contextDir, leaseID))
+}
+
 func TestCachePruneDeletesUnreferencedSharedRootFS(t *testing.T) {
 	stateDir := t.TempDir()
 	s := &Server{opts: Options{StateDir: stateDir}}
