@@ -514,12 +514,18 @@ func RunCachePrune(
 	cwd string,
 	params RemoteParams,
 ) (client.CachePruneResult, error) {
+	result, localErr := client.PruneLocalCache()
+
 	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
-		return client.CachePruneResult{}, err
+		return result, errors.Join(localErr, err)
 	}
 
-	return client.CachePrune(ctx, remote)
+	hostResult, hostErr := client.HostCachePrune(ctx, remote)
+	result.Deleted = append(result.Deleted, hostResult.Deleted...)
+	result.Bytes += hostResult.Bytes
+
+	return result, errors.Join(localErr, hostErr)
 }
 
 func resolveClientRemoteOptions(

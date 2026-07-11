@@ -875,11 +875,6 @@ func runCache(ctx context.Context, args []string) int {
 	}
 
 	result, err := app.RunCachePrune(ctx, cwd, params)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-
 	for _, artifact := range result.Deleted {
 		_, _ = fmt.Fprintf(
 			os.Stdout,
@@ -891,6 +886,10 @@ func runCache(ctx context.Context, args []string) int {
 	}
 
 	_, _ = fmt.Fprintf(os.Stdout, "deleted\t%d\tbytes=%d\n", len(result.Deleted), result.Bytes)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
 
 	return 0
 }
@@ -1354,9 +1353,10 @@ Command reference:
       Delete named persistent runtime volume.
 
   rmtx cache prune [--host ADDR] [--config PATH] [--discovery-timeout DURATION]
-      Delete host global cache data with no remaining context refs, plus stale
-      update installs, shared OCI rootfs bases, WSL staged OCI rootfs data, and
-      expired kept workspaces.
+      Delete host global cache data with no remaining context refs, stale update
+      installs, shared OCI rootfs bases, WSL staged OCI rootfs data, expired kept
+      workspaces, stale client manifest temp files, and client blobs unused by
+      all cached client manifests.
 
   rmtx wsl config [--profile 50|100] [--yes] [--no-restart]
                   [--path PATH] [--dry-run]

@@ -16,7 +16,7 @@
 - `rmtx context ...`: list/delete/prune host contexts.
 - `rmtx context workspaces ...`: list/delete kept host workspaces.
 - `rmtx context artifacts ...`: list/prune/delete host-side context artifacts.
-- `rmtx cache prune`: delete unreferenced host cache data and expired kept workspaces.
+- `rmtx cache prune`: delete unreferenced client/host cache data and expired kept workspaces.
 
 ## Install
 
@@ -232,7 +232,12 @@ remaining context references. Prepared runtime metadata tracks the current
 runtime only, so older rootfs variants stop pinning OCI data when runtime config
 changes. `rmtx cache prune` can also remove global cache data with no remaining
 context references, old update installs, shared OCI rootfs bases, stale Windows
-WSL staged rootfs copies, and expired kept workspaces.
+WSL staged rootfs copies, expired kept workspaces, and client blobs not
+referenced by any cached client manifest.
+Successful manifest replacement also removes displaced client blobs
+automatically once no other cached manifest references them.
+Client cleanup runs before host cleanup, so local space is reclaimed even when
+the configured host is unavailable; the command still reports the host error.
 
 Linux hosts use rootless user, mount, PID, IPC, and UTS namespaces for OCI
 execution. `network=none` adds a network namespace. Windows hosts delegate OCI
@@ -286,7 +291,8 @@ rmtx cache prune
   removes shared bases with no remaining context refs.
 - Discovery uses UDP broadcast on port `33222`; hosts also send outbound announcements so clients can discover Windows hosts even when inbound UDP is blocked.
 - If direct TCP to the host is blocked, `rmtx` can fall back to a reverse LAN connection where the host dials back to the client.
-- Client state is stored in `~/.rmtx/state.json`.
+- Client state is stored in `~/.rmtx/state.json`; client manifest and sync-back
+  blob caches live under `~/.rmtx/manifests` and `~/.rmtx/blobs`.
 - Interactive TTY mode is supported on Linux hosts/clients.
 
 ## Test

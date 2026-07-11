@@ -614,6 +614,13 @@ func loadManifestCache(root, contextID string, logger *runLogger) []syncfs.Entry
 }
 
 func saveManifestCache(root, contextID string, entries []syncfs.Entry, logger *runLogger) {
+	finishCacheUse, err := beginClientCacheUse(logger)
+	if err != nil {
+		logger.Printf("local manifest cache lock failed: %v", err)
+		return
+	}
+	defer finishCacheUse()
+
 	if err := saveCachedManifest(root, contextID, entries); err != nil {
 		logger.Printf("local manifest cache save failed: %v", err)
 	}
@@ -1060,6 +1067,12 @@ func syncWorkspaceChangesFromHost(
 	if err := syncfs.ApplyNonFileEntries(root, syncfs.NonFileEntries(changes.Entries)); err != nil {
 		return err
 	}
+
+	finishCacheUse, err := beginClientCacheUse(logger)
+	if err != nil {
+		return err
+	}
+	defer finishCacheUse()
 
 	store, err := clientBlobStore()
 	if err != nil {

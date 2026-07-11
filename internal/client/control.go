@@ -222,7 +222,7 @@ func ContextArtifacts(
 	)
 }
 
-func CachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, error) {
+func HostCachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, error) {
 	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
 		return CachePruneResult{}, err
