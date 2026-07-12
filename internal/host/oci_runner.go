@@ -9,11 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +32,8 @@ const (
 	contextSetupFile     = "context-setup.json"
 	artifactStateFile    = "artifacts.json"
 	defaultOCIPathEnv    = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	defaultOCINetwork    = "host"
+	defaultOCIUser       = "root"
 	defaultOCIWorkdir    = "/workspace"
 	pullProgressFields   = 2
 	// Rootfs format gates prepared-base reuse; bump only when rootfs contents
@@ -49,7 +51,7 @@ type preparedRuntime struct {
 type artifactState struct {
 	Images    []artifactImage    `json:"images,omitempty"`
 	Prepared  []artifactPrepared `json:"prepared,omitempty"`
-	UpdatedAt time.Time          `json:"updated_at,omitempty"`
+	UpdatedAt time.Time          `json:"updated_at"`
 }
 
 type artifactImage struct {
@@ -70,11 +72,11 @@ type contextSetupState struct {
 	Key string `json:"key"`
 }
 
-func isOCIRuntime(runtime protocol.RuntimeSpec) bool {
+func isOCIRuntime(runtime config.RuntimeConfig) bool {
 	return strings.EqualFold(strings.TrimSpace(runtime.Type), "oci")
 }
 
-func validateRuntimeSpec(runtime protocol.RuntimeSpec) error {
+func validateRuntimeSpec(runtime config.RuntimeConfig) error {
 	return config.ValidateRuntime(runtime)
 }
 
@@ -169,6 +171,7 @@ func (s *Server) prepareOCIRuntime(
 	return s.prepareOCIRuntimeLocked(ctx, handle, request, runLogs)
 }
 
+//nolint:cyclop,nestif // Cache validation and creation stay under one OCI lock transaction.
 func (s *Server) prepareOCIRuntimeLocked(
 	ctx context.Context,
 	handle contextHandle,
@@ -256,7 +259,7 @@ func (s *Server) prepareOCIRuntimeLocked(
 		}
 
 		content := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
-		if err := os.WriteFile(setupMarker, content, contextFileMode); err != nil {
+		if err := pathutil.WriteFileAtomically(setupMarker, content, contextFileMode); err != nil {
 			return preparedRuntime{}, err
 		}
 	} else {
@@ -280,7 +283,13 @@ func (s *Server) prepareOCIRuntimeLocked(
 		return preparedRuntime{}, err
 	}
 
-	if err := savePreparedRuntimeState(handle.runtimeDir, image, key, rootfs, baseRootFS); err != nil {
+	if err := savePreparedRuntimeState(
+		handle.runtimeDir,
+		image,
+		key,
+		rootfs,
+		baseRootFS,
+	); err != nil {
 		return preparedRuntime{}, err
 	}
 
@@ -306,7 +315,7 @@ func savePreparedRuntimeState(
 func (s *Server) pullOCIImage(
 	ctx context.Context,
 	ref oci.Reference,
-	runtimeSpec protocol.RuntimeSpec,
+	runtimeSpec config.RuntimeConfig,
 	store *oci.Store,
 	contextID string,
 	runLogs io.Writer,
@@ -342,7 +351,7 @@ func (s *Server) pullOCIImage(
 		}
 	}
 
-	client := oci.NewClient(&http.Client{Timeout: 0})
+	client := oci.NewClient(nil)
 	image, err := client.Pull(ctx, ref, store, oci.PullOptions{
 		PlatformOS:   "linux",
 		Architecture: runtime.GOARCH,
@@ -384,8 +393,12 @@ func ensureRootFSInstanceMarker(rootfs string) error {
 }
 
 func writeRootFSInstanceMarker(rootfs string) error {
-	content := []byte(fmt.Sprintf("%d-%d\n", time.Now().UTC().UnixNano(), os.Getpid()))
-	if err := os.WriteFile(filepath.Join(rootfs, rootFSInstanceMarker), content, contextFileMode); err != nil {
+	content := fmt.Appendf(nil, "%d-%d\n", time.Now().UTC().UnixNano(), os.Getpid())
+	if err := pathutil.WriteFileAtomically(
+		filepath.Join(rootfs, rootFSInstanceMarker),
+		content,
+		contextFileMode,
+	); err != nil {
 		return fmt.Errorf("write rootfs instance marker: %w", err)
 	}
 
@@ -395,7 +408,7 @@ func writeRootFSInstanceMarker(rootfs string) error {
 func (s *Server) runImageSetupCommands(
 	ctx context.Context,
 	rootfs string,
-	runtimeSpec protocol.RuntimeSpec,
+	runtimeSpec config.RuntimeConfig,
 	imageEnv []string,
 	runLogs *hostLogSubscription,
 ) error {
@@ -499,7 +512,7 @@ func (s *Server) logOCIUnpackProgress(
 				elapsed,
 				total,
 			)
-		default:
+		case oci.UnpackProgressLayerProgress:
 			s.logRun(
 				runLogs,
 				"unpacking OCI layer progress: context=%s image=%s layer=%s digest=%s bytes=%s entries=%d total=%s",
@@ -516,7 +529,7 @@ func (s *Server) logOCIUnpackProgress(
 }
 
 func shortOCIDigest(digest string) string {
-	parts := strings.SplitN(digest, ":", 2)
+	parts := strings.SplitN(digest, ":", splitNEquals)
 	if len(parts) != 2 || len(parts[1]) <= 12 {
 		return digest
 	}
@@ -526,7 +539,7 @@ func shortOCIDigest(digest string) string {
 
 func unpackProgressBytes(done, total int64) string {
 	if total <= 0 {
-		return fmt.Sprintf("%d", done)
+		return strconv.FormatInt(done, 10)
 	}
 
 	return fmt.Sprintf("%d/%d", done, total)
@@ -802,7 +815,7 @@ func mergeNvidiaRuntimeEnv(env []string, runtime nvidiaRuntimeSpec) []string {
 		seen[prefix] = true
 		paths = append(paths, prefix)
 	}
-	for _, path := range strings.Split(current, ":") {
+	for path := range strings.SplitSeq(current, ":") {
 		path = strings.TrimSpace(path)
 		if path == "" || seen[path] {
 			continue
@@ -875,15 +888,15 @@ func ociStore(runtimeRoot string) *oci.Store {
 	return oci.NewStore(filepath.Join(runtimeRoot, "cache", "oci"))
 }
 
-func runtimeCacheKey(manifestDigest string, runtimeSpec protocol.RuntimeSpec) string {
+func runtimeCacheKey(manifestDigest string, runtimeSpec config.RuntimeConfig) string {
 	network := strings.TrimSpace(runtimeSpec.Network)
 	if network == "" {
-		network = "host"
+		network = defaultOCINetwork
 	}
 
 	user := strings.TrimSpace(runtimeSpec.User)
 	if user == "" {
-		user = "root"
+		user = defaultOCIUser
 	}
 
 	gpu := strings.TrimSpace(runtimeSpec.GPU)
@@ -914,7 +927,7 @@ func runtimeCacheKey(manifestDigest string, runtimeSpec protocol.RuntimeSpec) st
 func contextSetupKey(
 	workspace string,
 	commandWorkDir string,
-	runtimeSpec protocol.RuntimeSpec,
+	runtimeSpec config.RuntimeConfig,
 	preparedKey string,
 ) (string, error) {
 	setup := runtimeSpec.Setup
@@ -925,14 +938,14 @@ func contextSetupKey(
 	h := sha256.New()
 	enc := json.NewEncoder(h)
 	if err := enc.Encode(struct {
-		PreparedKey     string                   `json:"prepared_key"`
-		CommandWorkDir  string                   `json:"command_workdir"`
-		WorkDir         string                   `json:"workdir"`
-		Network         string                   `json:"network"`
-		User            string                   `json:"user"`
-		GPU             string                   `json:"gpu"`
-		Volumes         []protocol.RuntimeVolume `json:"volumes"`
-		ContextCommands []string                 `json:"context_commands"`
+		PreparedKey     string                 `json:"prepared_key"`
+		CommandWorkDir  string                 `json:"command_workdir"`
+		WorkDir         string                 `json:"workdir"`
+		Network         string                 `json:"network"`
+		User            string                 `json:"user"`
+		GPU             string                 `json:"gpu"`
+		Volumes         []config.RuntimeVolume `json:"volumes"`
+		ContextCommands []string               `json:"context_commands"`
 	}{
 		PreparedKey:     preparedKey,
 		CommandWorkDir:  normalizedWorkDir(commandWorkDir),
@@ -998,10 +1011,10 @@ func saveContextSetupState(path string, state contextSetupState) error {
 		return err
 	}
 
-	return writeIndentedJSON(path, state)
+	return writeJSONAtomically(path, state, contextFileMode)
 }
 
-func (s *Server) ensureOCIVolumes(runtimeDir string, volumes []protocol.RuntimeVolume) error {
+func (s *Server) ensureOCIVolumes(runtimeDir string, volumes []config.RuntimeVolume) error {
 	for _, volume := range volumes {
 		path := filepath.Join(runtimeDir, "volumes", volume.Name)
 		if err := os.MkdirAll(path, defaultDirMode); err != nil {
@@ -1041,20 +1054,7 @@ func saveArtifactState(
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	return writeIndentedJSON(path, state)
-}
-
-func writeIndentedJSON(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), defaultDirMode); err != nil {
-		return err
-	}
-
-	content, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(path, append(content, '\n'), contextFileMode)
+	return writeJSONAtomically(path, state, contextFileMode)
 }
 
 func imageBlobDigests(image oci.Image) []string {

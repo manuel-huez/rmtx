@@ -1,3 +1,4 @@
+//nolint:cyclop,goconst // End-to-end scenarios keep fixture values and lifecycle checks together.
 package app
 
 import (
@@ -19,6 +20,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func TestRunExecRequiresLocalConfig(t *testing.T) {
@@ -90,7 +92,7 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -216,7 +218,10 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 	}
 
 	if strings.TrimSpace(stdout2.String()) != "changed" {
-		t.Fatalf("expected workspace to rehydrate without ignored cache file, got %q", stdout2.String())
+		t.Fatalf(
+			"expected workspace to rehydrate without ignored cache file, got %q",
+			stdout2.String(),
+		)
 	}
 
 	var stdout3, stderr3 bytes.Buffer
@@ -234,6 +239,7 @@ func TestRunExecEndToEndSyncsBackChangesAndCleansWorkspaces(t *testing.T) {
 	if code != 7 {
 		t.Fatalf("unexpected failing exit code: %d (stderr=%s)", code, stderr3.String())
 	}
+
 	if err := os.Remove(filepath.Join(project, "fail.txt")); err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +378,7 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -432,6 +438,7 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 			ForwardStdin: true,
 		})
 		_ = stdoutWriter.Close()
+
 		runDone <- struct {
 			code int
 			err  error
@@ -441,10 +448,12 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 	ready := make(chan error, 1)
 	go func() {
 		buf := make([]byte, len("ready\n"))
+
 		_, err := io.ReadFull(stdoutReader, buf)
 		if err == nil && string(buf) != "ready\n" {
 			err = errors.New("unexpected stdout before interrupt")
 		}
+
 		ready <- err
 	}()
 
@@ -462,8 +471,13 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 	select {
 	case result := <-runDone:
 		if result.err != nil {
-			t.Fatalf("interrupted run returned error before sync-back: code=%d err=%v", result.code, result.err)
+			t.Fatalf(
+				"interrupted run returned error before sync-back: code=%d err=%v",
+				result.code,
+				result.err,
+			)
 		}
+
 		if result.code == 0 {
 			t.Fatal("interrupted run should return non-zero exit code")
 		}
@@ -471,17 +485,20 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 		stdin.Close()
 		t.Fatal("interrupted run did not finish")
 	}
+
 	stdin.Close()
 
 	got, err := os.ReadFile(filepath.Join(project, "interrupted.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if string(got) != "host edit\n" {
 		t.Fatalf("interrupted.txt=%q want host edit", string(got))
 	}
 
 	var rerunStdout, rerunStderr bytes.Buffer
+
 	code, err := RunExec(context.Background(), project, ExecParams{
 		ConfigPath: configPath,
 		Command:    []string{"cat", "interrupted.txt"},
@@ -491,17 +508,21 @@ func TestRunExecInterruptSyncsBackHostChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if code != 0 {
 		t.Fatalf("rerun exit code=%d stderr=%s", code, rerunStderr.String())
 	}
+
 	if rerunStdout.String() != "host edit\n" {
 		t.Fatalf("rerun stdout=%q want host edit", rerunStdout.String())
 	}
+
 	if !strings.Contains(rerunStderr.String(), "host already has all file blobs") {
 		t.Fatalf("rerun reuploaded interrupted file: stderr=%s", rerunStderr.String())
 	}
 
 	stopHost()
+
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -544,7 +565,7 @@ func TestRunExecEndToEndNoopRunDoesNotDownloadFiles(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -756,7 +777,7 @@ func startWorkspaceLeaseE2E(
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -888,7 +909,7 @@ func deleteWorkspaceLease(t *testing.T, lease workspaceLeaseE2E, leaseID string)
 func parseWorkspaceLeaseID(t *testing.T, stderr string) string {
 	t.Helper()
 
-	for _, field := range strings.Fields(stderr) {
+	for field := range strings.FieldsSeq(stderr) {
 		if strings.HasPrefix(field, "id=ws_") {
 			return strings.TrimPrefix(field, "id=")
 		}
@@ -908,7 +929,7 @@ func TestRunExecEndToEndReportsCommandStartFailure(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -996,7 +1017,7 @@ func TestRunExecEndToEndRespectsContextSyncBack(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -1110,7 +1131,7 @@ func TestRunPairSupportsMultipleHosts(t *testing.T) {
 
 		stateDir := t.TempDir()
 
-		server, err := host.New(host.Options{
+		server, err := host.New(ctx, host.Options{
 			ListenAddr:       "127.0.0.1:0",
 			StateDir:         stateDir,
 			AdvertiseName:    label,
@@ -1220,7 +1241,7 @@ func TestRunPairUsesConfiguredHostWhenDiscoveryDisabled(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -1287,7 +1308,7 @@ func TestRunPairManualHostAcceptsFingerprintOverride(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -1347,7 +1368,7 @@ func TestRunPairRequestsCodeWhenCodeOmitted(t *testing.T) {
 	stateDir := t.TempDir()
 	codeCh := make(chan string, 1)
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -1439,7 +1460,7 @@ func TestRunInitCreatesConfigAndRequestsCodeFromSelectedHost(t *testing.T) {
 		stateDir := t.TempDir()
 		codeCh := make(chan string, 1)
 
-		server, err := host.New(host.Options{
+		server, err := host.New(ctx, host.Options{
 			ListenAddr:       "127.0.0.1:0",
 			StateDir:         stateDir,
 			AdvertiseName:    label,
@@ -1598,7 +1619,7 @@ func TestRunInitManualHostBypassesDiscovery(t *testing.T) {
 	stateDir := t.TempDir()
 	codeCh := make(chan string, 1)
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		AdvertiseName:    "manual-host",
@@ -1688,7 +1709,7 @@ func TestPairPromptsReuseBufferedInput(t *testing.T) {
 		t.Fatalf("unexpected selected host index: got %d want 2", index)
 	}
 
-	code, err := promptForPairCode(&params, client.PairCodeResult{
+	code, err := promptForPairCode(&params, protocol.PairCodeResponse{
 		HostName:  "host-b",
 		ExpiresAt: time.Unix(123, 0).UTC(),
 	})
@@ -1718,7 +1739,7 @@ func TestRequestPairCodeQuotesClientLabelInLogs(t *testing.T) {
 
 	var logs bytes.Buffer
 
-	server, err := host.New(host.Options{
+	server, err := host.New(t.Context(), host.Options{
 		ListenAddr:       "127.0.0.1:0",
 		StateDir:         stateDir,
 		DisableDiscovery: true,
@@ -1914,7 +1935,7 @@ type pairCodeLogCapture struct {
 }
 
 func (w *pairCodeLogCapture) Write(p []byte) (int, error) {
-	for _, field := range strings.Fields(string(p)) {
+	for field := range strings.FieldsSeq(string(p)) {
 		if !strings.HasPrefix(field, "code=") {
 			continue
 		}

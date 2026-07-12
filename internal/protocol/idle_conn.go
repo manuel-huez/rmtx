@@ -33,7 +33,7 @@ func (c *IdleDeadlineConn) SetReadIdleTimeout(timeout time.Duration) {
 	c.mu.Unlock()
 
 	if timeout <= 0 {
-		_ = c.Conn.SetReadDeadline(time.Time{})
+		_ = c.SetReadDeadline(time.Time{})
 	}
 }
 
@@ -43,13 +43,13 @@ func (c *IdleDeadlineConn) SetWriteIdleTimeout(timeout time.Duration) {
 	c.mu.Unlock()
 
 	if timeout <= 0 {
-		_ = c.Conn.SetWriteDeadline(time.Time{})
+		_ = c.SetWriteDeadline(time.Time{})
 	}
 }
 
 func (c *IdleDeadlineConn) Read(p []byte) (int, error) {
 	if timeout := c.readIdleTimeout(); timeout > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(timeout))
+		_ = c.SetReadDeadline(time.Now().Add(timeout))
 	}
 
 	return c.Conn.Read(p)
@@ -57,7 +57,7 @@ func (c *IdleDeadlineConn) Read(p []byte) (int, error) {
 
 func (c *IdleDeadlineConn) Write(p []byte) (int, error) {
 	if timeout := c.writeIdleTimeout(); timeout > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(timeout))
+		_ = c.SetWriteDeadline(time.Now().Add(timeout))
 	}
 
 	return c.Conn.Write(p)

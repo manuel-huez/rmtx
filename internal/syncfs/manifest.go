@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -16,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 type EntryKind string
@@ -29,10 +26,11 @@ const (
 )
 
 const (
-	minWorkers      = 2
-	defaultDirMode  = 0o755
-	defaultFileMode = 0o644
-	progressEvery   = 3 * time.Second
+	minWorkers        = 2
+	defaultDirMode    = 0o755
+	defaultFileMode   = 0o644
+	progressEvery     = 3 * time.Second
+	progressPhaseHash = "hash"
 )
 
 type MountSpec struct {
@@ -194,7 +192,7 @@ func hashManifestFiles(
 	startHashWorkers(ctx, workers, jobCh, results)
 	sendHashJobs(ctx, jobs, jobCh)
 
-	stats := BuildProgress{Phase: "hash", TotalFiles: len(jobs)}
+	stats := BuildProgress{Phase: progressPhaseHash, TotalFiles: len(jobs)}
 	progress.Report(stats, true)
 
 	for res := range results {
@@ -680,7 +678,7 @@ func FilterEntriesByPath(entries []Entry, includes []string) []Entry {
 }
 
 func ValidateSyncBack(root string, mounts []MountSpec, syncBack []string) error {
-	if syncBack == nil || len(syncBack) == 0 {
+	if len(syncBack) == 0 {
 		return nil
 	}
 
@@ -696,7 +694,10 @@ func ValidateSyncBack(root string, mounts []MountSpec, syncBack []string) error 
 		}
 
 		if !syncBackPatternEligible(root, mounts, normalized) {
-			return fmt.Errorf("sync_back path %q is not covered by mounted, non-ignored files", include)
+			return fmt.Errorf(
+				"sync_back path %q is not covered by mounted, non-ignored files",
+				include,
+			)
 		}
 	}
 
@@ -725,6 +726,7 @@ func syncBackPatternEligible(root string, mounts []MountSpec, pattern string) bo
 
 		matcher := newExcludeMatcher(mount.Exclude)
 		relMountBase := relFromMount(mountRelRoot, base)
+
 		relMountSample := relFromMount(mountRelRoot, sample)
 		if matcher.Match(base, relMountBase) || matcher.Match(sample, relMountSample) {
 			continue
@@ -738,6 +740,7 @@ func syncBackPatternEligible(root string, mounts []MountSpec, pattern string) bo
 
 func literalPatternPrefix(pattern string) string {
 	parts := splitPath(pattern)
+
 	prefix := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if strings.ContainsAny(part, "*?[") {
@@ -774,6 +777,7 @@ func samplePatternPath(pattern string) string {
 
 func samplePatternSegment(pattern string) string {
 	var b strings.Builder
+
 	for i := 0; i < len(pattern); i++ {
 		switch pattern[i] {
 		case '*', '?':
@@ -783,6 +787,7 @@ func samplePatternSegment(pattern string) string {
 			if end >= 0 {
 				b.WriteByte(sampleCharClass(pattern[i+1 : i+1+end]))
 				i += end + 1
+
 				continue
 			}
 
@@ -801,6 +806,7 @@ func samplePatternSegment(pattern string) string {
 
 func sampleCharClass(class string) byte {
 	class = strings.TrimPrefix(class, "!")
+
 	class = strings.TrimPrefix(class, "^")
 	if class == "" {
 		return 'x'
@@ -822,6 +828,7 @@ func pathUnderOrEqual(rel, base string) bool {
 
 func relFromMount(mountRelRoot, rel string) string {
 	rel = normalizeRel(rel)
+
 	mountRelRoot = normalizeRel(mountRelRoot)
 	if mountRelRoot == "." {
 		return rel
@@ -831,157 +838,11 @@ func relFromMount(mountRelRoot, rel string) string {
 		return "."
 	}
 
-	if strings.HasPrefix(rel, mountRelRoot+"/") {
-		return strings.TrimPrefix(rel, mountRelRoot+"/")
+	if after, ok := strings.CutPrefix(rel, mountRelRoot+"/"); ok {
+		return after
 	}
 
 	return rel
-}
-
-func DeletePaths(root string, paths []string) error {
-	sorted := append([]string(nil), paths...)
-	sort.Slice(sorted, func(i, j int) bool { return depth(sorted[i]) > depth(sorted[j]) })
-
-	for _, rel := range sorted {
-		if rel == "." {
-			continue
-		}
-
-		target, err := secureJoin(root, rel)
-		if err != nil {
-			return err
-		}
-
-		if err := pathutil.RemoveAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("delete %s: %w", rel, err)
-		}
-	}
-
-	return nil
-}
-
-func ApplyNonFileEntries(root string, entries []Entry) error {
-	sorted := append([]Entry(nil), entries...)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Kind == KindDir && sorted[j].Kind != KindDir {
-			return true
-		}
-
-		if sorted[i].Kind != KindDir && sorted[j].Kind == KindDir {
-			return false
-		}
-
-		return sorted[i].Path < sorted[j].Path
-	})
-
-	for _, entry := range sorted {
-		if entry.Path == "." {
-			continue
-		}
-
-		target, err := secureJoin(root, entry.Path)
-		if err != nil {
-			return err
-		}
-
-		if err := applyNonFileEntry(entry, target); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func applyNonFileEntry(entry Entry, target string) error {
-	switch entry.Kind {
-	case KindDir:
-		if err := os.MkdirAll(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
-			return fmt.Errorf("mkdir %s: %w", entry.Path, err)
-		}
-
-		if err := pathutil.Chmod(target, fileMode(entry.Mode, defaultDirMode)); err != nil {
-			return fmt.Errorf("chmod dir %s: %w", entry.Path, err)
-		}
-	case KindSymlink:
-		if err := os.MkdirAll(filepath.Dir(target), defaultDirMode); err != nil {
-			return fmt.Errorf("mkdir symlink parent %s: %w", entry.Path, err)
-		}
-
-		_ = pathutil.RemoveAll(target)
-		if err := pathutil.Symlink(entry.Linkname, target); err != nil {
-			if isUnsupportedWindowsSymlink(err) {
-				return nil
-			}
-
-			return fmt.Errorf("symlink %s: %w", entry.Path, err)
-		}
-	case KindFile:
-		return nil
-	default:
-		return fmt.Errorf("unsupported entry kind %q for %s", entry.Kind, entry.Path)
-	}
-
-	return nil
-}
-
-func isUnsupportedWindowsSymlink(err error) bool {
-	return runtime.GOOS == "windows" && strings.Contains(strings.ToLower(err.Error()), "privilege")
-}
-
-func WriteFile(root string, entry Entry, src io.Reader) error {
-	if entry.Kind != KindFile {
-		return fmt.Errorf("entry %s is not a file", entry.Path)
-	}
-
-	target, err := secureJoin(root, entry.Path)
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(target), defaultDirMode); err != nil {
-		return fmt.Errorf("mkdir file parent %s: %w", entry.Path, err)
-	}
-
-	tmp := target + ".rmtx-tmp"
-
-	f, err := os.OpenFile(
-		tmp,
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
-		fileMode(entry.Mode, defaultFileMode),
-	)
-	if err != nil {
-		return fmt.Errorf("create file %s: %w", entry.Path, err)
-	}
-
-	if _, err := io.Copy(f, src); err != nil {
-		_ = f.Close()
-
-		_ = os.Remove(tmp)
-
-		return fmt.Errorf("write file %s: %w", entry.Path, err)
-	}
-
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("close file %s: %w", entry.Path, err)
-	}
-
-	if err := pathutil.Chmod(tmp, fileMode(entry.Mode, defaultFileMode)); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("chmod file %s: %w", entry.Path, err)
-	}
-
-	if err := pathutil.RemoveAll(target); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace file %s: %w", entry.Path, err)
-	}
-
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename file %s: %w", entry.Path, err)
-	}
-
-	return setFileModTime(target, entry.ModTime)
 }
 
 func resolveMount(root, mountPath string) (string, error) {
@@ -1004,11 +865,12 @@ func resolveMount(root, mountPath string) (string, error) {
 		return clean, nil
 	}
 
-	return secureJoin(root, mountPath)
-}
+	clean := filepath.Clean(filepath.FromSlash(mountPath))
+	if !filepath.IsLocal(clean) {
+		return "", fmt.Errorf("mount %s escapes root %s", mountPath, root)
+	}
 
-func secureJoin(root, rel string) (string, error) {
-	return pathutil.SecureJoin(root, rel)
+	return filepath.Join(root, clean), nil
 }
 
 func normalizeRel(rel string) string {

@@ -27,9 +27,11 @@ func TestEnsureOverlayRootFSBundlePreservesMatchingUpper(t *testing.T) {
 	if err := ensureOverlayRootFSBundle(rootfs, "key", base); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(upperFile, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ensureOverlayRootFSBundle(rootfs, "key", base); err != nil {
 		t.Fatal(err)
 	}
@@ -46,9 +48,11 @@ func TestEnsureOverlayRootFSBundleReplacesStaleBundle(t *testing.T) {
 	if err := ensureOverlayRootFSBundle(rootfs, "key", firstBase); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(upperFile, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ensureOverlayRootFSBundle(rootfs, "key", secondBase); err != nil {
 		t.Fatal(err)
 	}

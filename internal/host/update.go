@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -114,6 +115,7 @@ func protectedUpdateDirs(pendingExecutable string) (map[string]bool, error) {
 	}
 
 	protected := map[string]bool{}
+
 	for _, executable := range []string{currentExecutable, pendingExecutable} {
 		if strings.TrimSpace(executable) == "" {
 			continue
@@ -145,8 +147,11 @@ func pruneOldUpdateArtifacts(
 		return nil, 0, err
 	}
 
-	var removed []protocol.ContextArtifact
-	var bytes int64
+	var (
+		removed []protocol.ContextArtifact
+		bytes   int64
+	)
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -193,6 +198,7 @@ func environWith(key, value string) []string {
 	return append(out, key+"="+value)
 }
 
+//nolint:cyclop // Update install, restart state, and response form one serialized transaction.
 func (s *Server) handleHostUpdateRequest(
 	parent context.Context,
 	conn *protocol.Conn,
@@ -275,7 +281,7 @@ func (s *Server) handleHostUpdateRequest(
 	)
 
 	if !s.beginRestart(result.Executable, targetVersion, result.InstallTarget) {
-		return fmt.Errorf("host restart already in progress")
+		return errors.New("host restart already in progress")
 	}
 
 	if err := s.waitForActiveRuns(ctx); err != nil {

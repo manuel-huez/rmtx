@@ -6,10 +6,10 @@ import (
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
-func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
+func Ping(ctx context.Context, opts RemoteOptions) (protocol.PingResponse, error) {
 	conn, info, checked, err := connectUpdatedRemote(ctx, opts, newRunLogger(opts.Stderr))
 	if err != nil {
-		return PingInfo{}, err
+		return protocol.PingResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -18,7 +18,7 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	}
 
 	if err := conn.WriteJSON(protocol.MsgPingRequest, protocol.PingRequest{}); err != nil {
-		return PingInfo{}, err
+		return protocol.PingResponse{}, err
 	}
 
 	return expectDataFrameWithOutput[protocol.PingResponse](
@@ -28,26 +28,29 @@ func Ping(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
 	)
 }
 
-func pingHost(ctx context.Context, opts RemoteOptions) (PingInfo, error) {
+func pingHost(ctx context.Context, opts RemoteOptions) (protocol.PingResponse, error) {
 	conn, info, err := pingHostConn(ctx, opts)
 	if err != nil {
-		return PingInfo{}, err
+		return protocol.PingResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
 	return info, nil
 }
 
-func pingHostConn(ctx context.Context, opts RemoteOptions) (*protocol.Conn, PingInfo, error) {
+func pingHostConn(
+	ctx context.Context,
+	opts RemoteOptions,
+) (*protocol.Conn, protocol.PingResponse, error) {
 	conn, err := dialRemote(ctx, opts)
 	if err != nil {
-		return nil, PingInfo{}, err
+		return nil, protocol.PingResponse{}, err
 	}
 
 	if err := conn.WriteJSON(protocol.MsgPingRequest, protocol.PingRequest{}); err != nil {
 		closeQuietly(conn.Raw())
 
-		return nil, PingInfo{}, err
+		return nil, protocol.PingResponse{}, err
 	}
 
 	info, err := expectDataFrameWithOutput[protocol.PingResponse](
@@ -58,21 +61,24 @@ func pingHostConn(ctx context.Context, opts RemoteOptions) (*protocol.Conn, Ping
 	if err != nil {
 		closeQuietly(conn.Raw())
 
-		return nil, PingInfo{}, err
+		return nil, protocol.PingResponse{}, err
 	}
 
 	return conn, info, nil
 }
 
-func HostStats(ctx context.Context, opts RemoteOptions) (HostStatsInfo, error) {
+func HostStats(ctx context.Context, opts RemoteOptions) (protocol.HostStatsResponse, error) {
 	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
-		return HostStatsInfo{}, err
+		return protocol.HostStatsResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
-	if err := conn.WriteJSON(protocol.MsgHostStatsRequest, protocol.HostStatsRequest{}); err != nil {
-		return HostStatsInfo{}, err
+	if err := conn.WriteJSON(
+		protocol.MsgHostStatsRequest,
+		protocol.HostStatsRequest{},
+	); err != nil {
+		return protocol.HostStatsResponse{}, err
 	}
 
 	return expectDataFrameWithOutput[protocol.HostStatsResponse](
@@ -86,10 +92,10 @@ func UpdateHost(
 	ctx context.Context,
 	opts RemoteOptions,
 	targetVersion string,
-) (HostUpdateResult, error) {
+) (protocol.HostUpdateResponse, error) {
 	conn, err := dialRemote(ctx, opts)
 	if err != nil {
-		return HostUpdateResult{}, err
+		return protocol.HostUpdateResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -98,7 +104,7 @@ func UpdateHost(
 
 	req := protocol.HostUpdateRequest{Version: targetVersion}
 	if err := conn.WriteJSON(protocol.MsgHostUpdateRequest, req); err != nil {
-		return HostUpdateResult{}, err
+		return protocol.HostUpdateResponse{}, err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)
@@ -111,7 +117,7 @@ func UpdateHost(
 	)
 }
 
-func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error) {
+func ListContexts(ctx context.Context, opts RemoteOptions) ([]protocol.ContextSummary, error) {
 	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -137,10 +143,13 @@ func ListContexts(ctx context.Context, opts RemoteOptions) ([]ContextInfo, error
 	return resp.Contexts, nil
 }
 
-func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteContextsResult, error) {
+func DeleteContexts(
+	ctx context.Context,
+	opts DeleteContextsOptions,
+) (protocol.DeleteContextsResponse, error) {
 	conn, err := updatedRemoteConn(ctx, opts.Remote)
 	if err != nil {
-		return DeleteContextsResult{}, err
+		return protocol.DeleteContextsResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -150,7 +159,7 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 		OlderThan: opts.OlderThan,
 	}
 	if err := conn.WriteJSON(protocol.MsgDeleteContextsRequest, req); err != nil {
-		return DeleteContextsResult{}, err
+		return protocol.DeleteContextsResponse{}, err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)
@@ -166,10 +175,10 @@ func DeleteContexts(ctx context.Context, opts DeleteContextsOptions) (DeleteCont
 func WorkspaceLeases(
 	ctx context.Context,
 	opts WorkspaceLeasesOptions,
-) (WorkspaceLeasesResult, error) {
+) (protocol.WorkspaceLeasesResponse, error) {
 	conn, err := updatedRemoteConn(ctx, opts.Remote)
 	if err != nil {
-		return WorkspaceLeasesResult{}, err
+		return protocol.WorkspaceLeasesResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -179,7 +188,7 @@ func WorkspaceLeases(
 		IDs:       append([]string(nil), opts.IDs...),
 	}
 	if err := conn.WriteJSON(protocol.MsgWorkspaceLeasesRequest, req); err != nil {
-		return WorkspaceLeasesResult{}, err
+		return protocol.WorkspaceLeasesResponse{}, err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)
@@ -195,10 +204,10 @@ func WorkspaceLeases(
 func ContextArtifacts(
 	ctx context.Context,
 	opts ContextArtifactsOptions,
-) (ContextArtifactsResult, error) {
+) (protocol.ContextArtifactsResponse, error) {
 	conn, err := updatedRemoteConn(ctx, opts.Remote)
 	if err != nil {
-		return ContextArtifactsResult{}, err
+		return protocol.ContextArtifactsResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -209,7 +218,7 @@ func ContextArtifacts(
 		Volume:    opts.Volume,
 	}
 	if err := conn.WriteJSON(protocol.MsgContextArtifactsRequest, req); err != nil {
-		return ContextArtifactsResult{}, err
+		return protocol.ContextArtifactsResponse{}, err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)
@@ -222,10 +231,10 @@ func ContextArtifacts(
 	)
 }
 
-func HostCachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, error) {
+func HostCachePrune(ctx context.Context, opts RemoteOptions) (protocol.CachePruneResponse, error) {
 	conn, err := updatedRemoteConn(ctx, opts)
 	if err != nil {
-		return CachePruneResult{}, err
+		return protocol.CachePruneResponse{}, err
 	}
 	defer closeQuietly(conn.Raw())
 
@@ -233,7 +242,7 @@ func HostCachePrune(ctx context.Context, opts RemoteOptions) (CachePruneResult, 
 		protocol.MsgCachePruneRequest,
 		protocol.CachePruneRequest{},
 	); err != nil {
-		return CachePruneResult{}, err
+		return protocol.CachePruneResponse{}, err
 	}
 
 	stopLiveness := startConnectionLiveness(ctx, conn, false)

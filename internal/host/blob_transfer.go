@@ -32,7 +32,7 @@ type blobTransferSession struct {
 }
 
 type blobSendJob struct {
-	info protocol.BlobChunkInfo
+	info syncfs.BlobChunkInfo
 	path string
 }
 
@@ -42,11 +42,12 @@ type blobChunkKey struct {
 }
 
 func newBlobReceiveSession(
+	ctx context.Context,
 	contextID,
 	session,
 	token string,
 	store *syncfs.BlobStore,
-	blobs []protocol.BlobDescriptor,
+	blobs []syncfs.BlobDescriptor,
 	chunkSize int64,
 	parallel int,
 ) (*blobTransferSession, error) {
@@ -67,10 +68,11 @@ func newBlobReceiveSession(
 	}
 
 	go func() {
-		if err := receiver.Wait(context.Background()); err != nil {
+		if err := receiver.Wait(ctx); err != nil {
 			_ = transfer.fail(err)
 			return
 		}
+
 		transfer.complete()
 	}()
 
@@ -110,12 +112,15 @@ func (s *blobTransferSession) validate(req protocol.BlobTransferRequest) error {
 	if s == nil {
 		return errors.New("blob transfer session not found")
 	}
+
 	if s.contextID != req.ContextID || s.session != req.Session || s.token != req.Token {
 		return errors.New("blob transfer session mismatch")
 	}
+
 	if s.direction != req.Direction {
 		return errors.New("blob transfer direction mismatch")
 	}
+
 	return nil
 }
 
@@ -129,7 +134,7 @@ func (s *blobTransferSession) complete() {
 	}
 }
 
-func (s *blobTransferSession) completeChunk(info protocol.BlobChunkInfo) {
+func (s *blobTransferSession) completeChunk(info syncfs.BlobChunkInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -137,6 +142,7 @@ func (s *blobTransferSession) completeChunk(info protocol.BlobChunkInfo) {
 	if _, ok := s.sent[key]; !ok {
 		s.sent[key] = struct{}{}
 	}
+
 	if len(s.sent) >= s.total && !s.doneSet {
 		s.doneSet = true
 		close(s.done)
@@ -157,6 +163,7 @@ func (s *blobTransferSession) fail(err error) error {
 			_ = s.receiver.Fail(err)
 		}
 	}
+
 	if !s.doneSet {
 		s.doneSet = true
 		close(s.done)
@@ -170,6 +177,7 @@ func (s *blobTransferSession) wait(ctx context.Context) error {
 	case <-s.done:
 		s.mu.Lock()
 		defer s.mu.Unlock()
+
 		return s.err
 	case <-ctx.Done():
 		return s.fail(ctx.Err())
@@ -242,6 +250,7 @@ func (s *Server) receiveBlobTransfer(
 		if err != nil {
 			return err
 		}
+
 		if done {
 			return nil
 		}
@@ -286,10 +295,11 @@ func (s *Server) receiveBlobTransferChunk(
 	transfer *blobTransferSession,
 	head protocol.Header,
 ) (bool, error) {
-	info, err := protocol.DecodeData[protocol.BlobChunkInfo](head)
+	info, err := protocol.DecodeData[syncfs.BlobChunkInfo](head)
 	if err != nil {
 		return false, transfer.fail(err)
 	}
+
 	err = transfer.receiver.ReceiveChunk(
 		info,
 		conn.PayloadReader(head),
@@ -318,6 +328,7 @@ func (s *Server) sendBlobTransfer(
 			if protocol.IsDisconnectError(err) {
 				return nil
 			}
+
 			return transfer.fail(err)
 		}
 
@@ -326,11 +337,14 @@ func (s *Server) sendBlobTransfer(
 			if protocol.IsDisconnectError(err) {
 				return nil
 			}
+
 			return transfer.fail(err)
 		}
+
 		if !ok {
 			return nil
 		}
+
 		req = next
 	}
 }
@@ -344,9 +358,11 @@ func (s *Server) sendRequestedBlobChunk(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	if err := transfer.validate(req); err != nil {
 		return err
 	}
+
 	if req.Chunk == nil {
 		return errors.New("blob download chunk is required")
 	}
@@ -355,9 +371,11 @@ func (s *Server) sendRequestedBlobChunk(
 	if item.hash == "" {
 		return fmt.Errorf("requested unknown blob chunk %s", req.Chunk.Hash)
 	}
+
 	if err := validateSendBlobChunk(*req.Chunk, item, transfer.chunkSize); err != nil {
 		return err
 	}
+
 	job := blobSendJob{info: *req.Chunk, path: item.path}
 	if err := sendBlobChunk(conn, job, transfer.chunkSize); err != nil {
 		return err
@@ -369,24 +387,33 @@ func (s *Server) sendRequestedBlobChunk(
 }
 
 func validateSendBlobChunk(
-	info protocol.BlobChunkInfo,
+	info syncfs.BlobChunkInfo,
 	item downloadBlobItem,
 	chunkSize int64,
 ) error {
 	if info.Size != item.size {
 		return fmt.Errorf("blob %s size mismatch: %d != %d", info.Hash, info.Size, item.size)
 	}
+
 	if info.Offset < 0 || info.Offset > item.size {
 		return fmt.Errorf("blob %s invalid chunk offset %d", info.Hash, info.Offset)
 	}
+
 	if item.size > 0 && info.Offset%chunkSize != 0 {
 		return fmt.Errorf("blob %s unaligned chunk offset %d", info.Hash, info.Offset)
 	}
+
 	index := 0
 	if item.size > 0 {
 		index = int(info.Offset / chunkSize)
 	}
-	if index >= protocol.BlobChunkCount(item.size, chunkSize) {
+
+	count, err := syncfs.BlobChunkCount(item.size, chunkSize)
+	if err != nil {
+		return err
+	}
+
+	if index >= count {
 		return fmt.Errorf("blob %s chunk index out of range %d", info.Hash, index)
 	}
 
@@ -423,19 +450,28 @@ func readNextBlobTransferRequest(conn *protocol.Conn) (protocol.BlobTransferRequ
 				return protocol.BlobTransferRequest{}, false, err
 			}
 
-			return protocol.BlobTransferRequest{}, false, fmt.Errorf("unexpected blob transfer frame: %s", head.Type)
+			return protocol.BlobTransferRequest{}, false, fmt.Errorf(
+				"unexpected blob transfer frame: %s",
+				head.Type,
+			)
 		}
 	}
 }
 
 func sendBlobChunk(conn *protocol.Conn, job blobSendJob, chunkSize int64) error {
-	payloadLen := protocol.BlobChunkPayloadLen(job.info, chunkSize)
+	payloadLen, err := syncfs.BlobChunkPayloadLen(job.info, chunkSize)
+	if err != nil {
+		return err
+	}
+
 	file, err := os.Open(job.path)
 	if err != nil {
 		return fmt.Errorf("open blob source %s: %w", job.path, err)
 	}
+
 	defer func() { _ = file.Close() }()
 
 	reader := io.NewSectionReader(file, job.info.Offset, payloadLen)
+
 	return conn.WriteFrom(protocol.MsgBlobChunk, job.info, reader, payloadLen)
 }

@@ -1,4 +1,4 @@
-//nolint:wsl_v5
+//nolint:goconst,wsl_v5 // Registry fixtures intentionally repeat wire values per case.
 package oci
 
 import (
@@ -102,7 +102,8 @@ func TestPullFetchesManifestAndBlobsWithBearerChallenge(t *testing.T) {
 		t.Fatalf("cached image env=%#v", cached.Env)
 	}
 
-	if !store.HasBlob(layerDigest) || !store.HasBlob(configDigest) {
+	if !store.HasBlob(layerDigest, int64(len(layer))) ||
+		!store.HasBlob(configDigest, int64(len(config))) {
 		t.Fatalf("expected blobs in store")
 	}
 }
@@ -245,7 +246,7 @@ func TestStoreBlobRejectsInvalidDigestBeforePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := store.StoreBlob("sha256:../../escape", bytes.NewReader([]byte("x")))
+	err := store.StoreBlob("sha256:../../escape", 1, bytes.NewReader([]byte("x")))
 	if err == nil || !strings.Contains(err.Error(), "invalid blob digest") {
 		t.Fatalf("err=%v want invalid blob digest", err)
 	}
@@ -269,13 +270,11 @@ func TestStoreBlobConcurrentSameDigest(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 
 			<-start
-			errs <- store.StoreBlob(blobDigest, bytes.NewReader(content))
-		}()
+			errs <- store.StoreBlob(blobDigest, int64(len(content)), bytes.NewReader(content))
+		})
 	}
 
 	close(start)
@@ -288,7 +287,7 @@ func TestStoreBlobConcurrentSameDigest(t *testing.T) {
 		}
 	}
 
-	if !store.HasBlob(blobDigest) {
+	if !store.HasBlob(blobDigest, int64(len(content))) {
 		t.Fatal("expected blob in store")
 	}
 }

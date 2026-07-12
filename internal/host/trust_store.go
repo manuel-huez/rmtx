@@ -53,7 +53,7 @@ func (s *Server) loadTrustStoreUnlocked() (trustStore, error) {
 }
 
 func (s *Server) saveTrustStore(store trustStore) error {
-	if err := writeJSONAtomically(s.trustStorePath(), store); err != nil {
+	if err := writeJSONAtomically(s.trustStorePath(), store, pairCodeFileMode); err != nil {
 		return fmt.Errorf("write trust store: %w", err)
 	}
 

@@ -54,17 +54,18 @@ type UnpackProgress struct {
 // UnpackProgressFunc receives throttled layer progress during rootfs unpack.
 type UnpackProgressFunc func(UnpackProgress)
 
-type contextReader struct {
-	ctx context.Context
-	src io.Reader
-}
+type readerFunc func([]byte) (int, error)
 
-func (r contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
+func (read readerFunc) Read(p []byte) (int, error) { return read(p) }
 
-	return r.src.Read(p)
+func readerWithContext(ctx context.Context, src io.Reader) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		return src.Read(p)
+	})
 }
 
 // UnpackImageContext applies image layers into a rootfs, reporting progress while extracting.
@@ -172,8 +173,8 @@ func (s *Store) unpackLayer(
 	)
 	reporter.start()
 
-	metered := &unpackProgressReader{ctx: ctx, src: f, reporter: reporter}
-	var r io.Reader = metered
+	metered := progressReader(ctx, f, reporter)
+	var r io.Reader
 	gz, err := gzip.NewReader(metered)
 	if err == nil {
 		defer func() { _ = gz.Close() }()
@@ -182,7 +183,7 @@ func (s *Store) unpackLayer(
 		return reporter.bytes(), seekErr
 	} else {
 		reporter.resetBytes()
-		metered = &unpackProgressReader{ctx: ctx, src: f, reporter: reporter}
+		metered = progressReader(ctx, f, reporter)
 		r = metered
 	}
 
@@ -201,29 +202,34 @@ func (s *Store) unpackLayer(
 		}
 
 		if err := applyTarEntry(ctx, root, hdr, tr); err != nil {
-			return reporter.bytes(), fmt.Errorf("apply layer %s entry %s: %w", digest, hdr.Name, err)
+			return reporter.bytes(), fmt.Errorf(
+				"apply layer %s entry %s: %w",
+				digest,
+				hdr.Name,
+				err,
+			)
 		}
 		reporter.addEntry()
 	}
 }
 
-type unpackProgressReader struct {
-	ctx      context.Context
-	src      io.Reader
-	reporter *unpackProgressReporter
-}
+func progressReader(
+	ctx context.Context,
+	src io.Reader,
+	reporter *unpackProgressReporter,
+) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 
-func (r *unpackProgressReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
+		n, err := src.Read(p)
+		if n > 0 {
+			reporter.addBytes(int64(n))
+		}
 
-	n, err := r.src.Read(p)
-	if n > 0 {
-		r.reporter.addBytes(int64(n))
-	}
-
-	return n, err
+		return n, err
+	})
 }
 
 type unpackProgressReporter struct {
@@ -307,7 +313,7 @@ func (r *unpackProgressReporter) report(event UnpackProgressEvent, force bool) {
 	r.lastAt = now
 }
 
-//nolint:cyclop // Tar entry handling must branch by OCI whiteout and entry type.
+//nolint:cyclop,gocognit // Tar entry handling must branch by OCI whiteout and entry type.
 func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Reader) error {
 	name, err := cleanTarName(hdr.Name)
 	if err != nil {
@@ -315,6 +321,9 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 	}
 	if name == "" || name == "." {
 		return nil
+	}
+	if err := ensureNoSymlinkParent(root, name); err != nil {
+		return err
 	}
 
 	base := path.Base(name)
@@ -328,26 +337,32 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 		return err
 	}
 
-	if err := ensureNoSymlinkParent(root, name); err != nil {
-		return err
-	}
-
 	switch hdr.Typeflag {
 	case tar.TypeDir:
+		if info, err := os.Lstat(target); err == nil && !info.IsDir() {
+			if err := pathutil.RemoveAll(target); err != nil {
+				return err
+			}
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
 		return os.MkdirAll(target, fileMode(hdr.FileInfo().Mode(), defaultRootDirMode))
 	case tar.TypeReg, legacyTarRegularFile:
 		if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
 			return err
 		}
 
-		_ = pathutil.RemoveAll(target)
+		if err := pathutil.RemoveAll(target); err != nil {
+			return err
+		}
 		mode := fileMode(hdr.FileInfo().Mode(), storeFileMode)
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 		if err != nil {
 			return err
 		}
 
-		if _, err := io.Copy(f, contextReader{ctx: ctx, src: src}); err != nil {
+		if _, err := io.Copy(f, readerWithContext(ctx, src)); err != nil {
 			_ = f.Close()
 			return err
 		}
@@ -370,7 +385,9 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
-		_ = pathutil.RemoveAll(target)
+		if err := pathutil.RemoveAll(target); err != nil {
+			return err
+		}
 		if err := pathutil.Symlink(hdr.Linkname, target); err != nil {
 			if isUnsupportedWindowsSymlink(err) {
 				return nil
@@ -381,6 +398,10 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 
 		return nil
 	case tar.TypeLink:
+		if err := ensureNoSymlinkParent(root, hdr.Linkname); err != nil {
+			return err
+		}
+
 		linkTarget, err := secureLayerPath(root, hdr.Linkname)
 		if err != nil {
 			return err
@@ -390,7 +411,9 @@ func applyTarEntry(ctx context.Context, root string, hdr *tar.Header, src io.Rea
 			return err
 		}
 
-		_ = pathutil.RemoveAll(target)
+		if err := pathutil.RemoveAll(target); err != nil {
+			return err
+		}
 		return pathutil.Link(linkTarget, target)
 	default:
 		return nil

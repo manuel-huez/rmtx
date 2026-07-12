@@ -66,7 +66,15 @@ func (s *Server) newTTYSessionCommand(
 
 		runLogs.Flush()
 
-		return s.newOCICommand(ctx, runtimeDir, workspace, workdir, request, preparedRuntime, runLogs)
+		return s.newOCICommand(
+			ctx,
+			runtimeDir,
+			workspace,
+			workdir,
+			request,
+			preparedRuntime,
+			runLogs,
+		)
 	}
 
 	return s.newSessionCommand(ctx, workspace, workdir, request), noopCommandCleanup, nil

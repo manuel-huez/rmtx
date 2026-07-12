@@ -1,3 +1,4 @@
+//nolint:cyclop,gocognit,goconst // Update scenarios keep streamed events and lifecycle assertions together.
 package host
 
 import (
@@ -31,9 +32,11 @@ func TestPruneOldUpdateDirsRemovesStaleInstalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(removed) != 1 || removed[0] != oldDir {
 		t.Fatalf("removed=%#v want %s", removed, oldDir)
 	}
+
 	assertPathMissing(t, oldDir)
 }
 
@@ -46,6 +49,7 @@ func TestPruneOldUpdateArtifactsKeepsPendingRestartInstall(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
+
 		if err := os.WriteFile(filepath.Join(dir, "rmtx"), []byte("bin"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -64,6 +68,7 @@ func TestPruneOldUpdateArtifactsKeepsPendingRestartInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(deleted) != 1 || deleted[0].Path != oldDir {
 		t.Fatalf("deleted=%#v want only %s", deleted, oldDir)
 	}
@@ -165,8 +170,11 @@ func TestHandleHostUpdateRequestStreamsLogs(t *testing.T) {
 	defer func() { _ = clientConn.Close() }()
 
 	client := protocol.NewConn(clientConn)
+
 	var hostLogs strings.Builder
+
 	serverProtocol := protocol.NewConn(serverConn)
+
 	requestLogs := newHostLogSubscription(serverProtocol)
 	defer requestLogs.Close()
 

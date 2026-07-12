@@ -1,17 +1,29 @@
 package syncfs
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
-type BlobStore struct{ root string }
+type blobStamp struct {
+	size    int64
+	modTime int64
+}
+
+type BlobStore struct {
+	root string
+	mu   sync.Mutex
+	seen map[string]blobStamp
+}
 
 const (
 	hashPrefixLen       = 2
@@ -20,23 +32,81 @@ const (
 	materializeTempGlob = ".rmtx-tmp-*"
 )
 
-func NewBlobStore(root string) *BlobStore { return &BlobStore{root: root} }
+func NewBlobStore(root string) *BlobStore {
+	return &BlobStore{root: root, seen: make(map[string]blobStamp)}
+}
 
 func (s *BlobStore) Ensure() error {
 	return os.MkdirAll(s.root, blobDefaultDirPerm)
 }
 
-func (s *BlobStore) Path(hash string) string {
-	if len(hash) < hashPrefixLen {
-		return filepath.Join(s.root, hash)
+func (s *BlobStore) Path(hash string) (string, error) {
+	if err := validateBlobHash(hash); err != nil {
+		return "", err
 	}
 
-	return filepath.Join(s.root, hash[:hashPrefixLen], hash)
+	if len(hash) < hashPrefixLen {
+		return filepath.Join(s.root, hash), nil
+	}
+
+	return filepath.Join(s.root, hash[:hashPrefixLen], hash), nil
 }
 
-func (s *BlobStore) Has(hash string) bool {
-	_, err := os.Stat(s.Path(hash))
-	return err == nil
+func validateBlobHash(hash string) error {
+	if len(hash) != sha256.Size*2 {
+		return fmt.Errorf("invalid blob hash %q", hash)
+	}
+
+	decoded, err := hex.DecodeString(hash)
+	if err != nil || hex.EncodeToString(decoded) != hash {
+		return fmt.Errorf("invalid blob hash %q", hash)
+	}
+
+	return nil
+}
+
+func (s *BlobStore) Has(hash string, size int64) bool {
+	_, ok := s.verifiedPath(hash, size)
+	return ok
+}
+
+//nolint:cyclop // Cache hits still require stable-file and digest checks.
+func (s *BlobStore) verifiedPath(hash string, size int64) (string, bool) {
+	path, err := s.Path(hash)
+	if err != nil {
+		return "", false
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || size >= 0 && info.Size() != size {
+		return "", false
+	}
+
+	stamp := blobStamp{size: info.Size(), modTime: info.ModTime().UnixNano()}
+
+	s.mu.Lock()
+	seen, verified := s.seen[hash]
+	s.mu.Unlock()
+
+	if verified && seen == stamp {
+		return path, true
+	}
+
+	actual, err := HashFile(path)
+	if err != nil || actual != hash {
+		return "", false
+	}
+
+	after, err := os.Stat(path)
+	if err != nil || after.Size() != info.Size() || after.ModTime() != info.ModTime() {
+		return "", false
+	}
+
+	s.mu.Lock()
+	s.seen[hash] = stamp
+	s.mu.Unlock()
+
+	return path, true
 }
 
 func (s *BlobStore) MissingHashes(entries []Entry) []string {
@@ -53,7 +123,7 @@ func (s *BlobStore) MissingHashes(entries []Entry) []string {
 		}
 
 		seen[entry.Hash] = struct{}{}
-		if !s.Has(entry.Hash) {
+		if !s.Has(entry.Hash, entry.Size) {
 			out = append(out, entry.Hash)
 		}
 	}
@@ -62,51 +132,91 @@ func (s *BlobStore) MissingHashes(entries []Entry) []string {
 }
 
 func (s *BlobStore) Store(hash string, size int64, src io.Reader) error {
-	path := s.Path(hash)
+	if size < 0 {
+		return fmt.Errorf("blob %s has negative size", hash)
+	}
+
+	path, err := s.Path(hash)
+	if err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create blob dir: %w", err)
 	}
 
-	if _, err := os.Stat(path); err == nil {
+	if s.Has(hash, size) {
 		_, copyErr := io.CopyN(io.Discard, src, size)
 		return copyErr
 	}
 
-	tmp := path + ".tmp"
-
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, blobDefaultFileMode)
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create blob file: %w", err)
 	}
 
-	if _, err := io.CopyN(f, src, size); err != nil {
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }()
+
+	if err := f.Chmod(blobDefaultFileMode); err != nil {
 		_ = f.Close()
+		return fmt.Errorf("chmod blob file: %w", err)
+	}
 
-		_ = os.Remove(tmp)
-
+	digest := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(f, digest), src, size); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("store blob payload: %w", err)
 	}
 
+	if actual := hex.EncodeToString(digest.Sum(nil)); actual != hash {
+		_ = f.Close()
+		return fmt.Errorf("blob hash mismatch: got %s want %s", actual, hash)
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync blob file: %w", err)
+	}
+
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("close blob file: %w", err)
 	}
 
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := pathutil.ReplaceFile(tmp, path); err != nil {
 		return fmt.Errorf("move blob file: %w", err)
 	}
+
+	s.remember(hash, size, path)
 
 	return nil
 }
 
+//nolint:cyclop // Clone validation and portable-copy fallback share one atomic store path.
 func (s *BlobStore) StorePath(hash string, size int64, src string) error {
-	path := s.Path(hash)
+	if size < 0 {
+		return fmt.Errorf("blob %s has negative size", hash)
+	}
+
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat blob source: %w", err)
+	}
+
+	if !info.Mode().IsRegular() || info.Size() != size {
+		return fmt.Errorf("blob source size %d does not match %d", info.Size(), size)
+	}
+
+	path, err := s.Path(hash)
+	if err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create blob dir: %w", err)
 	}
 
-	if _, err := os.Stat(path); err == nil {
+	if s.Has(hash, size) {
 		return nil
 	}
 
@@ -114,43 +224,70 @@ func (s *BlobStore) StorePath(hash string, size int64, src string) error {
 	if err != nil {
 		return fmt.Errorf("create blob temp: %w", err)
 	}
+
 	tmpPath := tmp.Name()
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close blob temp: %w", err)
 	}
+
 	if err := os.Remove(tmpPath); err != nil {
 		return fmt.Errorf("remove blob temp placeholder: %w", err)
 	}
 
 	mode := fs.FileMode(blobDefaultFileMode)
-	if cloned, err := cloneFile(src, tmpPath, mode); err != nil {
+
+	cloned, err := cloneFile(src, tmpPath, mode)
+	if err != nil {
 		_ = os.Remove(tmpPath)
 		return err
-	} else if cloned {
-		return renameStoredBlob(tmpPath, path)
 	}
+
+	if cloned {
+		actual, hashErr := HashFile(tmpPath)
+		if hashErr != nil {
+			_ = os.Remove(tmpPath)
+			return hashErr
+		}
+
+		info, statErr := os.Stat(tmpPath)
+		if statErr != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("stat cloned blob: %w", statErr)
+		}
+
+		if actual != hash || info.Size() != size {
+			_ = os.Remove(tmpPath)
+
+			return fmt.Errorf(
+				"blob source changed: hash=%s size=%d want hash=%s size=%d",
+				actual,
+				info.Size(),
+				hash,
+				size,
+			)
+		}
+
+		if err := pathutil.ReplaceFile(tmpPath, path); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("move blob file: %w", err)
+		}
+
+		s.remember(hash, size, path)
+
+		return nil
+	}
+
 	_ = os.Remove(tmpPath)
 
 	in, err := os.Open(src)
 	if err != nil {
-		_ = os.Remove(tmpPath)
 		return fmt.Errorf("open blob source: %w", err)
 	}
 	defer func() { _ = in.Close() }()
 
 	if err := s.Store(hash, size, in); err != nil {
-		_ = os.Remove(tmpPath)
 		return err
-	}
-
-	return nil
-}
-
-func renameStoredBlob(tmp, path string) error {
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("move blob file: %w", err)
 	}
 
 	return nil
@@ -167,7 +304,10 @@ func (s *BlobStore) MaterializeWithProgress(
 	modTime int64,
 	onWrite func(int),
 ) error {
-	src := s.Path(hash)
+	src, ok := s.verifiedPath(hash, -1)
+	if !ok {
+		return fmt.Errorf("blob %s is missing or corrupt", hash)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), blobDefaultDirPerm); err != nil {
 		return fmt.Errorf("create destination dir: %w", err)
@@ -182,6 +322,17 @@ func (s *BlobStore) MaterializeWithProgress(
 	}
 
 	return copyBlobToFile(src, dest, mode, modTime, onWrite)
+}
+
+func (s *BlobStore) remember(hash string, size int64, path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != size {
+		return
+	}
+
+	s.mu.Lock()
+	s.seen[hash] = blobStamp{size: size, modTime: info.ModTime().UnixNano()}
+	s.mu.Unlock()
 }
 
 func cloneBlobToFile(src, dest string, mode fs.FileMode, modTime int64) (bool, error) {
@@ -224,6 +375,7 @@ func copyBlobToFile(
 	if err != nil {
 		return fmt.Errorf("create destination file: %w", err)
 	}
+
 	tmp := out.Name()
 
 	srcReader := io.Reader(in)
@@ -292,11 +444,9 @@ func reportLogicalWrite(src string, onWrite func(int)) {
 
 	remaining := info.Size()
 	maxChunk := int64(int(^uint(0) >> 1))
+
 	for remaining > 0 {
-		chunk := remaining
-		if chunk > maxChunk {
-			chunk = maxChunk
-		}
+		chunk := min(remaining, maxChunk)
 
 		onWrite(int(chunk))
 		remaining -= chunk

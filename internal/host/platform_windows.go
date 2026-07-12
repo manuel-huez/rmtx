@@ -10,8 +10,8 @@ import (
 	"path"
 	"strings"
 
+	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
-	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
 func hostIsWindows() bool {
@@ -20,7 +20,7 @@ func hostIsWindows() bool {
 
 func (s *Server) platformRuntimeStateDir(
 	ctx context.Context,
-	runtime protocol.RuntimeSpec,
+	runtime config.RuntimeConfig,
 	runLogs *hostLogSubscription,
 ) (string, error) {
 	if !isOCIRuntime(runtime) {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
@@ -33,15 +34,18 @@ const (
 	exitCodeNotFound         = 127
 	defaultFileMode          = 0o644
 	noneValue                = "none"
+	outputStreamStderr       = "stderr"
+	syncProgressHash         = "hash"
 	reverseDialTimeout       = 5 * time.Second
 	progressEvery            = 3 * time.Second
+	defaultTransferParallel  = 8
 	maxBlobTransferParallel  = 16
-	materializeParallel      = 4
 	hostUpdateTimeout        = 5 * time.Minute
 	startupCleanupTimeout    = 15 * time.Second
 	restartPollEvery         = 100 * time.Millisecond
 	tcpKeepAliveEvery        = 15 * time.Second
 	workspaceLeasePruneEvery = time.Minute
+	maxLiveConnections       = 32
 )
 
 var (
@@ -108,6 +112,9 @@ type Server struct {
 	activeMu        sync.Mutex
 	activeContexts  map[string]int
 	activeLeases    map[string]int
+	connections     chan struct{}
+	pairLimitsMu    sync.Mutex
+	pairLimits      map[string]pairLimitWindow
 	deletingLeases  map[string]bool
 	blobTransfersMu sync.Mutex
 	blobTransfers   map[string]*blobTransferSession
@@ -118,7 +125,7 @@ type Server struct {
 	updateRunner updateRunner
 }
 
-func New(opts Options) (*Server, error) {
+func New(ctx context.Context, opts Options) (*Server, error) {
 	opts = withDefaultOptions(opts)
 
 	if err := os.MkdirAll(opts.StateDir, defaultDirMode); err != nil {
@@ -164,11 +171,13 @@ func New(opts Options) (*Server, error) {
 		contextLocks:   map[string]*sync.Mutex{},
 		activeContexts: map[string]int{},
 		activeLeases:   map[string]int{},
+		connections:    make(chan struct{}, maxLiveConnections),
+		pairLimits:     map[string]pairLimitWindow{},
 		deletingLeases: map[string]bool{},
 		blobTransfers:  map[string]*blobTransferSession{},
 		updateRunner:   defaultUpdateRunner,
 	}
-	server.cleanupStartupCaches(context.Background())
+	server.cleanupStartupCaches(ctx)
 
 	return server, nil
 }
@@ -258,19 +267,21 @@ func defaultStateDir() string {
 
 func (s *Server) runtimeStorage(
 	ctx context.Context,
-	runtime protocol.RuntimeSpec,
+	runtime config.RuntimeConfig,
 	runLogs *hostLogSubscription,
 ) (runtimeStorage, error) {
 	runtimeRoot, err := s.platformRuntimeStateDir(ctx, runtime, runLogs)
 	if err != nil {
 		return runtimeStorage{}, err
 	}
+
 	dataRoot := filepath.Clean(s.opts.StateDir)
 	runtimeRoot = filepath.Clean(runtimeRoot)
 
 	if err := os.MkdirAll(filepath.Join(dataRoot, contextDirName), defaultDirMode); err != nil {
 		return runtimeStorage{}, fmt.Errorf("create context data dir: %w", err)
 	}
+
 	if err := os.MkdirAll(filepath.Join(runtimeRoot, contextDirName), defaultDirMode); err != nil {
 		return runtimeStorage{}, fmt.Errorf("create context runtime dir: %w", err)
 	}
@@ -288,7 +299,7 @@ func (s *Server) runtimeStorage(
 }
 
 func (s *Server) defaultRuntimeStorage() (runtimeStorage, error) {
-	return s.runtimeStorage(context.Background(), protocol.RuntimeSpec{}, nil)
+	return s.runtimeStorage(context.Background(), config.RuntimeConfig{}, nil)
 }
 
 func (s *Server) stateRootsOrDefault() []string {
@@ -314,7 +325,9 @@ func (s *Server) contextStateRoots() (contextStateRoots, error) {
 	return s.stateRootsForContexts(contexts)
 }
 
-func (s *Server) stateRootsForContexts(contexts []protocol.ContextSummary) (contextStateRoots, error) {
+func (s *Server) stateRootsForContexts(
+	contexts []protocol.ContextSummary,
+) (contextStateRoots, error) {
 	roots := contextStateRoots{
 		data:    []string{filepath.Clean(s.opts.StateDir)},
 		runtime: []string{filepath.Clean(s.opts.StateDir)},
@@ -345,6 +358,7 @@ func (s *Server) contextRuntimeDirs() ([]string, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return roots, nil
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("list context metadata: %w", err)
 	}
@@ -490,6 +504,7 @@ func (s *Server) hostName() string {
 
 func (s *Server) Serve(ctx context.Context) error {
 	listenConfig := net.ListenConfig{KeepAlive: tcpKeepAliveEvery}
+
 	base, err := listenConfig.Listen(ctx, "tcp", s.opts.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.opts.ListenAddr, err)
@@ -563,7 +578,14 @@ func (s *Server) Serve(ctx context.Context) error {
 			return fmt.Errorf("accept connection: %w", err)
 		}
 
-		go s.handleConn(ctx, conn)
+		if !s.startConnection(ctx, conn) {
+			s.logger.Printf(
+				"connection rejected: limit=%d remote=%s",
+				maxLiveConnections,
+				conn.RemoteAddr(),
+			)
+			_ = conn.Close()
+		}
 	}
 }
 
@@ -604,7 +626,31 @@ func (s *Server) handleReverseConnect(parent context.Context, address string) {
 		return
 	}
 
-	s.handleConn(parent, tls.Server(raw, s.tlsConfig))
+	conn := tls.Server(raw, s.tlsConfig)
+	if !s.startConnection(parent, conn) {
+		s.logger.Printf(
+			"reverse connection rejected: limit=%d remote=%s",
+			maxLiveConnections,
+			address,
+		)
+
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) startConnection(parent context.Context, conn net.Conn) bool {
+	select {
+	case s.connections <- struct{}{}:
+		go func() {
+			defer func() { <-s.connections }()
+
+			s.handleConn(parent, conn)
+		}()
+
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleConn(parent context.Context, raw net.Conn) {
@@ -629,21 +675,7 @@ func transferParallelism(totalChunks int) int {
 		return 1
 	}
 
-	parallel := runtime.NumCPU()
-	if parallel > 8 {
-		parallel = 8
-	}
-	if parallel > maxBlobTransferParallel {
-		parallel = maxBlobTransferParallel
-	}
-	if parallel > totalChunks {
-		parallel = totalChunks
-	}
-	if parallel < 1 {
-		return 1
-	}
-
-	return parallel
+	return min(runtime.NumCPU(), defaultTransferParallel, maxBlobTransferParallel, totalChunks)
 }
 
 func (s *Server) handleConnSession(
@@ -756,7 +788,12 @@ func (s *Server) handleRunRequest(
 		return err
 	}
 
-	handle, err := s.ensureContext(request.ContextID, request.ContextName, request.RootHint, storage)
+	handle, err := s.ensureContext(
+		request.ContextID,
+		request.ContextName,
+		request.RootHint,
+		storage,
+	)
 	if err != nil {
 		return err
 	}
@@ -1453,6 +1490,7 @@ func (s *Server) sendWorkspaceChanges(
 	if transfer != nil {
 		defer s.unregisterBlobTransferSession(transfer.token)
 	}
+
 	if err != nil {
 		return err
 	}
@@ -1531,7 +1569,7 @@ func (s *Server) logBuildProgress(
 				progress.Dirs,
 				progress.Skipped,
 			)
-		case "hash":
+		case syncProgressHash:
 			if progress.Done {
 				s.logRun(
 					runLogs,
@@ -1570,13 +1608,23 @@ func (s *Server) sendChangedFileBlobs(
 	changed []syncfs.Entry,
 	need protocol.NeedBlobs,
 ) (*blobTransferSession, error) {
-	items, descriptors, err := prepareDownloadBlobItems(workspace, blobSources, changed, need.Hashes)
+	items, descriptors, err := prepareDownloadBlobItems(
+		workspace,
+		blobSources,
+		changed,
+		need.Hashes,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	chunkSize := protocol.DefaultBlobChunkSize
-	chunks := protocol.PlanBlobChunks(descriptors, chunkSize)
+	chunkSize := syncfs.DefaultBlobChunkSize
+
+	chunks, err := syncfs.PlanBlobChunks(descriptors, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+
 	parallel := transferParallelism(len(chunks))
 
 	s.logger.Printf(
@@ -1632,19 +1680,22 @@ func prepareDownloadBlobItems(
 	blobSources map[string]string,
 	changed []syncfs.Entry,
 	hashes []string,
-) (map[string]downloadBlobItem, []protocol.BlobDescriptor, error) {
+) (map[string]downloadBlobItem, []syncfs.BlobDescriptor, error) {
 	entriesByHash := map[string]syncfs.Entry{}
+
 	for _, entry := range changed {
 		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
 			continue
 		}
+
 		if _, ok := entriesByHash[entry.Hash]; !ok {
 			entriesByHash[entry.Hash] = entry
 		}
 	}
 
 	items := make(map[string]downloadBlobItem, len(hashes))
-	descriptors := make([]protocol.BlobDescriptor, 0, len(hashes))
+
+	descriptors := make([]syncfs.BlobDescriptor, 0, len(hashes))
 	for _, hash := range hashes {
 		entry, ok := entriesByHash[hash]
 		if !ok {
@@ -1657,7 +1708,7 @@ func prepareDownloadBlobItems(
 		}
 
 		items[hash] = downloadBlobItem{hash: hash, path: source, size: entry.Size}
-		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: hash, Size: entry.Size})
+		descriptors = append(descriptors, syncfs.BlobDescriptor{Hash: hash, Size: entry.Size})
 	}
 
 	return items, descriptors, nil
@@ -1670,10 +1721,12 @@ func (s *Server) storeChangedFileBlobs(
 	changed []syncfs.Entry,
 ) error {
 	stored := map[string]struct{}{}
+
 	for _, entry := range changed {
 		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
 			continue
 		}
+
 		if _, ok := stored[entry.Hash]; ok {
 			continue
 		}
@@ -1682,9 +1735,11 @@ func (s *Server) storeChangedFileBlobs(
 		if source == "" {
 			source = filepath.Join(workspace, filepath.FromSlash(entry.Path))
 		}
+
 		if err := store.StorePath(entry.Hash, entry.Size, source); err != nil {
 			return fmt.Errorf("store changed blob %s: %w", entry.Path, err)
 		}
+
 		stored[entry.Hash] = struct{}{}
 	}
 
@@ -1707,6 +1762,7 @@ func readClientNeedBlobs(conn *protocol.Conn) (protocol.NeedBlobs, error) {
 			if err := conn.DiscardPayload(head); err != nil {
 				return protocol.NeedBlobs{}, err
 			}
+
 			return protocol.NeedBlobs{}, context.Canceled
 		case protocol.MsgNeedBlobs:
 			return protocol.DecodeData[protocol.NeedBlobs](head)
@@ -1714,7 +1770,12 @@ func readClientNeedBlobs(conn *protocol.Conn) (protocol.NeedBlobs, error) {
 			if err := conn.DiscardPayload(head); err != nil {
 				return protocol.NeedBlobs{}, err
 			}
-			return protocol.NeedBlobs{}, fmt.Errorf("expected %s, got %s", protocol.MsgNeedBlobs, head.Type)
+
+			return protocol.NeedBlobs{}, fmt.Errorf(
+				"expected %s, got %s",
+				protocol.MsgNeedBlobs,
+				head.Type,
+			)
 		}
 	}
 }
@@ -1735,6 +1796,7 @@ func readClientSyncComplete(conn *protocol.Conn) error {
 			if err := conn.DiscardPayload(head); err != nil {
 				return err
 			}
+
 			return context.Canceled
 		case protocol.MsgSyncComplete:
 			return nil
@@ -1742,6 +1804,7 @@ func readClientSyncComplete(conn *protocol.Conn) error {
 			if err := conn.DiscardPayload(head); err != nil {
 				return err
 			}
+
 			return fmt.Errorf("expected %s, got %s", protocol.MsgSyncComplete, head.Type)
 		}
 	}
@@ -1766,25 +1829,30 @@ func (s *Server) waitForClientSyncCompleteAndBlobTransfer(
 		select {
 		case err := <-syncDone:
 			syncDone = nil
+
 			if err != nil {
 				_ = transfer.fail(err)
 				return err
 			}
 		case err := <-transferDone:
 			transferDone = nil
+
 			if err != nil {
 				if conn != nil && conn.Raw() != nil {
 					_ = conn.Raw().SetReadDeadline(time.Now())
 				}
+
 				if syncDone != nil {
 					<-syncDone
 				}
+
 				return err
 			}
 		}
 	}
 
 	s.logger.Printf("sending changed file blobs done")
+
 	return nil
 }
 
@@ -1824,6 +1892,10 @@ func (s *Server) handlePairCodeRequest(
 	req protocol.PairCodeRequest,
 	requestLogs *hostLogSubscription,
 ) error {
+	if !s.allowPairRequest(conn, "code", maxPairCodeRequests) {
+		return errors.New("pairing request rate limit exceeded")
+	}
+
 	info, err := createPairCodeInfo(s.opts.StateDir, s.hostName(), 0)
 	if err != nil {
 		return err
@@ -1863,37 +1935,44 @@ func (s *Server) handlePairRequest(
 	req protocol.PairRequest,
 	requestLogs *hostLogSubscription,
 ) error {
-	return withPairCode(s.opts.StateDir, req.Code, func() error {
-		if strings.TrimSpace(req.CSRPEM) == "" {
-			return errors.New("csr is required")
-		}
+	if !s.allowPairRequest(conn, "pair", maxPairAttempts) {
+		return errors.New("pairing attempt rate limit exceeded")
+	}
 
-		clientCertPEM, fingerprint, err := security.SignClientCSR(
-			s.hostPKI.CACertPEM,
-			s.hostPKI.CAKeyPEM,
-			[]byte(req.CSRPEM),
-			req.ClientLabel,
-		)
-		if err != nil {
-			return err
-		}
+	if strings.TrimSpace(req.CSRPEM) == "" {
+		return errors.New("csr is required")
+	}
 
-		if err := s.trustClient(fingerprint, req.PreviousFingerprint, req.ClientLabel); err != nil {
-			return err
-		}
+	clientCertPEM, fingerprint, err := security.SignClientCSR(
+		s.hostPKI.CACertPEM,
+		s.hostPKI.CAKeyPEM,
+		[]byte(req.CSRPEM),
+		req.ClientLabel,
+	)
+	if err != nil {
+		return err
+	}
 
-		return writeJSONAfterLogs(
-			conn,
-			requestLogs,
-			protocol.MsgPairResponse,
-			protocol.PairResponse{
-				ClientCertPEM: string(clientCertPEM),
-				Fingerprint:   fingerprint,
-			},
-		)
-	})
+	if err := ConsumePairCode(s.opts.StateDir, req.Code); err != nil {
+		return err
+	}
+
+	if err := s.trustClient(fingerprint, req.PreviousFingerprint, req.ClientLabel); err != nil {
+		return err
+	}
+
+	return writeJSONAfterLogs(
+		conn,
+		requestLogs,
+		protocol.MsgPairResponse,
+		protocol.PairResponse{
+			ClientCertPEM: string(clientCertPEM),
+			Fingerprint:   fingerprint,
+		},
+	)
 }
 
+//nolint:cyclop,gocognit // Transfer protocol states and cleanup errors remain explicit.
 func (s *Server) waitForClientBlobTransfer(
 	ctx context.Context,
 	conn *protocol.Conn,
@@ -1915,6 +1994,7 @@ func (s *Server) waitForClientBlobTransfer(
 			if transfer != nil {
 				_ = transfer.fail(err)
 			}
+
 			return fmt.Errorf("read sync frame: %w", err)
 		}
 
@@ -1924,6 +2004,7 @@ func (s *Server) waitForClientBlobTransfer(
 				if transfer != nil {
 					_ = transfer.fail(err)
 				}
+
 				return err
 			}
 		case protocol.MsgSyncComplete:
@@ -1946,6 +2027,7 @@ func (s *Server) waitForClientBlobTransfer(
 				if transfer != nil {
 					_ = transfer.fail(err)
 				}
+
 				return err
 			}
 
@@ -1953,23 +2035,10 @@ func (s *Server) waitForClientBlobTransfer(
 			if transfer != nil {
 				_ = transfer.fail(err)
 			}
+
 			return err
 		}
 	}
-}
-
-type logReader struct {
-	src    io.Reader
-	onRead func(int)
-}
-
-func (r *logReader) Read(p []byte) (int, error) {
-	n, err := r.src.Read(p)
-	if n > 0 && r.onRead != nil {
-		r.onRead(n)
-	}
-
-	return n, err
 }
 
 func (s *Server) runCommand(
@@ -1982,6 +2051,7 @@ func (s *Server) runCommand(
 	runLogs *hostLogSubscription,
 ) (int, error) {
 	workspace := handle.workspace
+
 	workdir, err := secureJoin(workspace, request.WorkDir)
 	if err != nil {
 		return 1, err
@@ -2074,17 +2144,20 @@ func (s *Server) runPipeExecCommandWithInput(
 	input *pipeInputForwarding,
 	cancelRunHandle *runCancelHandle,
 ) (int, error) {
-	cancelRun := context.CancelFunc(cancel)
+	cancelRun := cancel
 	defer func() {
 		cancelRun()
 	}()
 
 	inputStopped := false
+
 	stopInput := func() {
 		if inputStopped {
 			return
 		}
+
 		inputStopped = true
+
 		if err := stopPipeInputReader(conn, input); err != nil && !errors.Is(err, io.EOF) {
 			s.logger.Printf("stdin forwarding ended: %v", err)
 		}
@@ -2095,6 +2168,7 @@ func (s *Server) runPipeExecCommandWithInput(
 	if err != nil {
 		return 1, err
 	}
+
 	cmd.Stdin = input.Reader()
 
 	if err := cmd.Start(); err != nil {
@@ -2102,10 +2176,12 @@ func (s *Server) runPipeExecCommandWithInput(
 	}
 
 	cancelCommand := s.commandCancel(cmd, cancel)
+
 	cancelRun = cancelCommand
 	if cancelRunHandle != nil {
 		cancelRunHandle.Set(cancelCommand)
 	}
+
 	if ctx.Err() != nil {
 		cancelCommand()
 	}
@@ -2129,7 +2205,7 @@ func (s *Server) runPipeExecCommandWithInput(
 	go func() {
 		defer outWG.Done()
 
-		if err := streamPipe(conn, stderr, "stderr"); err != nil {
+		if err := streamPipe(conn, stderr, outputStreamStderr); err != nil {
 			cancelRun()
 		}
 	}()
@@ -2231,7 +2307,7 @@ func writeUserVisibleRunError(conn *protocol.Conn, err error) error {
 
 	return conn.WriteBytes(
 		protocol.MsgExecOutput,
-		protocol.OutputInfo{Stream: "stderr"},
+		protocol.OutputInfo{Stream: outputStreamStderr},
 		[]byte(message),
 	)
 }
@@ -2307,9 +2383,9 @@ func secureJoin(root, rel string) (string, error) {
 		rel = "."
 	}
 
-	joined, err := pathutil.SecureJoin(root, filepath.FromSlash(rel))
+	joined, err := pathutil.SecureJoinExisting(root, filepath.FromSlash(rel))
 	if err != nil {
-		return "", fmt.Errorf("workdir %s escapes workspace", rel)
+		return "", fmt.Errorf("resolve workspace path %s: %w", rel, err)
 	}
 
 	return joined, nil

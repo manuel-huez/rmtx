@@ -44,9 +44,11 @@ func closeBlobTransferConn(conn *blobTransferConn) {
 	if conn == nil {
 		return
 	}
+
 	if conn.stop != nil {
 		conn.stop()
 	}
+
 	if conn.conn != nil {
 		closeQuietly(conn.conn.Raw())
 	}
@@ -84,11 +86,13 @@ func retryBlobTransferChunk(
 		lastErr = err
 		// Retry always starts with a fresh connection because frame boundaries are lost after partial I/O.
 		closeBlobTransferConn(nextConn)
+
 		conn = nil
 
 		if !isRetryableBlobTransferError(ctx, err) || attempt == blobTransferMaxAttempts {
 			break
 		}
+
 		if logger != nil {
 			logger.Printf(
 				"retrying blob %s chunk: hash=%s offset=%d attempt=%d/%d error=%v",
@@ -100,6 +104,7 @@ func retryBlobTransferChunk(
 				err,
 			)
 		}
+
 		if err := waitBlobTransferRetry(ctx, attempt); err != nil {
 			return nil, err
 		}
@@ -135,6 +140,6 @@ type blobChunkKey struct {
 	offset int64
 }
 
-func keyBlobChunk(chunk protocol.BlobChunkInfo) blobChunkKey {
+func keyBlobChunk(chunk syncfs.BlobChunkInfo) blobChunkKey {
 	return blobChunkKey{hash: chunk.Hash, offset: chunk.Offset}
 }

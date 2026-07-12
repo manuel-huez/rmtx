@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package host
 
 import (
@@ -26,17 +27,12 @@ func TestConsumePairCodeAllowsSingleWinner(t *testing.T) {
 	start := make(chan struct{})
 
 	var wg sync.WaitGroup
-
 	for range 2 {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			<-start
 
 			results <- ConsumePairCode(stateDir, record.Code)
-		}()
+		})
 	}
 
 	close(start)
@@ -147,10 +143,10 @@ func TestHandlePairRequestKeepsCodeOnValidationFailure(t *testing.T) {
 	}
 }
 
-func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
+func TestHandlePairRequestConsumesCodeBeforeResponseWrite(t *testing.T) {
 	stateDir := t.TempDir()
 
-	server, err := New(Options{StateDir: stateDir})
+	server, err := New(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +156,7 @@ func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, csrPEM, err := security.GenerateClientIdentity("retry-client")
+	_, csrPEM, err := security.GenerateClientKeyAndCSR("retry-client")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +175,8 @@ func TestHandlePairRequestKeepsCodeOnResponseWriteFailure(t *testing.T) {
 		t.Fatal("expected pair response write to fail")
 	}
 
-	if err := ConsumePairCode(stateDir, record.Code); err != nil {
-		t.Fatalf("expected code to remain usable after response failure: %v", err)
+	if err := ConsumePairCode(stateDir, record.Code); err == nil {
+		t.Fatal("pairing code remained usable after trust was persisted")
 	}
 }
 

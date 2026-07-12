@@ -91,17 +91,21 @@ func TestPruneClientBlobCacheRejectsInvalidManifestBeforeDeleting(t *testing.T) 
 
 func TestPruneClientBlobCacheRemovesOldInvalidManifest(t *testing.T) {
 	dir := t.TempDir()
+
 	manifestPath := filepath.Join(dir, "manifests", "broken.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(manifestPath, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	old := time.Now().Add(-2 * staleManifestAge)
 	if err := os.Chtimes(manifestPath, old, old); err != nil {
 		t.Fatal(err)
 	}
+
 	orphanHash := strings.Repeat("e", sha256HexLength)
 	orphanPath := writeCachedBlob(t, dir, orphanHash, "orphan", old)
 
@@ -109,6 +113,7 @@ func TestPruneClientBlobCacheRemovesOldInvalidManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(deleted) != 2 {
 		t.Fatalf("deleted=%#v", deleted)
 	}
@@ -165,10 +170,12 @@ func TestPruneClientBlobCacheWithoutCacheDirs(t *testing.T) {
 
 func TestPruneClientBlobCacheRejectsInvalidHashWithoutEscapingRoot(t *testing.T) {
 	dir := t.TempDir()
+
 	outside := filepath.Join(dir, "outside")
 	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	writeCachedManifest(t, dir, "invalid.json", []syncfs.Entry{{
 		Kind: syncfs.KindFile,
 		Hash: "../../outside",
@@ -177,6 +184,7 @@ func TestPruneClientBlobCacheRejectsInvalidHashWithoutEscapingRoot(t *testing.T)
 	if _, _, err := pruneClientBlobCacheInDir(dir, time.Now()); err == nil {
 		t.Fatal("expected invalid hash error")
 	}
+
 	if content, err := os.ReadFile(outside); err != nil || string(content) != "keep" {
 		t.Fatalf("outside file changed: content=%q err=%v", content, err)
 	}

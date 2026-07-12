@@ -9,9 +9,6 @@ import (
 )
 
 func cloneFile(src, dest string, _ fs.FileMode) (bool, error) {
-	if err := unix.Clonefile(src, dest, 0); err != nil {
-		return false, nil
-	}
-
-	return true, nil
+	// Clone is an optimization. Caller performs the portable copy fallback.
+	return unix.Clonefile(src, dest, 0) == nil, nil
 }

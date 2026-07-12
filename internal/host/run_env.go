@@ -9,10 +9,7 @@ import (
 )
 
 func rmtxRunEnv(ctx context.Context, workspace string, contextID string) []string {
-	cpuCount := runtime.NumCPU()
-	if cpuCount < 1 {
-		cpuCount = 1
-	}
+	cpuCount := max(runtime.NumCPU(), 1)
 
 	availableMemory := uint64(0)
 	if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil {

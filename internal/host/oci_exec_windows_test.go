@@ -113,6 +113,9 @@ func TestWSLChildScriptBindsHostNetworkFilesForHostNetwork(t *testing.T) {
 			t.Fatalf("script does not bind %s:\n%s", file, script)
 		}
 	}
+	if !strings.Contains(script, "safe_mount_target \"$target\"") {
+		t.Fatalf("script does not reject symlink mount parents:\n%s", script)
+	}
 }
 
 func TestWSLChildScriptStagesRootFSWhenConfigured(t *testing.T) {

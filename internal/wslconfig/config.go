@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 const (
@@ -20,6 +22,8 @@ const (
 	FullProfileFraction = 1
 	MinResourceLimit    = 1
 	OneGiB              = 1024 * 1024 * 1024
+	keyMemory           = "memory"
+	keyProcessors       = "processors"
 )
 
 var ErrUnsupported = errors.New("WSL configuration is only supported on Windows")
@@ -72,7 +76,7 @@ func Read(path string) (File, error) {
 }
 
 func Write(path string, content string) error {
-	return os.WriteFile(path, []byte(content), DefaultFileMode)
+	return pathutil.WriteFileAtomically(path, []byte(content), DefaultFileMode)
 }
 
 func Shutdown(ctx context.Context) error {
@@ -81,6 +85,7 @@ func Shutdown(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, "wsl.exe", "--shutdown")
+
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(out))
@@ -131,8 +136,8 @@ func ProfileSettings(specs SystemSpecs, fraction float64) (map[string]string, er
 	memoryGiB = max(memoryGiB, MinResourceLimit)
 
 	return map[string]string{
-		"processors": strconv.Itoa(processors),
-		"memory":     fmt.Sprintf("%dGB", memoryGiB),
+		keyProcessors: strconv.Itoa(processors),
+		keyMemory:     fmt.Sprintf("%dGB", memoryGiB),
 	}, nil
 }
 
@@ -144,6 +149,7 @@ func Apply(content string, section string, updates map[string]string) string {
 	}
 
 	lines := splitLines(content)
+
 	start, end := sectionRange(lines, section)
 	if start == -1 {
 		return appendSection(lines, section, updates, newline)
@@ -155,6 +161,7 @@ func Apply(content string, section string, updates map[string]string) string {
 	}
 
 	seen := make(map[string]bool, len(managed))
+
 	for i := start + 1; i < end; i++ {
 		key, ok := settingKey(lines[i])
 		if !ok {
@@ -162,6 +169,7 @@ func Apply(content string, section string, updates map[string]string) string {
 		}
 
 		lower := strings.ToLower(key)
+
 		value, exists := managed[lower]
 		if !exists {
 			continue
@@ -190,6 +198,7 @@ func ParseSection(content string, section string) map[string]string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	lines := splitLines(content)
 	start, end := sectionRange(lines, section)
+
 	settings := map[string]string{}
 	if start == -1 {
 		return settings
@@ -221,7 +230,12 @@ func splitLines(content string) []string {
 	return lines
 }
 
-func appendSection(lines []string, section string, updates map[string]string, newline string) string {
+func appendSection(
+	lines []string,
+	section string,
+	updates map[string]string,
+	newline string,
+) string {
 	if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
 		lines = append(lines, "")
 	}

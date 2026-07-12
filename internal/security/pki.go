@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 const (
@@ -27,6 +30,9 @@ const (
 	shortFingerprintTail  = 12
 	rsaKeyBits            = 3072
 	certificateSerialBits = 128
+	pemCertificate        = "CERTIFICATE"
+	pemRSAPrivateKey      = "RSA PRIVATE KEY"
+	hostPKIFileCount      = 4
 )
 
 type HostPKI struct {
@@ -41,6 +47,7 @@ type hostPKIPaths struct {
 	CAKey      string
 	ServerCert string
 	ServerKey  string
+	Pending    string
 }
 
 func FingerprintDER(der []byte) string {
@@ -88,6 +95,9 @@ func EnsureHostPKI(stateDir, serverName string) (HostPKI, error) {
 	}
 
 	paths := resolveHostPKIPaths(stateDir)
+	if err := recoverPendingHostPKI(paths); err != nil {
+		return HostPKI{}, err
+	}
 
 	current, err := loadOrCreateHostPKI(paths, serverName)
 	if err != nil {
@@ -100,6 +110,17 @@ func EnsureHostPKI(stateDir, serverName string) (HostPKI, error) {
 func loadOrCreateHostPKI(paths hostPKIPaths, serverName string) (HostPKI, error) {
 	current, err := readHostPKI(paths)
 	if errors.Is(err, os.ErrNotExist) {
+		missing, statErr := missingHostPKIFiles(paths)
+		if statErr != nil {
+			return HostPKI{}, statErr
+		}
+
+		if missing != hostPKIFileCount {
+			return HostPKI{}, errors.New(
+				"host pki is incomplete; restore missing files or remove the pki directory",
+			)
+		}
+
 		pki, err := generateHostPKI(serverName)
 		if err != nil {
 			return HostPKI{}, err
@@ -145,7 +166,7 @@ func rotateHostPKI(paths hostPKIPaths, current HostPKI, serverName string) (Host
 	current.ServerCertPEM = serverCertPEM
 
 	current.ServerKeyPEM = serverKeyPEM
-	if err := writeServerPKI(paths, serverCertPEM, serverKeyPEM); err != nil {
+	if err := writeHostPKI(paths, current); err != nil {
 		return HostPKI{}, err
 	}
 
@@ -171,7 +192,22 @@ func resolveHostPKIPaths(stateDir string) hostPKIPaths {
 		CAKey:      filepath.Join(stateDir, "pki", "ca-key.pem"),
 		ServerCert: filepath.Join(stateDir, "pki", "server-cert.pem"),
 		ServerKey:  filepath.Join(stateDir, "pki", "server-key.pem"),
+		Pending:    filepath.Join(stateDir, "pki", ".host-pki.pending.json"),
 	}
+}
+
+func missingHostPKIFiles(paths hostPKIPaths) (int, error) {
+	missing := 0
+
+	for _, path := range []string{paths.CACert, paths.CAKey, paths.ServerCert, paths.ServerKey} {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			missing++
+		} else if err != nil {
+			return 0, fmt.Errorf("stat %s: %w", filepath.Base(path), err)
+		}
+	}
+
+	return missing, nil
 }
 
 func readHostPKI(paths hostPKIPaths) (HostPKI, error) {
@@ -198,6 +234,58 @@ func readHostPKI(paths hostPKIPaths) (HostPKI, error) {
 }
 
 func writeHostPKI(paths hostPKIPaths, pki HostPKI) error {
+	content, err := json.Marshal(pki)
+	if err != nil {
+		return fmt.Errorf("marshal host pki transaction: %w", err)
+	}
+
+	if err := pathutil.WriteFileAtomically(paths.Pending, content, privateMode); err != nil {
+		return fmt.Errorf("write host pki transaction: %w", err)
+	}
+
+	if err := commitHostPKI(paths, pki); err != nil {
+		return err
+	}
+
+	if err := os.Remove(paths.Pending); err != nil {
+		return fmt.Errorf("remove host pki transaction: %w", err)
+	}
+
+	return nil
+}
+
+func recoverPendingHostPKI(paths hostPKIPaths) error {
+	content, err := os.ReadFile(paths.Pending)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("read host pki transaction: %w", err)
+	}
+
+	var pki HostPKI
+	if err := json.Unmarshal(content, &pki); err != nil {
+		return fmt.Errorf("parse host pki transaction: %w", err)
+	}
+
+	if len(pki.CACertPEM) == 0 || len(pki.CAKeyPEM) == 0 ||
+		len(pki.ServerCertPEM) == 0 || len(pki.ServerKeyPEM) == 0 {
+		return errors.New("host pki transaction is incomplete")
+	}
+
+	if err := commitHostPKI(paths, pki); err != nil {
+		return err
+	}
+
+	if err := os.Remove(paths.Pending); err != nil {
+		return fmt.Errorf("remove recovered host pki transaction: %w", err)
+	}
+
+	return nil
+}
+
+func commitHostPKI(paths hostPKIPaths, pki HostPKI) error {
 	for _, item := range []struct {
 		path string
 		data []byte
@@ -207,43 +295,9 @@ func writeHostPKI(paths hostPKIPaths, pki HostPKI) error {
 		{paths.ServerCert, pki.ServerCertPEM},
 		{paths.ServerKey, pki.ServerKeyPEM},
 	} {
-		if err := writePrivateFileAtomically(item.path, item.data); err != nil {
+		if err := pathutil.WriteFileAtomically(item.path, item.data, privateMode); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(item.path), err)
 		}
-	}
-
-	return nil
-}
-
-func writeServerPKI(paths hostPKIPaths, serverCertPEM, serverKeyPEM []byte) error {
-	for _, item := range []struct {
-		path string
-		data []byte
-	}{
-		{paths.ServerCert, serverCertPEM},
-		{paths.ServerKey, serverKeyPEM},
-	} {
-		if err := writePrivateFileAtomically(item.path, item.data); err != nil {
-			return fmt.Errorf("write %s: %w", filepath.Base(item.path), err)
-		}
-	}
-
-	return nil
-}
-
-func writePrivateFileAtomically(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
-		return err
-	}
-
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, privateMode); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
 	}
 
 	return nil
@@ -501,10 +555,10 @@ func peerPools(
 	return roots, intermediates, matchedIdentity
 }
 
-func GenerateClientIdentity(label string) (certPEM, keyPEM, csrPEM []byte, err error) {
+func GenerateClientKeyAndCSR(label string) (keyPEM, csrPEM []byte, err error) {
 	key, err := rsa.GenerateKey(rand.Reader, rsaKeyBits)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("generate client key: %w", err)
+		return nil, nil, fmt.Errorf("generate client key: %w", err)
 	}
 
 	subject := pkix.Name{CommonName: defaultCommonName(label, "rmtx-client")}
@@ -514,15 +568,15 @@ func GenerateClientIdentity(label string) (certPEM, keyPEM, csrPEM []byte, err e
 		SignatureAlgorithm: x509.SHA256WithRSA,
 	}, key)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create csr: %w", err)
+		return nil, nil, fmt.Errorf("create csr: %w", err)
 	}
 
 	keyPEM = pem.EncodeToMemory(
-		&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)},
+		&pem.Block{Type: pemRSAPrivateKey, Bytes: x509.MarshalPKCS1PrivateKey(key)},
 	)
 	csrPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
 
-	return nil, keyPEM, csrPEM, nil
+	return keyPEM, csrPEM, nil
 }
 
 func GenerateCSRFromKey(keyPEM []byte, label string) ([]byte, error) {
@@ -591,7 +645,7 @@ func SignClientCSR(caCertPEM, caKeyPEM, csrPEM []byte, label string) ([]byte, st
 		return nil, "", fmt.Errorf("sign client certificate: %w", err)
 	}
 
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: pemCertificate, Bytes: der})
 
 	return certPEM, FingerprintDER(der), nil
 }
@@ -662,9 +716,9 @@ func generateHostPKI(serverName string) (HostPKI, error) {
 	}
 
 	return HostPKI{
-		CACertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		CACertPEM: pem.EncodeToMemory(&pem.Block{Type: pemCertificate, Bytes: caDER}),
 		CAKeyPEM: pem.EncodeToMemory(
-			&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(caKey)},
+			&pem.Block{Type: pemRSAPrivateKey, Bytes: x509.MarshalPKCS1PrivateKey(caKey)},
 		),
 		ServerCertPEM: serverCertPEM,
 		ServerKeyPEM:  serverKeyPEM,
@@ -726,9 +780,9 @@ func generateServerCertificate(
 		return nil, nil, fmt.Errorf("create server cert: %w", err)
 	}
 
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverDER}),
+	return pem.EncodeToMemory(&pem.Block{Type: pemCertificate, Bytes: serverDER}),
 		pem.EncodeToMemory(
-			&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)},
+			&pem.Block{Type: pemRSAPrivateKey, Bytes: x509.MarshalPKCS1PrivateKey(serverKey)},
 		),
 		nil
 }

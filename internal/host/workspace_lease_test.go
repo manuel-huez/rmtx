@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated lease fixture values keep cases self-contained.
 package host
 
 import (

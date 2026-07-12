@@ -49,12 +49,15 @@ func TestParseWSLUNCPath(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if ok != tt.wantOK {
 				t.Fatalf("ok=%t want %t", ok, tt.wantOK)
 			}
+
 			if !ok {
 				return
 			}
+
 			if got.Distro != tt.wantDistro || got.LinuxPath != tt.wantPath {
 				t.Fatalf("parsed=%#v want distro=%s path=%s", got, tt.wantDistro, tt.wantPath)
 			}

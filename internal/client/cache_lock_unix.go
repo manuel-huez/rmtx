@@ -13,6 +13,7 @@ func lockClientCache(path string) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err = unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("lock client cache: %w", err)
@@ -25,6 +26,7 @@ func lockClientCache(path string) (func() error, error) {
 		if unlockErr != nil {
 			return fmt.Errorf("unlock client cache: %w", unlockErr)
 		}
+
 		if closeErr != nil {
 			return fmt.Errorf("close client cache lock: %w", closeErr)
 		}

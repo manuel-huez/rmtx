@@ -23,13 +23,13 @@ const (
 )
 
 // PruneLocalCache removes client cache files not referenced by any valid manifest.
-func PruneLocalCache() (CachePruneResult, error) {
+func PruneLocalCache() (protocol.CachePruneResponse, error) {
 	dir, unlock, err := acquireClientCacheLock()
 	if err != nil {
-		return CachePruneResult{}, err
+		return protocol.CachePruneResponse{}, err
 	}
 
-	result := CachePruneResult{}
+	result := protocol.CachePruneResponse{}
 
 	result.Deleted, result.Bytes, err = pruneClientBlobCacheInDir(dir, time.Now())
 	if unlockErr := unlock(); unlockErr != nil {
@@ -44,6 +44,7 @@ func acquireClientCacheLock() (string, func() error, error) {
 	if err != nil {
 		return "", nil, err
 	}
+
 	if err := os.MkdirAll(dir, manifestCacheDirMode); err != nil {
 		return "", nil, fmt.Errorf("create client cache dir: %w", err)
 	}
@@ -66,6 +67,7 @@ func beginClientCacheUse(logger *runLogger) (func(), error) {
 		if _, _, err := pruneClientBlobCacheInDir(dir, time.Now()); err != nil {
 			logger.Printf("local client blob cache cleanup failed: %v", err)
 		}
+
 		if err := unlock(); err != nil {
 			logger.Printf("local client blob cache unlock failed: %v", err)
 		}
@@ -204,6 +206,7 @@ func cachedManifestHashes(
 		if err != nil {
 			return nil, nil, err
 		}
+
 		if stalePath != "" {
 			stale = append(stale, stalePath)
 		}
@@ -235,6 +238,7 @@ func collectCachedManifestHashes(
 	if strings.HasSuffix(entry.Name(), ".tmp") && info.ModTime().Before(staleBefore) {
 		return path, nil
 	}
+
 	if !strings.HasSuffix(entry.Name(), ".json") {
 		return "", nil
 	}
@@ -247,6 +251,7 @@ func collectCachedManifestHashes(
 
 		return "", err
 	}
+
 	if err := addManifestHashes(manifest, referenced); err != nil {
 		if info.ModTime().Before(staleBefore) {
 			return path, nil
@@ -277,6 +282,7 @@ func addManifestHashes(manifest []syncfs.Entry, referenced map[string]struct{}) 
 		if item.Kind != syncfs.KindFile || item.Hash == "" {
 			continue
 		}
+
 		if !validBlobHash(item.Hash) {
 			return errors.New("invalid blob hash")
 		}

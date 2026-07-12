@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package config
 
 import (
@@ -110,25 +111,26 @@ func TestLoadedContextIDUsesStableExplicitName(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsLegacyTokenFields(t *testing.T) {
-	root := t.TempDir()
-
-	path := filepath.Join(root, ".rmtx.json")
-	if err := os.WriteFile(
-		path,
-		[]byte(`{"version":1,"token_env":"RMTX_TOKEN"}`),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
+func TestLoadRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		content string
+		want    string
+	}{
+		{`{"version":1,"token_env":"RMTX_TOKEN"}`, `unknown field "token_env"`},
+		{`{"version":2}`, "unsupported config version 2"},
+		{`{"version":1,"discovery":{"timeout":"0s"}}`, `invalid discovery.timeout "0s"`},
 	}
 
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected legacy token field error")
-	}
+	for _, tt := range tests {
+		path := filepath.Join(t.TempDir(), ".rmtx.json")
+		if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 
-	if !strings.Contains(err.Error(), `"token_env" is unsupported`) {
-		t.Fatalf("unexpected error: %v", err)
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Fatalf("Load() error = %v, want containing %q", err, tt.want)
+		}
 	}
 }
 

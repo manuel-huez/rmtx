@@ -114,7 +114,7 @@ func validDotIdentifiers(value string) bool {
 		return false
 	}
 
-	for _, part := range strings.Split(value, ".") {
+	for part := range strings.SplitSeq(value, ".") {
 		if part == "" {
 			return false
 		}

@@ -7,16 +7,26 @@ import (
 	"strings"
 )
 
-func SecureJoin(root, rel string) (string, error) {
+func SecureJoinExisting(root, rel string) (string, error) {
 	clean := filepath.Clean(rel)
 	joined := filepath.Join(root, clean)
 
-	absRoot, err := filepath.Abs(root)
+	resolvedRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", err
 	}
 
-	absJoined, err := filepath.Abs(joined)
+	absRoot, err := filepath.Abs(resolvedRoot)
+	if err != nil {
+		return "", err
+	}
+
+	resolvedJoined, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", err
+	}
+
+	absJoined, err := filepath.Abs(resolvedJoined)
 	if err != nil {
 		return "", err
 	}

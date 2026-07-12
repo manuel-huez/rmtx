@@ -28,7 +28,12 @@ func (s *Server) platformOCIChildCommand(
 	ctx context.Context,
 	run ociChildCommandRequest,
 ) (*exec.Cmd, commandCleanup, error) {
-	if err := checkWSLAvailable(ctx, s.hostOnlyLogger(), run.spec.WSLDistro, run.runLogs); err != nil {
+	if err := checkWSLAvailable(
+		ctx,
+		s.hostOnlyLogger(),
+		run.spec.WSLDistro,
+		run.runLogs,
+	); err != nil {
 		return nil, noopCommandCleanup, err
 	}
 
@@ -347,7 +352,16 @@ func pruneWSLStagedRootFSInDistro(
 	distro string,
 	live map[string]bool,
 ) ([]protocol.ContextArtifact, error) {
-	args := wslCommandArgs(distro, "--user", "root", "--exec", "sh", "-c", wslPruneRootFSScript(), "sh")
+	args := wslCommandArgs(
+		distro,
+		"--user",
+		"root",
+		"--exec",
+		"sh",
+		"-c",
+		wslPruneRootFSScript(),
+		"sh",
+	)
 	for path := range live {
 		args = append(args, path)
 	}
@@ -621,6 +635,7 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 		b.WriteString("lower_rootfs=" + shellQuote(spec.LowerRootFS) + "\n")
 		b.WriteString(wslOverlayRootFSSnippet())
 	}
+	b.WriteString(wslMountSafetySnippet())
 
 	if strings.EqualFold(strings.TrimSpace(spec.GPU), "nvidia") {
 		b.WriteString(
@@ -634,11 +649,13 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 		)
 	}
 
+	b.WriteString("for target in \"$rootfs/proc\" \"$rootfs/tmp\" \"$rootfs/dev\"; do safe_mount_target \"$target\"; reject_mount_symlink \"$target\"; done\n")
 	b.WriteString("mkdir -p \"$rootfs/proc\" \"$rootfs/tmp\" \"$rootfs/dev\"\n")
 	b.WriteString("mount -t proc proc \"$rootfs/proc\" 2>/dev/null || true\n")
 	b.WriteString("mount -t tmpfs -o mode=1777 tmpfs \"$rootfs/tmp\" 2>/dev/null || true\n")
 
 	for _, dev := range []string{"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"} {
+		b.WriteString("safe_mount_target \"$rootfs" + dev + "\"; reject_mount_symlink \"$rootfs" + dev + "\"\n")
 		b.WriteString("touch \"$rootfs" + dev + "\" 2>/dev/null || true\n")
 		b.WriteString(
 			"mount --bind " + shellQuote(dev) + " \"$rootfs" + dev + "\" 2>/dev/null || true\n",
@@ -674,6 +691,21 @@ func wslChildScript(spec ociChildSpec) (string, error) {
 	b.WriteByte('\n')
 
 	return b.String(), nil
+}
+
+func wslMountSafetySnippet() string {
+	return strings.Join([]string{
+		"safe_mount_target() {",
+		"  target=$1",
+		"  parent=$(dirname \"$target\")",
+		"  while [ \"$parent\" != \"$rootfs\" ]; do",
+		"    case \"$parent\" in \"$rootfs\"/*) ;; *) echo 'error: OCI mount target escapes rootfs' >&2; exit 1 ;; esac",
+		"    if [ -L \"$parent\" ]; then echo \"error: OCI mount target has symlink parent: $parent\" >&2; exit 1; fi",
+		"    parent=$(dirname \"$parent\")",
+		"  done",
+		"}",
+		"reject_mount_symlink() { if [ -L \"$1\" ]; then echo \"error: OCI mount target is symlink: $1\" >&2; exit 1; fi; }",
+	}, "\n") + "\n"
 }
 
 func wslStageRootFSSnippet() string {
@@ -718,6 +750,7 @@ func wslHostNetworkFilesSnippet() string {
 		target := `"$rootfs"` + shellQuote(file)
 		b.WriteString("if [ -e " + source + " ]; then\n")
 		b.WriteString("  target=" + target + "\n")
+		b.WriteString("  safe_mount_target \"$target\"\n")
 		b.WriteString("  mkdir -p \"$(dirname \"$target\")\"\n")
 		b.WriteString("  if [ -L \"$target\" ]; then rm -f \"$target\"; fi\n")
 		b.WriteString("  touch \"$target\" 2>/dev/null || true\n")
@@ -744,6 +777,8 @@ func wslBindSnippet(bind ociBind) (string, error) {
 	source := shellQuote(bind.Source)
 	target := `"$rootfs"` + shellQuote(targetPath)
 	b.WriteString("target=" + target + "\n")
+	b.WriteString("safe_mount_target \"$target\"\n")
+	b.WriteString("reject_mount_symlink \"$target\"\n")
 	b.WriteString(
 		"if [ -d " + source + " ]; then mkdir -p \"$target\"; else mkdir -p \"$(dirname \"$target\")\"; touch \"$target\" 2>/dev/null || true; fi\n",
 	)

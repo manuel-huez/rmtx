@@ -1,4 +1,4 @@
-//nolint:wsl_v5
+//nolint:cyclop,wsl_v5 // Progress test checks one ordered event stream end to end.
 package oci
 
 import (
@@ -22,7 +22,7 @@ func TestUnpackImageRejectsPathTraversal(t *testing.T) {
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(digest, bytes.NewReader(layer)); err != nil {
+	if err := store.StoreBlob(digest, int64(len(layer)), bytes.NewReader(layer)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -45,10 +45,14 @@ func TestUnpackImageAppliesWhiteout(t *testing.T) {
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(firstDigest, bytes.NewReader(first)); err != nil {
+	if err := store.StoreBlob(firstDigest, int64(len(first)), bytes.NewReader(first)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(secondDigest, bytes.NewReader(second)); err != nil {
+	if err := store.StoreBlob(
+		secondDigest,
+		int64(len(second)),
+		bytes.NewReader(second),
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,6 +72,44 @@ func TestUnpackImageAppliesWhiteout(t *testing.T) {
 	}
 }
 
+func TestApplyTarEntryRejectsWhiteoutThroughSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	err := applyTarEntry(context.Background(), root, &tar.Header{
+		Name: "link/.wh.victim",
+	}, strings.NewReader(""))
+	if err == nil {
+		t.Fatal("whiteout through symlink parent succeeded")
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("outside file changed: %v", err)
+	}
+}
+
+func TestApplyTarEntryDirectoryReplacesSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "dir")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if err := applyTarEntry(context.Background(), root, &tar.Header{
+		Name: "dir", Typeflag: tar.TypeDir, Mode: 0o755,
+	}, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(filepath.Join(root, "dir")); err != nil || !info.IsDir() {
+		t.Fatalf("directory not installed: info=%v err=%v", info, err)
+	}
+}
+
 func TestUnpackImageContextReportsLayerProgress(t *testing.T) {
 	first := tarGzip(t, tarEntry{Name: "first.txt", Body: "first"})
 	second := tarGzip(t, tarEntry{Name: "second.txt", Body: "second"})
@@ -78,10 +120,14 @@ func TestUnpackImageContextReportsLayerProgress(t *testing.T) {
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(firstDigest, bytes.NewReader(first)); err != nil {
+	if err := store.StoreBlob(firstDigest, int64(len(first)), bytes.NewReader(first)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(secondDigest, bytes.NewReader(second)); err != nil {
+	if err := store.StoreBlob(
+		secondDigest,
+		int64(len(second)),
+		bytes.NewReader(second),
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,7 +148,8 @@ func TestUnpackImageContextReportsLayerProgress(t *testing.T) {
 	if len(events) != 4 {
 		t.Fatalf("events=%d want 4: %#v", len(events), events)
 	}
-	if events[0].Event != UnpackProgressLayerStart || events[0].LayerIndex != 1 || events[0].LayerCount != 2 {
+	if events[0].Event != UnpackProgressLayerStart || events[0].LayerIndex != 1 ||
+		events[0].LayerCount != 2 {
 		t.Fatalf("first event=%#v", events[0])
 	}
 	last := events[len(events)-1]

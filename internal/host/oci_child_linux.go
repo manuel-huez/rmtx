@@ -223,21 +223,23 @@ func ociPathEnv(env []string) string {
 }
 
 func mountRuntimeFilesystems(rootfs string) error {
-	if err := os.MkdirAll(filepath.Join(rootfs, "proc"), defaultDirMode); err != nil {
+	proc, err := childMountDir(rootfs, "/proc")
+	if err != nil {
 		return err
 	}
 
-	if err := syscall.Mount("proc", filepath.Join(rootfs, "proc"), "proc", 0, ""); err != nil {
+	if err := syscall.Mount("proc", proc, "proc", 0, ""); err != nil {
 		return fmt.Errorf("mount proc: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(rootfs, "tmp"), defaultDirMode); err != nil {
+	tmp, err := childMountDir(rootfs, "/tmp")
+	if err != nil {
 		return err
 	}
 
 	if err := syscall.Mount(
 		"tmpfs",
-		filepath.Join(rootfs, "tmp"),
+		tmp,
 		"tmpfs",
 		0,
 		"mode=1777",
@@ -245,21 +247,42 @@ func mountRuntimeFilesystems(rootfs string) error {
 		return fmt.Errorf("mount tmpfs: %w", err)
 	}
 
-	dev := filepath.Join(rootfs, "dev")
-	if err := os.MkdirAll(dev, defaultDirMode); err != nil {
+	_, err = childMountDir(rootfs, "/dev")
+	if err != nil {
 		return err
 	}
 
 	for _, name := range []string{"null", "zero", "random", "urandom"} {
 		source := filepath.Join("/dev", name)
 
-		target := filepath.Join(dev, name)
+		target, err := childTarget(rootfs, "/dev/"+name)
+		if err != nil {
+			return err
+		}
+		if err := rejectChildTargetSymlink(target); err != nil {
+			return err
+		}
 		if err := bindFile(source, target, false); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func childMountDir(rootfs, name string) (string, error) {
+	target, err := childTarget(rootfs, name)
+	if err != nil {
+		return "", err
+	}
+	if err := rejectChildTargetSymlink(target); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(target, defaultDirMode); err != nil {
+		return "", err
+	}
+
+	return target, nil
 }
 
 func mountBind(rootfs string, bind ociBind) error {
@@ -269,6 +292,9 @@ func mountBind(rootfs string, bind ociBind) error {
 
 	target, err := childTarget(rootfs, bind.Target)
 	if err != nil {
+		return err
+	}
+	if err := rejectChildTargetSymlink(target); err != nil {
 		return err
 	}
 
@@ -361,5 +387,46 @@ func childTarget(rootfs, target string) (string, error) {
 		return "", fmt.Errorf("bind target escapes root: %q", target)
 	}
 
-	return filepath.Join(rootfs, clean), nil
+	joined := filepath.Join(rootfs, clean)
+	if err := rejectChildSymlinkParents(rootfs, joined); err != nil {
+		return "", err
+	}
+
+	return joined, nil
+}
+
+func rejectChildSymlinkParents(rootfs, target string) error {
+	for parent := filepath.Dir(target); parent != rootfs; parent = filepath.Dir(parent) {
+		if parent == filepath.Dir(parent) {
+			return fmt.Errorf("bind target escapes rootfs: %s", target)
+		}
+
+		info, err := os.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("bind target has symlink parent: %s", parent)
+		}
+	}
+
+	return nil
+}
+
+func rejectChildTargetSymlink(target string) error {
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("bind target is a symlink: %s", target)
+	}
+
+	return nil
 }

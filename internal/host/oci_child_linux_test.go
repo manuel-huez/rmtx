@@ -44,6 +44,17 @@ func TestValidateOverlayMountPathRejectsComma(t *testing.T) {
 	}
 }
 
+func TestChildTargetRejectsSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := childTarget(root, "/escape/target"); err == nil {
+		t.Fatal("expected symlink parent error")
+	}
+}
+
 func TestOCIChildCommandCleanupRemovesSpecFile(t *testing.T) {
 	s := &Server{}
 

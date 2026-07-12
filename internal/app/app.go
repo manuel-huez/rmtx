@@ -18,6 +18,7 @@ import (
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/discovery"
 	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/security"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
@@ -37,10 +38,8 @@ var (
 	discoverOneHost  = discovery.DiscoverOne
 )
 
-const (
-	initConfigDirMode  = 0o755
-	initConfigFileMode = 0o644
-)
+const initConfigFileMode = 0o644
+const manualHostInstance = "manual-host"
 
 type ExecParams struct {
 	AddressOverride  string
@@ -226,7 +225,7 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		Command:          params.Command,
 		Mounts:           mounts,
 		SyncBack:         syncBack,
-		Runtime:          runtimeSpec(cfg.Runtime),
+		Runtime:          cfg.Runtime,
 		ForwardEnv:       append([]string(nil), cfg.Env.Forward...),
 		Stdout:           params.Stdout,
 		Stderr:           params.Stderr,
@@ -242,29 +241,6 @@ func RunExec(ctx context.Context, cwd string, params ExecParams) (int, error) {
 		KeepWorkspace:    params.KeepWorkspace,
 		ReuseWorkspace:   params.ReuseWorkspace,
 	})
-}
-
-func runtimeSpec(runtime config.RuntimeConfig) protocol.RuntimeSpec {
-	return protocol.RuntimeSpec{
-		Type:       runtime.Type,
-		Image:      runtime.Image,
-		PullPolicy: runtime.PullPolicy,
-		WSLDistro:  runtime.WSLDistro,
-		WorkDir:    runtime.WorkDir,
-		Network:    runtime.Network,
-		User:       runtime.User,
-		GPU:        runtime.GPU,
-		Setup: protocol.RuntimeSetup{
-			ImageCommands:   append([]string(nil), runtime.Setup.ImageCommands...),
-			ContextCommands: append([]string(nil), runtime.Setup.ContextCommands...),
-			ContextInputs:   append([]string(nil), runtime.Setup.ContextInputs...),
-		},
-		Volumes: runtimeVolumes(runtime.Volumes),
-	}
-}
-
-func runtimeVolumes(volumes []config.RuntimeVolume) []protocol.RuntimeVolume {
-	return append([]protocol.RuntimeVolume(nil), volumes...)
 }
 
 func buildMountSpecs(root string, cfg config.Config) ([]syncfs.MountSpec, error) {
@@ -303,7 +279,7 @@ func loadGitignorePatterns(root string) ([]string, error) {
 
 	var patterns []string
 
-	for _, line := range strings.Split(string(content), "\n") {
+	for line := range strings.SplitSeq(string(content), "\n") {
 		pattern, ok := gitignoreLineToExclude(line)
 		if ok {
 			patterns = append(patterns, pattern)
@@ -349,10 +325,10 @@ func gitignoreLineToExclude(line string) (string, bool) {
 	return line, true
 }
 
-func RunPing(ctx context.Context, cwd string, params RemoteParams) (client.PingInfo, error) {
+func RunPing(ctx context.Context, cwd string, params RemoteParams) (protocol.PingResponse, error) {
 	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
-		return client.PingInfo{}, err
+		return protocol.PingResponse{}, err
 	}
 
 	return client.Ping(ctx, remote)
@@ -362,10 +338,10 @@ func RunHostStats(
 	ctx context.Context,
 	cwd string,
 	params RemoteParams,
-) (client.HostStatsInfo, error) {
+) (protocol.HostStatsResponse, error) {
 	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
-		return client.HostStatsInfo{}, err
+		return protocol.HostStatsResponse{}, err
 	}
 
 	return client.HostStats(ctx, remote)
@@ -375,7 +351,7 @@ func RunListContexts(
 	ctx context.Context,
 	cwd string,
 	params RemoteParams,
-) ([]client.ContextInfo, error) {
+) ([]protocol.ContextSummary, error) {
 	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
 	if err != nil {
 		return nil, err
@@ -388,14 +364,14 @@ func RunDeleteContexts(
 	ctx context.Context,
 	cwd string,
 	params ContextDeleteParams,
-) (client.DeleteContextsResult, error) {
+) (protocol.DeleteContextsResponse, error) {
 	remote, loaded, err := resolveClientRemoteOptions(
 		ctx,
 		cwd,
 		params.RemoteParams,
 	)
 	if err != nil {
-		return client.DeleteContextsResult{}, err
+		return protocol.DeleteContextsResponse{}, err
 	}
 
 	ids := append([]string(nil), params.IDs...)
@@ -403,7 +379,7 @@ func RunDeleteContexts(
 		if loaded == nil {
 			loaded, err = config.ResolveRequired(cwd, params.ConfigPath)
 			if err != nil {
-				return client.DeleteContextsResult{}, err
+				return protocol.DeleteContextsResponse{}, err
 			}
 		}
 
@@ -427,7 +403,7 @@ func RunWorkspaceLeases(
 	ctx context.Context,
 	cwd string,
 	params WorkspaceLeasesParams,
-) (client.WorkspaceLeasesResult, error) {
+) (protocol.WorkspaceLeasesResponse, error) {
 	remote, contextID, err := resolveContextScopedRemote(
 		ctx,
 		cwd,
@@ -436,7 +412,7 @@ func RunWorkspaceLeases(
 		params.Current,
 	)
 	if err != nil {
-		return client.WorkspaceLeasesResult{}, err
+		return protocol.WorkspaceLeasesResponse{}, err
 	}
 
 	return client.WorkspaceLeases(ctx, client.WorkspaceLeasesOptions{
@@ -451,7 +427,7 @@ func RunContextArtifacts(
 	ctx context.Context,
 	cwd string,
 	params ContextArtifactsParams,
-) (client.ContextArtifactsResult, error) {
+) (protocol.ContextArtifactsResponse, error) {
 	remote, contextID, err := resolveContextScopedRemote(
 		ctx,
 		cwd,
@@ -460,7 +436,7 @@ func RunContextArtifacts(
 		params.Current,
 	)
 	if err != nil {
-		return client.ContextArtifactsResult{}, err
+		return protocol.ContextArtifactsResponse{}, err
 	}
 
 	return client.ContextArtifacts(ctx, client.ContextArtifactsOptions{
@@ -513,7 +489,7 @@ func RunCachePrune(
 	ctx context.Context,
 	cwd string,
 	params RemoteParams,
-) (client.CachePruneResult, error) {
+) (protocol.CachePruneResponse, error) {
 	result, localErr := client.PruneLocalCache()
 
 	remote, _, err := resolveClientRemoteOptions(ctx, cwd, params)
@@ -556,7 +532,7 @@ func resolveClientRemoteOptions(
 }
 
 func RunHost(ctx context.Context, params HostParams) error {
-	server, err := host.New(host.Options{
+	server, err := host.New(ctx, host.Options{
 		ListenAddr:       params.ListenAddr,
 		StateDir:         params.StateDir,
 		AdvertiseName:    params.AdvertiseName,
@@ -575,7 +551,7 @@ func RunHostPairCode(params HostPairCodeParams) (host.PairCodeInfo, error) {
 	return host.CreatePairCodeInfo(params.StateDir, params.TTL)
 }
 
-//nolint:cyclop // Init flow discovers pairable hosts, writes config, then completes pairing.
+//nolint:cyclop // Init flow discovers and pairs before persisting the selected host config.
 func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, error) {
 	pairParams := PairParams(params)
 	preparePairIO(&pairParams)
@@ -601,12 +577,12 @@ func RunInit(ctx context.Context, cwd string, params InitParams) (InitResult, er
 		configHost = result.Address
 	}
 
-	if err := writeInitConfig(configPath, cwd, result.HostFingerprint, configHost); err != nil {
+	record, err := completePair(ctx, result, &pairParams)
+	if err != nil {
 		return InitResult{}, err
 	}
 
-	record, err := completePair(ctx, result, &pairParams)
-	if err != nil {
+	if err := writeInitConfig(configPath, cwd, result.HostFingerprint, configHost); err != nil {
 		return InitResult{}, err
 	}
 
@@ -736,7 +712,7 @@ func previousPairFingerprint(existing *clientstate.HostRecord) string {
 
 func ensurePairCSR(clientKeyPEM []byte, label string) ([]byte, []byte, error) {
 	if len(clientKeyPEM) == 0 {
-		_, keyPEM, csrPEM, err := client.GenerateClientIdentity(label)
+		keyPEM, csrPEM, err := security.GenerateClientKeyAndCSR(label)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -744,7 +720,7 @@ func ensurePairCSR(clientKeyPEM []byte, label string) ([]byte, []byte, error) {
 		return csrPEM, keyPEM, nil
 	}
 
-	csrPEM, err := client.GenerateCSR(clientKeyPEM, label)
+	csrPEM, err := security.GenerateCSRFromKey(clientKeyPEM, label)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -788,7 +764,7 @@ func resolvePairCode(
 
 func pairedHostRecord(
 	result discovery.Result,
-	pairResp client.PairResult,
+	pairResp protocol.PairResponse,
 	clientKeyPEM []byte,
 ) clientstate.HostRecord {
 	return clientstate.HostRecord{
@@ -803,7 +779,7 @@ func pairedHostRecord(
 	}
 }
 
-func promptForPairCode(params *PairParams, response client.PairCodeResult) (string, error) {
+func promptForPairCode(params *PairParams, response protocol.PairCodeResponse) (string, error) {
 	preparePairIO(params)
 
 	hostName := empty(response.HostName, "host")
@@ -897,7 +873,7 @@ func resolveTTY(params ExecParams) (bool, error) {
 		return ShouldUseTTY(params.StdinFile, params.StdoutFile, params.StderrFile), nil
 	}
 
-	return false, fmt.Errorf("unsupported tty mode %q", params.TTYMode)
+	return false, fmt.Errorf("unsupported tty mode %d", params.TTYMode)
 }
 
 //nolint:cyclop // Remote resolution joins optional config lookup with paired-state validation.
@@ -1171,7 +1147,7 @@ func resolveInitTarget(
 		return discovery.Result{
 			Address:         discovery.NormalizeAddress(addressOverride, config.DefaultPort),
 			Service:         cfg.Discovery.Service,
-			Instance:        "manual-host",
+			Instance:        manualHostInstance,
 			OS:              "",
 			HostFingerprint: fingerprint,
 			PairingEnabled:  true,
@@ -1263,7 +1239,7 @@ func resolvePairTarget(
 		return discovery.Result{
 			Address:         discovery.NormalizeAddress(out, config.DefaultPort),
 			Service:         cfg.Discovery.Service,
-			Instance:        "manual-host",
+			Instance:        manualHostInstance,
 			OS:              "",
 			HostFingerprint: fingerprint,
 			PairingEnabled:  true,
@@ -1454,11 +1430,7 @@ func writeInitConfig(path, cwd, fingerprint, hostAddress string) error {
 
 	content = append(content, '\n')
 
-	if err := os.MkdirAll(filepath.Dir(path), initConfigDirMode); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
-
-	if err := os.WriteFile(path, content, initConfigFileMode); err != nil {
+	if err := pathutil.WriteFileAtomically(path, content, initConfigFileMode); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 

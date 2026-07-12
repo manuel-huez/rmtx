@@ -8,9 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
-const DefaultBlobChunkSize int64 = 4 << 20
+const (
+	DefaultBlobChunkSize int64 = 4 << 20
+	MaxBlobChunkSize     int64 = 64 << 20
+	MaxBlobChunks              = 1 << 20
+)
 
 type BlobDescriptor struct {
 	Hash string `json:"hash"`
@@ -43,17 +49,40 @@ func IsChunkReadError(err error) bool {
 	return errors.As(err, &chunkErr)
 }
 
-func PlanBlobChunks(blobs []BlobDescriptor, chunkSize int64) []BlobChunkInfo {
-	if chunkSize <= 0 {
-		chunkSize = DefaultBlobChunkSize
+func PlanBlobChunks(blobs []BlobDescriptor, chunkSize int64) ([]BlobChunkInfo, error) {
+	chunkSize, err := normalizeBlobChunkSize(chunkSize)
+	if err != nil {
+		return nil, err
 	}
 
 	total := 0
+
+	seen := make(map[string]struct{}, len(blobs))
 	for _, blob := range blobs {
-		total += BlobChunkCount(blob.Size, chunkSize)
+		if err := validateBlobHash(blob.Hash); err != nil {
+			return nil, err
+		}
+
+		if _, exists := seen[blob.Hash]; exists {
+			return nil, fmt.Errorf("duplicate blob descriptor %s", blob.Hash)
+		}
+
+		seen[blob.Hash] = struct{}{}
+
+		count, err := BlobChunkCount(blob.Size, chunkSize)
+		if err != nil {
+			return nil, fmt.Errorf("plan blob %s: %w", blob.Hash, err)
+		}
+
+		if count > MaxBlobChunks-total {
+			return nil, fmt.Errorf("blob chunk plan exceeds %d chunks", MaxBlobChunks)
+		}
+
+		total += count
 	}
 
 	chunks := make([]BlobChunkInfo, 0, total)
+
 	for _, blob := range blobs {
 		if blob.Size == 0 {
 			chunks = append(chunks, BlobChunkInfo{Hash: blob.Hash})
@@ -69,34 +98,75 @@ func PlanBlobChunks(blobs []BlobDescriptor, chunkSize int64) []BlobChunkInfo {
 		}
 	}
 
-	return chunks
+	return chunks, nil
 }
 
-func BlobChunkCount(size, chunkSize int64) int {
-	if size <= 0 {
-		return 1
-	}
-	if chunkSize <= 0 {
-		chunkSize = DefaultBlobChunkSize
+func BlobChunkCount(size, chunkSize int64) (int, error) {
+	if size < 0 {
+		return 0, fmt.Errorf("negative blob size %d", size)
 	}
 
-	return int((size + chunkSize - 1) / chunkSize)
+	chunkSize, err := normalizeBlobChunkSize(chunkSize)
+	if err != nil {
+		return 0, err
+	}
+
+	if size == 0 {
+		return 1, nil
+	}
+
+	count := 1 + (size-1)/chunkSize
+	if count > MaxBlobChunks {
+		return 0, fmt.Errorf("blob requires %d chunks; maximum is %d", count, MaxBlobChunks)
+	}
+
+	return int(count), nil
 }
 
-func BlobChunkPayloadLen(info BlobChunkInfo, chunkSize int64) int64 {
+func BlobChunkPayloadLen(info BlobChunkInfo, chunkSize int64) (int64, error) {
+	chunkSize, err := normalizeBlobChunkSize(chunkSize)
+	if err != nil {
+		return 0, err
+	}
+
+	if info.Size < 0 {
+		return 0, fmt.Errorf("blob %s has negative size", info.Hash)
+	}
+
+	if info.Offset < 0 || info.Offset > info.Size {
+		return 0, fmt.Errorf("blob %s invalid chunk offset %d", info.Hash, info.Offset)
+	}
+
 	if info.Size == 0 {
-		return 0
+		if info.Offset != 0 {
+			return 0, fmt.Errorf("blob %s invalid empty chunk offset %d", info.Hash, info.Offset)
+		}
+
+		return 0, nil
 	}
-	if chunkSize <= 0 {
-		chunkSize = DefaultBlobChunkSize
+
+	if info.Offset%chunkSize != 0 {
+		return 0, fmt.Errorf("blob %s unaligned chunk offset %d", info.Hash, info.Offset)
 	}
 
 	remaining := info.Size - info.Offset
 	if remaining < chunkSize {
-		return remaining
+		return remaining, nil
 	}
 
-	return chunkSize
+	return chunkSize, nil
+}
+
+func normalizeBlobChunkSize(chunkSize int64) (int64, error) {
+	if chunkSize <= 0 {
+		return DefaultBlobChunkSize, nil
+	}
+
+	if chunkSize > MaxBlobChunkSize {
+		return 0, fmt.Errorf("blob chunk size %d exceeds maximum %d", chunkSize, MaxBlobChunkSize)
+	}
+
+	return chunkSize, nil
 }
 
 type ChunkedBlobReceiver struct {
@@ -117,8 +187,9 @@ func NewChunkedBlobReceiver(
 	blobs []BlobDescriptor,
 	chunkSize int64,
 ) (*ChunkedBlobReceiver, error) {
-	if chunkSize <= 0 {
-		chunkSize = DefaultBlobChunkSize
+	chunkSize, err := normalizeBlobChunkSize(chunkSize)
+	if err != nil {
+		return nil, err
 	}
 
 	receiver := &ChunkedBlobReceiver{
@@ -130,14 +201,23 @@ func NewChunkedBlobReceiver(
 	}
 
 	for _, blob := range blobs {
-		if blob.Hash == "" {
-			return nil, errors.New("blob hash is required")
+		if err := validateBlobHash(blob.Hash); err != nil {
+			receiver.abort()
+			return nil, err
 		}
+
 		if blob.Size < 0 {
+			receiver.abort()
 			return nil, fmt.Errorf("blob %s has negative size", blob.Hash)
 		}
+
+		if _, exists := receiver.blobs[blob.Hash]; exists {
+			receiver.abort()
+			return nil, fmt.Errorf("duplicate blob descriptor %s", blob.Hash)
+		}
+
 		receiver.blobs[blob.Hash] = blob
-		if store.Has(blob.Hash) {
+		if store.Has(blob.Hash, blob.Size) {
 			continue
 		}
 
@@ -172,14 +252,16 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(
 	if r.err != nil {
 		err := r.err
 		r.mu.Unlock()
+
 		return err
 	}
 
 	blob, known := r.blobs[info.Hash]
+
 	writer := r.writers[info.Hash]
 	if writer == nil {
 		// Retries can replay chunks after commit; validate metadata, drain payload, keep state done.
-		if known && r.store.Has(info.Hash) {
+		if known && r.store.Has(info.Hash, blob.Size) {
 			err := validateBlobChunkShape(
 				info,
 				blob.Hash,
@@ -192,9 +274,11 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(
 				return r.fail(err)
 			}
 			r.mu.Unlock()
+
 			return discardChunkPayload(info, src, payloadLen)
 		}
 		r.mu.Unlock()
+
 		return r.fail(fmt.Errorf("unexpected blob chunk %s", info.Hash))
 	}
 	r.mu.Unlock()
@@ -212,6 +296,7 @@ func (r *ChunkedBlobReceiver) ReceiveChunk(
 	if err != nil {
 		return r.fail(err)
 	}
+
 	if !complete {
 		return nil
 	}
@@ -242,6 +327,7 @@ func (r *ChunkedBlobReceiver) Wait(ctx context.Context) error {
 	case <-r.done:
 		r.mu.Lock()
 		defer r.mu.Unlock()
+
 		return r.err
 	case <-ctx.Done():
 		return r.fail(ctx.Err())
@@ -272,6 +358,7 @@ func (r *ChunkedBlobReceiver) fail(err error) error {
 func (r *ChunkedBlobReceiver) abort() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.abortLocked()
 }
 
@@ -309,7 +396,11 @@ func newChunkedBlobWriter(
 	blob BlobDescriptor,
 	chunkSize int64,
 ) (*chunkedBlobWriter, error) {
-	path := store.Path(blob.Hash)
+	path, err := store.Path(blob.Hash)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), blobDefaultDirPerm); err != nil {
 		return nil, fmt.Errorf("create blob dir: %w", err)
 	}
@@ -317,6 +408,14 @@ func newChunkedBlobWriter(
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return nil, fmt.Errorf("create blob temp: %w", err)
+	}
+
+	count, err := BlobChunkCount(blob.Size, chunkSize)
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+
+		return nil, err
 	}
 
 	writer := &chunkedBlobWriter{
@@ -327,7 +426,7 @@ func newChunkedBlobWriter(
 		path:      path,
 		tmp:       tmp.Name(),
 		file:      tmp,
-		completed: make([]bool, BlobChunkCount(blob.Size, chunkSize)),
+		completed: make([]bool, count),
 	}
 
 	if blob.Size > 0 {
@@ -344,7 +443,13 @@ func (w *chunkedBlobWriter) writeChunk(info BlobChunkInfo, payload []byte) (bool
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := validateBlobChunkShape(info, w.hash, w.size, w.chunkSize, int64(len(payload))); err != nil {
+	if err := validateBlobChunkShape(
+		info,
+		w.hash,
+		w.size,
+		w.chunkSize,
+		int64(len(payload)),
+	); err != nil {
 		return false, err
 	}
 
@@ -386,26 +491,31 @@ func validateBlobChunkShape(
 	if info.Hash != hash {
 		return fmt.Errorf("blob chunk hash mismatch: %s != %s", info.Hash, hash)
 	}
+
 	if info.Size != size {
 		return fmt.Errorf("blob %s size mismatch: %d != %d", hash, info.Size, size)
 	}
 
-	wantLen := BlobChunkPayloadLen(info, chunkSize)
+	wantLen, err := BlobChunkPayloadLen(info, chunkSize)
+	if err != nil {
+		return err
+	}
+
 	if payloadLen != wantLen {
 		return fmt.Errorf("blob %s chunk length mismatch: %d != %d", hash, payloadLen, wantLen)
-	}
-	if info.Offset < 0 || info.Offset > size {
-		return fmt.Errorf("blob %s invalid chunk offset %d", hash, info.Offset)
-	}
-	if size > 0 && info.Offset%chunkSize != 0 {
-		return fmt.Errorf("blob %s unaligned chunk offset %d", hash, info.Offset)
 	}
 
 	index := 0
 	if size > 0 {
 		index = int(info.Offset / chunkSize)
 	}
-	if index >= BlobChunkCount(size, chunkSize) {
+
+	count, err := BlobChunkCount(size, chunkSize)
+	if err != nil {
+		return err
+	}
+
+	if index >= count {
 		return fmt.Errorf("blob %s chunk index out of range %d", hash, index)
 	}
 
@@ -419,7 +529,15 @@ func (w *chunkedBlobWriter) commit() error {
 	if w.committed {
 		return nil
 	}
+
 	w.committed = true
+
+	if err := w.file.Sync(); err != nil {
+		_ = w.file.Close()
+		_ = os.Remove(w.tmp)
+
+		return fmt.Errorf("sync blob temp: %w", err)
+	}
 
 	if err := w.file.Close(); err != nil {
 		_ = os.Remove(w.tmp)
@@ -431,20 +549,23 @@ func (w *chunkedBlobWriter) commit() error {
 		_ = os.Remove(w.tmp)
 		return err
 	}
+
 	if actual != w.hash {
 		_ = os.Remove(w.tmp)
 		return fmt.Errorf("blob hash mismatch: got %s want %s", actual, w.hash)
 	}
 
-	if _, err := os.Stat(w.path); err == nil {
+	if w.store.Has(w.hash, w.size) {
 		_ = os.Remove(w.tmp)
 		return nil
 	}
 
-	if err := os.Rename(w.tmp, w.path); err != nil {
+	if err := pathutil.ReplaceFile(w.tmp, w.path); err != nil {
 		_ = os.Remove(w.tmp)
 		return fmt.Errorf("move blob file: %w", err)
 	}
+
+	w.store.remember(w.hash, w.size, w.path)
 
 	return nil
 }
@@ -453,6 +574,7 @@ func (w *chunkedBlobWriter) abort() {
 	if w.file != nil {
 		_ = w.file.Close()
 	}
+
 	if w.tmp != "" {
 		_ = os.Remove(w.tmp)
 	}

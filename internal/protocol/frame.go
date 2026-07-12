@@ -4,10 +4,16 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+)
+
+const (
+	MaxFrameHeaderSize  = 8 << 20
+	MaxFramePayloadSize = 64 << 20
 )
 
 type Header struct {
@@ -69,7 +75,16 @@ func (c *Conn) write(msgType string, payload any, data any, payloadLen int64) er
 	return c.writeLocked(msgType, payload, data, payloadLen)
 }
 
+//nolint:cyclop // Frame bounds and each wire write need distinct errors.
 func (c *Conn) writeLocked(msgType string, payload any, data any, payloadLen int64) error {
+	if msgType == "" {
+		return errors.New("frame type is required")
+	}
+
+	if payloadLen < 0 || payloadLen > MaxFramePayloadSize {
+		return fmt.Errorf("invalid frame payload length %d", payloadLen)
+	}
+
 	h := Header{Type: msgType, PayloadLen: payloadLen}
 
 	if payload != nil {
@@ -84,6 +99,10 @@ func (c *Conn) writeLocked(msgType string, payload any, data any, payloadLen int
 	encoded, err := json.Marshal(h)
 	if err != nil {
 		return fmt.Errorf("marshal frame header: %w", err)
+	}
+
+	if len(encoded) == 0 || len(encoded) > MaxFrameHeaderSize {
+		return fmt.Errorf("invalid frame header length %d", len(encoded))
 	}
 
 	if err := binary.Write(c.w, binary.BigEndian, uint32(len(encoded))); err != nil {
@@ -113,6 +132,10 @@ func (c *Conn) ReadHeader() (Header, error) {
 		return Header{}, err
 	}
 
+	if size == 0 || size > MaxFrameHeaderSize {
+		return Header{}, fmt.Errorf("invalid frame header length %d", size)
+	}
+
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(c.r, buf); err != nil {
 		return Header{}, fmt.Errorf("read frame header: %w", err)
@@ -121,6 +144,14 @@ func (c *Conn) ReadHeader() (Header, error) {
 	var h Header
 	if err := json.Unmarshal(buf, &h); err != nil {
 		return Header{}, fmt.Errorf("decode frame header: %w", err)
+	}
+
+	if h.PayloadLen < 0 || h.PayloadLen > MaxFramePayloadSize {
+		return Header{}, fmt.Errorf("invalid frame payload length %d", h.PayloadLen)
+	}
+
+	if h.Type == "" {
+		return Header{}, errors.New("frame type is required")
 	}
 
 	return h, nil

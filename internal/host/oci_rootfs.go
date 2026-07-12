@@ -51,7 +51,11 @@ func ensureOverlayRootFSBundle(rootfs, key, baseRootFS string) error {
 		return err
 	}
 
-	return os.WriteFile(marker, []byte(overlayRootFSMarkerContent(key, baseRootFS)+"\n"), contextFileMode)
+	return pathutil.WriteFileAtomically(
+		marker,
+		[]byte(overlayRootFSMarkerContent(key, baseRootFS)+"\n"),
+		contextFileMode,
+	)
 }
 
 func overlayRootFSMarkerContent(key, baseRootFS string) string {

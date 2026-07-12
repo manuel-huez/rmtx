@@ -8,6 +8,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 )
 
 const (
@@ -103,7 +105,11 @@ func (l *Loaded) Save() error {
 		return fmt.Errorf("marshal client state: %w", err)
 	}
 
-	return os.WriteFile(l.Path, append(content, '\n'), fileMode)
+	if err := pathutil.WriteFileAtomically(l.Path, append(content, '\n'), fileMode); err != nil {
+		return fmt.Errorf("write client state: %w", err)
+	}
+
+	return nil
 }
 
 func (l *Loaded) FindHostByAddress(address string) *HostRecord {

@@ -1,5 +1,6 @@
 //go:build !linux && !windows
 
+//nolint:unused // TTY input consumer is reached only by Linux and Windows runner builds.
 package host
 
 import (

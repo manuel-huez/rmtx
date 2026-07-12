@@ -20,6 +20,7 @@ const pairCodeLockWait = 5 * time.Second
 const pairCodeLockPoll = 10 * time.Millisecond
 const pairCodeLockStaleAfter = 30 * time.Second
 const pairCodeSpace = 1_000_000
+const maxActivePairCodes = 32
 
 var pairCodeStoreMu sync.Mutex
 
@@ -112,6 +113,9 @@ func CreatePairCode(stateDir string, ttl time.Duration) (pairCodeRecord, error) 
 	}
 
 	store.Codes = filtered
+	if len(store.Codes) >= maxActivePairCodes {
+		store.Codes = store.Codes[len(store.Codes)-(maxActivePairCodes-1):]
+	}
 
 	code, err := randomPairCode()
 	if err != nil {
@@ -132,10 +136,6 @@ func CreatePairCode(stateDir string, ttl time.Duration) (pairCodeRecord, error) 
 }
 
 func ConsumePairCode(stateDir, code string) error {
-	return withPairCode(stateDir, code, func() error { return nil })
-}
-
-func withPairCode(stateDir, code string, use func() error) error {
 	pairCodeStoreMu.Lock()
 	defer pairCodeStoreMu.Unlock()
 
@@ -152,10 +152,6 @@ func withPairCode(stateDir, code string, use func() error) error {
 
 	index, err := validPairCodeIndex(store, code, time.Now())
 	if err != nil {
-		return err
-	}
-
-	if err := use(); err != nil {
 		return err
 	}
 
@@ -204,12 +200,7 @@ func loadPairCodeStore(stateDir string) (pairCodeStore, error) {
 }
 
 func savePairCodeStore(stateDir string, store pairCodeStore) error {
-	content, err := json.MarshalIndent(store, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal pairing codes: %w", err)
-	}
-
-	return os.WriteFile(pairCodePath(stateDir), append(content, '\n'), pairCodeFileMode)
+	return writeJSONAtomically(pairCodePath(stateDir), store, pairCodeFileMode)
 }
 
 func randomPairCode() (string, error) {

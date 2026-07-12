@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package host
 
 import (
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
@@ -193,6 +195,7 @@ func TestLogRunStreamsToClientSubscription(t *testing.T) {
 	var hostLogs bytes.Buffer
 
 	hub := newHostLogHub(&hostLogs)
+
 	sub := hub.Subscribe(protocol.NewConn(serverRaw))
 	defer sub.Close()
 
@@ -204,10 +207,12 @@ func TestLogRunStreamsToClientSubscription(t *testing.T) {
 	}
 
 	client := protocol.NewConn(clientRaw)
+
 	head, err := client.ReadHeader()
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if head.Type != protocol.MsgExecOutput {
 		t.Fatalf("frame type=%s want %s", head.Type, protocol.MsgExecOutput)
 	}
@@ -234,7 +239,7 @@ func TestPullOCIImageWritesRunLogs(t *testing.T) {
 		runLogs  bytes.Buffer
 	)
 
-	server, err := New(Options{
+	server, err := New(t.Context(), Options{
 		StateDir: t.TempDir(),
 		Logger:   log.New(&hostLogs, "", 0),
 	})
@@ -255,7 +260,7 @@ func TestPullOCIImageWritesRunLogs(t *testing.T) {
 	_, err = server.pullOCIImage(
 		context.Background(),
 		ref,
-		protocol.RuntimeSpec{PullPolicy: "never"},
+		config.RuntimeConfig{PullPolicy: "never"},
 		store,
 		"ctx",
 		&runLogs,
@@ -280,7 +285,7 @@ func TestBuildProgressWritesRunLogs(t *testing.T) {
 		runLogs  bytes.Buffer
 	)
 
-	server, err := New(Options{
+	server, err := New(t.Context(), Options{
 		StateDir: t.TempDir(),
 		Logger:   log.New(&hostLogs, "", 0),
 	})

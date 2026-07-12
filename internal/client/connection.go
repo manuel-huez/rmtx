@@ -61,6 +61,7 @@ func dialFastestTLS(
 	// Reverse starts shortly after direct so firewalled local dials skip the full direct timeout.
 	timer := time.NewTimer(reverseFallbackDelay)
 	defer timer.Stop()
+
 	timerCh := timer.C
 
 	var (
@@ -73,25 +74,46 @@ func dialFastestTLS(
 		select {
 		case result := <-directCh:
 			directCh = nil
+
 			if result.err == nil {
 				return result.conn, nil
 			}
+
 			directErr = result.err
+
 			if reverseCh == nil {
 				stopTimer(timer)
+
 				timerCh = nil
-				reverseCh = startReverseDialTLS(ctx, done, address, discoveryService, fingerprint, tlsConfig)
+				reverseCh = startReverseDialTLS(
+					ctx,
+					done,
+					address,
+					discoveryService,
+					fingerprint,
+					tlsConfig,
+				)
 			}
 		case <-timerCh:
 			timerCh = nil
+
 			if reverseCh == nil {
-				reverseCh = startReverseDialTLS(ctx, done, address, discoveryService, fingerprint, tlsConfig)
+				reverseCh = startReverseDialTLS(
+					ctx,
+					done,
+					address,
+					discoveryService,
+					fingerprint,
+					tlsConfig,
+				)
 			}
 		case result := <-reverseCh:
 			reverseCh = nil
+
 			if result.err == nil {
 				return result.conn, nil
 			}
+
 			reverseErr = result.err
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -110,6 +132,7 @@ func stopTimer(timer *time.Timer) {
 	if timer == nil {
 		return
 	}
+
 	if !timer.Stop() {
 		select {
 		case <-timer.C:
@@ -140,6 +163,7 @@ func startDialTLS(
 	dial func() (*protocol.Conn, error),
 ) <-chan dialTLSResult {
 	ch := make(chan dialTLSResult)
+
 	go func() {
 		conn, err := dial()
 		result := dialTLSResult{conn: conn, err: err}
@@ -162,7 +186,12 @@ func dialDirectTLS(
 	tlsConfig *tls.Config,
 ) (*protocol.Conn, error) {
 	dialer := net.Dialer{KeepAlive: tcpKeepAliveEvery}
-	raw, err := (&tls.Dialer{NetDialer: &dialer, Config: tlsConfig}).DialContext(ctx, "tcp", address)
+
+	raw, err := (&tls.Dialer{NetDialer: &dialer, Config: tlsConfig}).DialContext(
+		ctx,
+		"tcp",
+		address,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +205,7 @@ func dialReverseTLS(
 	tlsConfig *tls.Config,
 ) (*protocol.Conn, error) {
 	listenConfig := net.ListenConfig{KeepAlive: tcpKeepAliveEvery}
+
 	ln, err := listenConfig.Listen(ctx, "tcp4", "0.0.0.0:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen for reverse connection: %w", err)

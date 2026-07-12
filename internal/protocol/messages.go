@@ -96,20 +96,17 @@ type NeedBlobs struct {
 }
 
 type BlobTransferRequest struct {
-	ContextID string         `json:"context_id"`
-	Session   string         `json:"session"`
-	Token     string         `json:"token"`
-	Direction string         `json:"direction"`
-	Chunk     *BlobChunkInfo `json:"chunk,omitempty"`
+	ContextID string                `json:"context_id"`
+	Session   string                `json:"session"`
+	Token     string                `json:"token"`
+	Direction string                `json:"direction"`
+	Chunk     *syncfs.BlobChunkInfo `json:"chunk,omitempty"`
 }
 
 const (
 	BlobTransferUpload   = "upload"
 	BlobTransferDownload = "download"
 )
-
-type BlobDescriptor = syncfs.BlobDescriptor
-type BlobChunkInfo = syncfs.BlobChunkInfo
 
 type ChangeSet struct {
 	Entries []syncfs.Entry `json:"entries"`
@@ -127,32 +124,28 @@ type WorkspaceReady struct {
 	Workspace          string    `json:"workspace,omitempty"`
 	WorkspaceLeaseID   string    `json:"workspace_lease_id,omitempty"`
 	WorkspaceReused    bool      `json:"workspace_reused,omitempty"`
-	WorkspaceExpiresAt time.Time `json:"workspace_expires_at,omitempty"`
+	WorkspaceExpiresAt time.Time `json:"workspace_expires_at"`
 }
 
 type RunRequest struct {
-	ContextID      string             `json:"context_id"`
-	ContextName    string             `json:"context_name,omitempty"`
-	WorkDir        string             `json:"work_dir"`
-	Command        []string           `json:"command"`
-	Env            map[string]string  `json:"env"`
-	Runtime        RuntimeSpec        `json:"runtime,omitempty"`
-	Mounts         []syncfs.MountSpec `json:"mounts"`
-	Manifest       []syncfs.Entry     `json:"manifest"`
-	SyncBack       []string           `json:"sync_back"`
-	Session        string             `json:"session"`
-	Project        string             `json:"project,omitempty"`
-	RootHint       string             `json:"root_hint,omitempty"`
-	TTY            bool               `json:"tty,omitempty"`
-	TTYRows        int                `json:"tty_rows,omitempty"`
-	TTYCols        int                `json:"tty_cols,omitempty"`
-	KeepWorkspace  string             `json:"keep_workspace,omitempty"`
-	ReuseWorkspace string             `json:"reuse_workspace,omitempty"`
+	ContextID      string               `json:"context_id"`
+	ContextName    string               `json:"context_name,omitempty"`
+	WorkDir        string               `json:"work_dir"`
+	Command        []string             `json:"command"`
+	Env            map[string]string    `json:"env"`
+	Runtime        config.RuntimeConfig `json:"runtime"`
+	Mounts         []syncfs.MountSpec   `json:"mounts"`
+	Manifest       []syncfs.Entry       `json:"manifest"`
+	SyncBack       []string             `json:"sync_back"`
+	Session        string               `json:"session"`
+	Project        string               `json:"project,omitempty"`
+	RootHint       string               `json:"root_hint,omitempty"`
+	TTY            bool                 `json:"tty,omitempty"`
+	TTYRows        int                  `json:"tty_rows,omitempty"`
+	TTYCols        int                  `json:"tty_cols,omitempty"`
+	KeepWorkspace  string               `json:"keep_workspace,omitempty"`
+	ReuseWorkspace string               `json:"reuse_workspace,omitempty"`
 }
-
-type RuntimeSpec = config.RuntimeConfig
-type RuntimeSetup = config.RuntimeSetup
-type RuntimeVolume = config.RuntimeVolume
 
 type PingRequest struct{}
 
@@ -218,8 +211,8 @@ type ContextSummary struct {
 	Path      string    `json:"path"`
 	Workspace string    `json:"workspace"`
 	RootHint  string    `json:"root_hint,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	Active    bool      `json:"active,omitempty"`
 }
 
@@ -231,9 +224,9 @@ type WorkspaceLeaseSummary struct {
 	ID        string    `json:"id"`
 	ContextID string    `json:"context_id"`
 	Path      string    `json:"path"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 	Dirty     bool      `json:"dirty,omitempty"`
 	Active    bool      `json:"active,omitempty"`
 }

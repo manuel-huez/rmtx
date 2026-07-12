@@ -18,6 +18,13 @@ import (
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
+const (
+	artifactKindBlob            = "blob"
+	artifactKindPreparedRuntime = "prepared-runtime"
+	artifactKindVolume          = "volume"
+)
+
+//nolint:cyclop // Mutation, pruning, and response ordering share one context lock boundary.
 func (s *Server) handleContextArtifacts(
 	conn *protocol.Conn,
 	req protocol.ContextArtifactsRequest,
@@ -104,7 +111,7 @@ func (s *Server) deleteContextArtifact(
 	}
 
 	path := filepath.Join(runtimeDir, "volumes", volume)
-	artifact := protocol.ContextArtifact{Kind: "volume", Name: volume, Path: path}
+	artifact := protocol.ContextArtifact{Kind: artifactKindVolume, Name: volume, Path: path}
 	if err := pathutil.RemoveAll(path); err != nil {
 		return nil, err
 	}
@@ -128,15 +135,15 @@ func removeContextSetupCache(runtimeDir string) error {
 func (s *Server) pruneContextArtifacts(runtimeDir string) ([]protocol.ContextArtifact, error) {
 	var deleted []protocol.ContextArtifact
 
+	if err := compactArtifactState(runtimeDir); err != nil {
+		return nil, err
+	}
+
 	specs, err := pruneRuntimeSpecs(runtimeDir)
 	if err != nil {
 		return nil, err
 	}
 	deleted = append(deleted, specs...)
-
-	if err := compactArtifactState(runtimeDir); err != nil {
-		return nil, err
-	}
 
 	prepared, err := pruneStalePreparedRuntimes(runtimeDir)
 	if err != nil {
@@ -162,7 +169,7 @@ func compactArtifactState(runtimeDir string) error {
 	if len(state.Prepared) == 0 {
 		state.Images = nil
 
-		return writeIndentedJSON(path, state)
+		return writeJSONAtomically(path, state, contextFileMode)
 	}
 
 	current := state.Prepared[len(state.Prepared)-1]
@@ -175,7 +182,7 @@ func compactArtifactState(runtimeDir string) error {
 		}}
 	}
 
-	return writeIndentedJSON(path, state)
+	return writeJSONAtomically(path, state, contextFileMode)
 }
 
 func artifactImagesForDigest(images []artifactImage, digest string) []artifactImage {
@@ -214,7 +221,14 @@ func pruneRuntimeSpecs(runtimeDir string) ([]protocol.ContextArtifact, error) {
 }
 
 func pruneStalePreparedRuntimes(runtimeDir string) ([]protocol.ContextArtifact, error) {
-	state, _ := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
+	state, err := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	live := map[string]bool{}
 	for _, prepared := range state.Prepared {
 		live[prepared.Key] = true
@@ -238,7 +252,7 @@ func pruneStalePreparedRuntimes(runtimeDir string) ([]protocol.ContextArtifact, 
 		path := filepath.Join(root, entry.Name())
 		size, _ := dirSize(path)
 		deleted = append(deleted, protocol.ContextArtifact{
-			Kind: "prepared-runtime",
+			Kind: artifactKindPreparedRuntime,
 			Name: entry.Name(),
 			Path: path,
 			Size: size,
@@ -262,7 +276,7 @@ func (s *Server) listContextArtifacts(
 	workspace := filepath.Join(dataDir, contextWorkspaceDir)
 	if size, err := dirSize(workspace); err == nil {
 		out = append(out, protocol.ContextArtifact{
-			Kind: "workspace",
+			Kind: workspaceLeaseWorkspace,
 			Name: contextID,
 			Path: workspace,
 			Size: size,
@@ -280,7 +294,7 @@ func (s *Server) listContextArtifacts(
 			path := filepath.Join(volumeRoot, volume.Name())
 			size, _ := dirSize(path)
 			out = append(out, protocol.ContextArtifact{
-				Kind: "volume",
+				Kind: artifactKindVolume,
 				Name: volume.Name(),
 				Path: path,
 				Size: size,
@@ -290,7 +304,10 @@ func (s *Server) listContextArtifacts(
 		return nil, err
 	}
 
-	state, _ := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
+	state, err := loadArtifactState(filepath.Join(runtimeDir, runtimeDirName, artifactStateFile))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	for _, image := range state.Images {
 		out = append(out, protocol.ContextArtifact{
 			Kind:   "image",
@@ -308,7 +325,7 @@ func (s *Server) listContextArtifacts(
 			detail = fmt.Sprintf("%s base=%s", prepared.ImageReference, prepared.BasePath)
 		}
 		out = append(out, protocol.ContextArtifact{
-			Kind:   "prepared-runtime",
+			Kind:   artifactKindPreparedRuntime,
 			Name:   prepared.Key,
 			Path:   prepared.Path,
 			Ref:    prepared.ImageDigest,
@@ -592,6 +609,7 @@ func readOCIRefManifestDigest(path string) (string, error) {
 	return image.ManifestDigest, nil
 }
 
+//nolint:cyclop // Corrupt context state must abort GC instead of becoming an empty reference set.
 func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error) {
 	refs := map[string]map[string]bool{}
 	entries, err := os.ReadDir(s.contextsRoot())
@@ -620,8 +638,11 @@ func (s *Server) referencedOCIDigestsByRoot() (map[string]map[string]bool, error
 		state, err := loadArtifactState(
 			filepath.Join(runtimeDir, runtimeDirName, artifactStateFile),
 		)
-		if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 
 		for _, image := range state.Images {
@@ -701,7 +722,7 @@ func pruneUnreferencedBlobsInRoot(
 		}
 
 		deleted = append(deleted, protocol.ContextArtifact{
-			Kind: "blob",
+			Kind: artifactKindBlob,
 			Path: path,
 			Ref:  hash,
 		})

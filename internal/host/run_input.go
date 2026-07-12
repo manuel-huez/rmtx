@@ -1,3 +1,4 @@
+//nolint:unused // TTY forwarding is compiled for all hosts but used only by Linux and Windows runners.
 package host
 
 import (
@@ -20,6 +21,7 @@ type ttyInputForwarding struct {
 	mu      sync.Mutex
 	writer  io.Writer
 	queue   [][]byte
+	queued  int
 	resize  *protocol.TTYSize
 	stopped bool
 	done    chan error
@@ -49,12 +51,15 @@ func (i *ttyInputForwarding) Attach(writer io.Writer) error {
 			return err
 		}
 	}
+
 	i.queue = nil
+	i.queued = 0
 
 	if i.resize != nil {
 		if err := resizeTTYWriter(writer, i.resize.Rows, i.resize.Cols); err != nil {
 			return err
 		}
+
 		i.resize = nil
 	}
 
@@ -70,7 +75,13 @@ func (i *ttyInputForwarding) Write(p []byte) (int, error) {
 	defer i.mu.Unlock()
 
 	if i.writer == nil {
+		if i.queued+len(p) > maxQueuedPipeInputBytes {
+			return 0, fmt.Errorf("tty input queue exceeds %d bytes", maxQueuedPipeInputBytes)
+		}
+
 		i.queue = append(i.queue, append([]byte(nil), p...))
+		i.queued += len(p)
+
 		return len(p), nil
 	}
 
@@ -131,6 +142,7 @@ type pipeInputForwarding struct {
 	once        sync.Once
 	cond        *sync.Cond
 	queue       [][]byte
+	head        int
 	queuedBytes int
 	closed      bool
 	stopped     bool
@@ -149,10 +161,12 @@ func (s *Server) startPipeInputForwarding(
 
 	go func() {
 		err := s.consumePipeInput(conn, input, cancelRun)
+
 		_ = input.Close()
 		if err != nil && !input.Stopped() && cancelRun != nil {
 			cancelRun()
 		}
+
 		input.done <- err
 	}()
 
@@ -172,6 +186,7 @@ func (i *pipeInputForwarding) Stop() {
 		i.cond.L.Lock()
 		i.stopped = true
 		i.queue = nil
+		i.head = 0
 		i.queuedBytes = 0
 		i.cond.Broadcast()
 		i.cond.L.Unlock()
@@ -189,6 +204,7 @@ func stopTTYInputReader(conn *protocol.Conn, input *ttyInputForwarding) error {
 	}
 
 	input.Stop()
+
 	return stopInputReader(conn, input.Done())
 }
 
@@ -203,6 +219,7 @@ func stopInputReader(conn *protocol.Conn, done <-chan error) error {
 		if protocol.IsDisconnectError(err) || errors.Is(err, os.ErrDeadlineExceeded) {
 			return nil
 		}
+
 		return err
 	case <-time.After(time.Second):
 		return nil
@@ -257,23 +274,29 @@ func (i *pipeInputForwarding) Read(p []byte) (int, error) {
 	i.cond.L.Lock()
 	defer i.cond.L.Unlock()
 
-	for len(i.queue) == 0 && !i.closed && !i.stopped {
+	for i.head == len(i.queue) && !i.closed && !i.stopped {
 		i.cond.Wait()
 	}
 
-	if len(i.queue) == 0 {
+	if i.head == len(i.queue) {
 		return 0, io.EOF
 	}
 
-	n := copy(p, i.queue[0])
-	if n == len(i.queue[0]) {
-		i.queuedBytes -= len(i.queue[0])
-		copy(i.queue, i.queue[1:])
-		i.queue = i.queue[:len(i.queue)-1]
+	n := copy(p, i.queue[i.head])
+	if n == len(i.queue[i.head]) {
+		i.queuedBytes -= len(i.queue[i.head])
+		i.queue[i.head] = nil
+
+		i.head++
+		if i.head == len(i.queue) {
+			i.queue = nil
+			i.head = 0
+		}
 	} else {
-		i.queue[0] = i.queue[0][n:]
+		i.queue[i.head] = i.queue[i.head][n:]
 		i.queuedBytes -= n
 	}
+
 	i.cond.Signal()
 
 	return n, nil
@@ -304,6 +327,7 @@ func (s *Server) consumePipeInput(
 			if err := conn.DiscardPayload(head); err != nil {
 				return err
 			}
+
 			continue
 		}
 
@@ -319,6 +343,7 @@ func (s *Server) consumePipeInput(
 	}
 }
 
+//nolint:cyclop // Protocol frame cases must remain explicit and exhaustive.
 func (s *Server) handleInputFrame(
 	conn *protocol.Conn,
 	head protocol.Header,

@@ -1,5 +1,6 @@
 //go:build !windows
 
+//nolint:cyclop,goconst // Recovery scenarios keep fault setup and assertions together.
 package host
 
 import (
@@ -43,8 +44,6 @@ func TestRunPipeExecCommandDisconnectCancelsAfterStdinClose(t *testing.T) {
 	}()
 
 	client := protocol.NewConn(clientConn)
-
-	time.Sleep(40 * time.Millisecond)
 
 	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
 		t.Fatalf("send stdin close: %v", err)
@@ -98,8 +97,6 @@ func TestRunPipeExecCommandDisconnectCancelsProcessTree(t *testing.T) {
 
 	client := protocol.NewConn(clientConn)
 
-	time.Sleep(40 * time.Millisecond)
-
 	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
 		t.Fatalf("send stdin close: %v", err)
 	}
@@ -143,7 +140,6 @@ func TestRunPipeExecCommandIdleTimeoutCancelsSilentClient(t *testing.T) {
 	}()
 
 	client := protocol.NewConn(clientConn)
-	time.Sleep(40 * time.Millisecond)
 
 	if err := client.WriteJSON(protocol.MsgStdinClose, nil); err != nil {
 		t.Fatalf("send stdin close: %v", err)
@@ -192,8 +188,7 @@ func TestRunPipeExecCommandHeartbeatsKeepIdleClientAlive(t *testing.T) {
 		t.Fatalf("send stdin close: %v", err)
 	}
 
-	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
-	defer stopHeartbeat()
+	heartbeatCtx := t.Context()
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Millisecond)
@@ -214,6 +209,7 @@ func TestRunPipeExecCommandHeartbeatsKeepIdleClientAlive(t *testing.T) {
 		if result.err != nil {
 			t.Fatalf("run failed while client heartbeats were flowing: %v", result.err)
 		}
+
 		if result.code != 0 {
 			t.Fatalf("exit code=%d want 0", result.code)
 		}
@@ -231,6 +227,7 @@ func TestPipeInputForwardingReadsCancelAfterQueuedStdin(t *testing.T) {
 
 	cancelled := make(chan struct{})
 	server := &Server{logger: log.New(io.Discard, "", 0)}
+
 	input := server.startPipeInputForwarding(protocol.NewConn(serverConn), func() {
 		select {
 		case <-cancelled:
@@ -241,9 +238,14 @@ func TestPipeInputForwardingReadsCancelAfterQueuedStdin(t *testing.T) {
 	defer input.Stop()
 
 	client := protocol.NewConn(clientConn)
-	if err := client.WriteBytes(protocol.MsgStdinData, nil, []byte("queued before command")); err != nil {
+	if err := client.WriteBytes(
+		protocol.MsgStdinData,
+		nil,
+		[]byte("queued before command"),
+	); err != nil {
 		t.Fatalf("send stdin data: %v", err)
 	}
+
 	if err := client.WriteJSON(protocol.MsgRunCancel, nil); err != nil {
 		t.Fatalf("send run cancel: %v", err)
 	}
@@ -259,6 +261,7 @@ func TestPipeInputForwardingBackpressuresQueuedStdin(t *testing.T) {
 	t.Helper()
 
 	input := &pipeInputForwarding{done: make(chan error, 1)}
+
 	input.cond = sync.NewCond(&sync.Mutex{})
 	defer input.Stop()
 
@@ -267,6 +270,7 @@ func TestPipeInputForwardingBackpressuresQueuedStdin(t *testing.T) {
 	}
 
 	writeDone := make(chan error, 1)
+
 	go func() {
 		_, err := input.Write([]byte("blocked"))
 		writeDone <- err
@@ -298,7 +302,7 @@ func TestHandleRunRequestDisconnectClearsContextActiveState(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := New(Options{
+	server, err := New(t.Context(), Options{
 		StateDir: stateDir,
 		Logger:   log.New(io.Discard, "", 0),
 	})
@@ -373,7 +377,7 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 
 	stateDir := t.TempDir()
 
-	server, err := New(Options{
+	server, err := New(t.Context(), Options{
 		StateDir: stateDir,
 		Logger:   log.New(io.Discard, "", 0),
 	})
@@ -385,8 +389,7 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 
 	done := make(chan error, 1)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	request := protocol.RunRequest{
 		ContextID: "ctx-sync-retry",
@@ -406,12 +409,15 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read NeedBlobs: %v", err)
 	}
+
 	if needBlobs.Type != protocol.MsgNeedBlobs {
 		t.Fatalf("need blobs request type %q", needBlobs.Type)
 	}
+
 	if err := client.DiscardPayload(needBlobs); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := client.WriteJSON(protocol.MsgSyncComplete, nil); err != nil {
 		t.Fatalf("send sync complete: %v", err)
 	}
@@ -420,9 +426,11 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read workspace ready: %v", err)
 	}
+
 	if ws.Type != protocol.MsgWorkspaceReady {
 		t.Fatalf("workspace ready type %q", ws.Type)
 	}
+
 	if err := client.DiscardPayload(ws); err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +444,7 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read run frame: %v", err)
 		}
+
 		if head.Type == protocol.MsgExecExit {
 			if err := client.DiscardPayload(head); err != nil {
 				t.Fatal(err)
@@ -443,6 +452,7 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 
 			break
 		}
+
 		if err := client.DiscardPayload(head); err != nil {
 			t.Fatal(err)
 		}
@@ -461,12 +471,15 @@ func TestHandleRunRequestDisconnectBeforeSyncBackKeepsWorkspace(t *testing.T) {
 
 	contextDir := filepath.Join(stateDir, contextDirName, request.ContextID)
 	workspaceFile := filepath.Join(contextDir, contextWorkspaceDir, "host.txt")
+
 	content, err := os.ReadFile(workspaceFile)
 	if err != nil {
 		t.Fatalf("read retained workspace file: %v", err)
 	}
+
 	if string(content) != "host" {
 		t.Fatalf("workspace file=%q want host", string(content))
 	}
+
 	assertPathMissing(t, filepath.Join(contextDir, contextCleanFile))
 }

@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package discovery
 
 import (
@@ -7,7 +8,9 @@ import (
 )
 
 func TestResponderDedupesReverseConnectRequests(t *testing.T) {
-	r := &Responder{}
+	r := &Responder{reverseSlots: make(chan struct{}, maxReverseConnections)}
+	defer r.wg.Wait()
+
 	callbacks := make(chan string, 2)
 
 	pkt := packet{
@@ -43,21 +46,19 @@ func TestResponderDedupesReverseConnectRequests(t *testing.T) {
 	}
 }
 
-func TestReverseRequestKeyUsesCallbackForLegacyRequests(t *testing.T) {
+func TestReverseRequestKeyRejectsMissingRequestID(t *testing.T) {
 	pkt := packet{HostFingerprint: "host-fingerprint"}
 
-	got := reverseRequestKey(pkt, "192.0.2.10:64595")
-	want := "host-fingerprint\x00callback\x00192.0.2.10:64595"
-
-	if got != want {
-		t.Fatalf("unexpected legacy reverse request key: got %q want %q", got, want)
+	got := reverseRequestKey(pkt)
+	if got != "" {
+		t.Fatalf("reverse request key = %q, want rejection", got)
 	}
 }
 
 func TestReverseRequestKeyUsesRequestID(t *testing.T) {
 	pkt := packet{RequestID: "request-1", HostFingerprint: "host-fingerprint"}
 
-	got := reverseRequestKey(pkt, "192.0.2.10:64595")
+	got := reverseRequestKey(pkt)
 	want := "host-fingerprint\x00id\x00request-1"
 
 	if got != want {

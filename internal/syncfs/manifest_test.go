@@ -1,10 +1,10 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package syncfs
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,17 +292,25 @@ func TestNormalizeModesUsesReferenceModeForEquivalentEntries(t *testing.T) {
 	}
 }
 
-func TestWriteFileLeavesExistingTargetWhenReadFails(t *testing.T) {
+func TestApplyChangesLeavesExistingTargetWhenStagingFails(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, testFilePath), "original")
 
-	err := WriteFile(
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ApplyChanges(
+		context.Background(),
 		root,
-		Entry{Path: testFilePath, Kind: KindFile, Mode: 0o644},
-		errReader{},
+		store,
+		[]Entry{{Path: testFilePath, Kind: KindFile, Hash: "missing", Mode: 0o644}},
+		nil,
+		ApplyOptions{},
 	)
 	if err == nil {
-		t.Fatal("expected WriteFile read error")
+		t.Fatal("expected ApplyChanges staging error")
 	}
 
 	got, readErr := os.ReadFile(filepath.Join(root, testFilePath))
@@ -453,9 +461,9 @@ func TestBlobStoreMaterializePreservesDuplicateContentModTimes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
-
 	content := "same content"
+
+	hash := sha256Hex([]byte(content))
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
@@ -507,8 +515,9 @@ func TestBlobStoreMaterializePreservesExecutableMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
 	const content = "#!/bin/sh\n"
+
+	hash := sha256Hex([]byte(content))
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
@@ -522,6 +531,7 @@ func TestBlobStoreMaterializePreservesExecutableMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := info.Mode().Perm(); got != 0o755 {
 		t.Fatalf("mode=%#o want 0755", got)
 	}
@@ -533,8 +543,9 @@ func TestBlobStoreStorePathKeepsBlobIndependentFromSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
 	const original = "original content"
+
+	hash := sha256Hex([]byte(original))
 
 	src := filepath.Join(t.TempDir(), "source.txt")
 	mustWrite(t, src, original)
@@ -545,10 +556,11 @@ func TestBlobStoreStorePathKeepsBlobIndependentFromSource(t *testing.T) {
 
 	mustWrite(t, src, "mutated content")
 
-	got, err := os.ReadFile(store.Path(hash))
+	got, err := os.ReadFile(mustBlobPath(t, store, hash))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if string(got) != original {
 		t.Fatalf("stored blob changed with source mutation: got %q want %q", got, original)
 	}
@@ -560,8 +572,9 @@ func TestBlobStoreMaterializeKeepsBlobIndependentFromDest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
 	const original = "original content"
+
+	hash := sha256Hex([]byte(original))
 
 	if err := store.Store(hash, int64(len(original)), strings.NewReader(original)); err != nil {
 		t.Fatal(err)
@@ -574,10 +587,11 @@ func TestBlobStoreMaterializeKeepsBlobIndependentFromDest(t *testing.T) {
 
 	mustWrite(t, dest, "mutated content")
 
-	got, err := os.ReadFile(store.Path(hash))
+	got, err := os.ReadFile(mustBlobPath(t, store, hash))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if string(got) != original {
 		t.Fatalf("stored blob changed with destination mutation: got %q want %q", got, original)
 	}
@@ -589,9 +603,9 @@ func TestBlobStoreMaterializeWithProgressReportsCopiedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
-
 	content := strings.Repeat("x", 64*1024)
+
+	hash := sha256Hex([]byte(content))
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
@@ -600,6 +614,7 @@ func TestBlobStoreMaterializeWithProgressReportsCopiedBytes(t *testing.T) {
 
 	dest := filepath.Join(t.TempDir(), "file.txt")
 	modTime := time.Unix(100, 0).UnixNano()
+
 	err := store.MaterializeWithProgress(hash, dest, 0o644, modTime, func(n int) {
 		copied += int64(n)
 	})
@@ -627,9 +642,9 @@ func TestBlobStoreMaterializeDoesNotClobberTempNameNeighbor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
-
 	content := "materialized content"
+
+	hash := sha256Hex([]byte(content))
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
@@ -669,22 +684,25 @@ func TestBlobStoreMaterializeHandlesLongDestinationName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const hash = "abcdef"
-
 	content := "materialized content"
+
+	hash := sha256Hex([]byte(content))
 	if err := store.Store(hash, int64(len(content)), strings.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
 
 	root := t.TempDir()
 	dest := filepath.Join(root, strings.Repeat("x", 240)+".txt")
+
 	probe, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
 		t.Skipf("long destination names unsupported: %v", err)
 	}
+
 	if err := probe.Close(); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.Remove(dest); err != nil {
 		t.Fatal(err)
 	}
@@ -723,8 +741,13 @@ func mustSymlinkOrSkip(t *testing.T, oldname, newname string) {
 	}
 }
 
-type errReader struct{}
+func mustBlobPath(t *testing.T, store *BlobStore, hash string) string {
+	t.Helper()
 
-func (errReader) Read(_ []byte) (int, error) {
-	return 0, io.ErrUnexpectedEOF
+	path, err := store.Path(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return path
 }

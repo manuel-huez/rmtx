@@ -1,10 +1,14 @@
 package client
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/manuel-huez/rmtx/internal/protocol"
+)
 
 func TestHostUpdateWaitVersionUsesPendingRestartVersion(t *testing.T) {
 	got := hostUpdateWaitVersion(
-		HostUpdateResult{Restarting: true, Version: "v1.2.4"},
+		protocol.HostUpdateResponse{Restarting: true, Version: "v1.2.4"},
 		"v1.2.5",
 	)
 	if got != "v1.2.4" {
@@ -14,7 +18,7 @@ func TestHostUpdateWaitVersionUsesPendingRestartVersion(t *testing.T) {
 
 func TestHostUpdateWaitVersionFallsBackToTargetVersion(t *testing.T) {
 	got := hostUpdateWaitVersion(
-		HostUpdateResult{Restarting: true},
+		protocol.HostUpdateResponse{Restarting: true},
 		"v1.2.5",
 	)
 	if got != "v1.2.5" {

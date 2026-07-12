@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package version
 
 import "testing"

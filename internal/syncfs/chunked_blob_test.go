@@ -6,13 +6,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestPlanBlobChunksSplitsLargeBlob(t *testing.T) {
-	chunks := PlanBlobChunks([]BlobDescriptor{{Hash: "hash", Size: 10}}, 4)
+	hash := sha256Hex([]byte("abcdefghij"))
+
+	chunks, err := PlanBlobChunks([]BlobDescriptor{{Hash: hash, Size: 10}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(chunks) != 3 {
 		t.Fatalf("chunks=%d want 3", len(chunks))
@@ -23,8 +29,43 @@ func TestPlanBlobChunksSplitsLargeBlob(t *testing.T) {
 		t.Fatalf("offsets=%v want [0 4 8]", offsets)
 	}
 
-	if got := BlobChunkPayloadLen(chunks[2], 4); got != 2 {
+	got, err := BlobChunkPayloadLen(chunks[2], 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != 2 {
 		t.Fatalf("last chunk len=%d want 2", got)
+	}
+}
+
+func TestPlanBlobChunksRejectsUnboundedPlan(t *testing.T) {
+	hash := sha256Hex([]byte("large"))
+	if _, err := PlanBlobChunks(
+		[]BlobDescriptor{{Hash: hash, Size: math.MaxInt64}},
+		1,
+	); err == nil {
+		t.Fatal("PlanBlobChunks() accepted unbounded plan")
+	}
+}
+
+func TestChunkedBlobReceiverRejectsDuplicateDescriptors(t *testing.T) {
+	store := NewBlobStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := sha256Hex([]byte("content"))
+
+	if _, err := NewChunkedBlobReceiver(
+		store,
+		[]BlobDescriptor{
+			{Hash: hash, Size: 7},
+			{Hash: hash, Size: 7},
+		},
+		4,
+	); err == nil {
+		t.Fatal("NewChunkedBlobReceiver() accepted duplicate descriptors")
 	}
 }
 
@@ -36,6 +77,7 @@ func TestChunkedBlobReceiverStoresVerifiedBlob(t *testing.T) {
 
 	content := []byte("abcdefghij")
 	hash := sha256Hex(content)
+
 	receiver, err := NewChunkedBlobReceiver(
 		store,
 		[]BlobDescriptor{{Hash: hash, Size: int64(len(content))}},
@@ -45,9 +87,20 @@ func TestChunkedBlobReceiverStoresVerifiedBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, chunk := range PlanBlobChunks([]BlobDescriptor{{Hash: hash, Size: int64(len(content))}}, 4) {
+	chunks, err := PlanBlobChunks([]BlobDescriptor{{Hash: hash, Size: int64(len(content))}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, chunk := range chunks {
 		start := chunk.Offset
-		end := start + BlobChunkPayloadLen(chunk, 4)
+
+		payloadLen, err := BlobChunkPayloadLen(chunk, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		end := start + payloadLen
 		if err := receiver.ReceiveChunk(
 			chunk,
 			bytes.NewReader(content[int(start):int(end)]),
@@ -61,10 +114,11 @@ func TestChunkedBlobReceiverStoresVerifiedBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := os.ReadFile(store.Path(hash))
+	got, err := os.ReadFile(mustBlobPath(t, store, hash))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !bytes.Equal(got, content) {
 		t.Fatalf("stored content=%q want %q", got, content)
 	}
@@ -78,6 +132,7 @@ func TestChunkedBlobReceiverAcceptsDuplicateChunk(t *testing.T) {
 
 	content := []byte("abcdefgh")
 	hash := sha256Hex(content)
+
 	receiver, err := NewChunkedBlobReceiver(
 		store,
 		[]BlobDescriptor{{Hash: hash, Size: int64(len(content))}},
@@ -101,9 +156,11 @@ func TestChunkedBlobReceiverAcceptsDuplicateChunk(t *testing.T) {
 	if err := receiver.ReceiveChunk(second, bytes.NewReader(content[4:]), 4); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := receiver.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+
 	err = receiver.ReceiveChunk(chunk, bytes.NewReader(content[:4]), 4)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +175,7 @@ func TestChunkedBlobReceiverCanRetryAfterChunkReadError(t *testing.T) {
 
 	content := []byte("abcdefgh")
 	hash := sha256Hex(content)
+
 	receiver, err := NewChunkedBlobReceiver(
 		store,
 		[]BlobDescriptor{{Hash: hash, Size: int64(len(content))}},
@@ -128,6 +186,7 @@ func TestChunkedBlobReceiverCanRetryAfterChunkReadError(t *testing.T) {
 	}
 
 	chunk := BlobChunkInfo{Hash: hash, Size: int64(len(content))}
+
 	err = receiver.ReceiveChunk(chunk, readerFunc(func(p []byte) (int, error) {
 		copy(p, content[:2])
 		return 2, os.ErrDeadlineExceeded
@@ -149,6 +208,7 @@ func TestChunkedBlobReceiverRejectsBadLengthBeforeRead(t *testing.T) {
 
 	content := []byte("abcdefgh")
 	hash := sha256Hex(content)
+
 	receiver, err := NewChunkedBlobReceiver(
 		store,
 		[]BlobDescriptor{{Hash: hash, Size: int64(len(content))}},
@@ -176,6 +236,7 @@ func TestChunkedBlobReceiverRejectsBadLengthBeforeRead(t *testing.T) {
 
 func TestChunkedBlobReceiverRemovesBadHashTemp(t *testing.T) {
 	root := t.TempDir()
+
 	store := NewBlobStore(root)
 	if err := store.Ensure(); err != nil {
 		t.Fatal(err)
@@ -183,6 +244,7 @@ func TestChunkedBlobReceiverRemovesBadHashTemp(t *testing.T) {
 
 	content := []byte("actual")
 	wantHash := sha256Hex([]byte("expected"))
+
 	receiver, err := NewChunkedBlobReceiver(
 		store,
 		[]BlobDescriptor{{Hash: wantHash, Size: int64(len(content))}},
@@ -201,7 +263,12 @@ func TestChunkedBlobReceiverRemovesBadHashTemp(t *testing.T) {
 		t.Fatal("expected hash mismatch")
 	}
 
-	if _, statErr := os.Stat(store.Path(wantHash)); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(
+		mustBlobPath(t, store, wantHash),
+	); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
 		t.Fatalf("bad blob path stat err=%v want not exist", statErr)
 	}
 
@@ -209,6 +276,7 @@ func TestChunkedBlobReceiverRemovesBadHashTemp(t *testing.T) {
 	if globErr != nil {
 		t.Fatal(globErr)
 	}
+
 	if len(matches) != 0 {
 		t.Fatalf("left temp files: %v", matches)
 	}

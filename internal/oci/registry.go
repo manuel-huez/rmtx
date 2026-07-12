@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -20,6 +21,10 @@ const (
 	mediaDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
 	mediaOCIManifest        = "application/vnd.oci.image.manifest.v1+json"
 	mediaDockerManifest     = "application/vnd.docker.distribution.manifest.v2+json"
+	maxManifestSize         = 8 << 20
+	maxTokenResponseSize    = 1 << 20
+	registryRequestTimeout  = 30 * time.Minute
+	defaultPlatformOS       = "linux"
 )
 
 type PullOptions struct {
@@ -34,7 +39,11 @@ type Client struct {
 
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: registryRequestTimeout}
+	} else if httpClient.Timeout <= 0 {
+		configured := *httpClient
+		configured.Timeout = registryRequestTimeout
+		httpClient = &configured
 	}
 
 	return &Client{http: httpClient}
@@ -48,7 +57,7 @@ func (c *Client) Pull(
 	opts PullOptions,
 ) (Image, error) {
 	if opts.PlatformOS == "" {
-		opts.PlatformOS = "linux"
+		opts.PlatformOS = defaultPlatformOS
 	}
 
 	if opts.Architecture == "" {
@@ -149,7 +158,10 @@ func (c *Client) ensureBlob(
 	store *Store,
 	opts PullOptions,
 ) error {
-	if store.HasBlob(desc.Digest) {
+	if desc.Size < 0 {
+		return fmt.Errorf("blob %s has negative descriptor size", desc.Digest)
+	}
+	if store.HasBlob(desc.Digest, desc.Size) {
 		if opts.Progress != nil {
 			opts.Progress("blob already present in cache: %s", desc.Digest)
 		}
@@ -170,8 +182,16 @@ func (c *Client) ensureBlob(
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetch blob %s: registry returned %s", desc.Digest, resp.Status)
 	}
+	if resp.ContentLength >= 0 && resp.ContentLength != desc.Size {
+		return fmt.Errorf(
+			"blob %s content length %d does not match descriptor size %d",
+			desc.Digest,
+			resp.ContentLength,
+			desc.Size,
+		)
+	}
 
-	if err := store.StoreBlob(desc.Digest, resp.Body); err != nil {
+	if err := store.StoreBlob(desc.Digest, desc.Size, resp.Body); err != nil {
 		return err
 	}
 
@@ -214,9 +234,12 @@ func (c *Client) fetchManifest(
 		)
 	}
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
 	if err != nil {
 		return nil, "", "", fmt.Errorf("read manifest: %w", err)
+	}
+	if len(raw) > maxManifestSize {
+		return nil, "", "", fmt.Errorf("manifest exceeds %d bytes", maxManifestSize)
 	}
 
 	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
@@ -305,6 +328,9 @@ func (c *Client) bearerToken(ctx context.Context, challenge string) (string, err
 	if err != nil {
 		return "", err
 	}
+	if u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("registry auth realm must use https: %q", realm)
+	}
 
 	q := u.Query()
 	for _, key := range []string{"service", "scope"} {
@@ -329,11 +355,19 @@ func (c *Client) bearerToken(ctx context.Context, challenge string) (string, err
 		return "", fmt.Errorf("registry token request returned %s", resp.Status)
 	}
 
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseSize+1))
+	if err != nil {
+		return "", fmt.Errorf("read registry token response: %w", err)
+	}
+	if len(raw) > maxTokenResponseSize {
+		return "", fmt.Errorf("registry token response exceeds %d bytes", maxTokenResponseSize)
+	}
+
 	var body struct {
 		Token       string `json:"token"`
 		AccessToken string `json:"access_token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return "", err
 	}
 
@@ -448,6 +482,9 @@ func parseManifest(raw []byte) (imageManifest, error) {
 		if err := validateDigest(manifest.Config.Digest, "config"); err != nil {
 			return imageManifest{}, err
 		}
+		if manifest.Config.Size < 0 {
+			return imageManifest{}, errors.New("config descriptor has negative size")
+		}
 	}
 
 	if len(manifest.Layers) == 0 {
@@ -457,6 +494,9 @@ func parseManifest(raw []byte) (imageManifest, error) {
 	for i, layer := range manifest.Layers {
 		if err := validateDigest(layer.Digest, fmt.Sprintf("layer %d", i)); err != nil {
 			return imageManifest{}, err
+		}
+		if layer.Size < 0 {
+			return imageManifest{}, fmt.Errorf("layer %d has negative size", i)
 		}
 	}
 

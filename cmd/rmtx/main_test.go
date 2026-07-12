@@ -1,3 +1,4 @@
+//nolint:goconst // Repeated CLI fixture labels are clearer beside each case.
 package main
 
 import (
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/app"
-	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/wslconfig"
 )
@@ -35,11 +35,13 @@ func TestResolveTTYModeForceAndDisableConflict(t *testing.T) {
 
 func TestCRLFLineFeedWriterConvertsLoneLineFeeds(t *testing.T) {
 	var out bytes.Buffer
+
 	writer := &crlfLineFeedWriter{w: &out}
 
 	if _, err := writer.Write([]byte("one\ntwo\r\nthree\r")); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := writer.Write([]byte("\nfour\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +55,26 @@ func TestCRLFLineFeedWriterConvertsLoneLineFeeds(t *testing.T) {
 func TestRunCacheRequiresPruneSubcommand(t *testing.T) {
 	if code := runCache(context.Background(), nil); code != exitUsage {
 		t.Fatalf("exit code=%d want %d", code, exitUsage)
+	}
+}
+
+func TestContextCommandsRejectUnknownSubcommands(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() int
+	}{
+		{"context", func() int { return runContext(t.Context(), []string{"wat"}) }},
+		{"workspaces", func() int { return runContextWorkspaces(t.Context(), []string{"wat"}) }},
+		{"artifacts", func() int { return runContextArtifacts(t.Context(), []string{"wat"}) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stderr := captureRunStderr(t, tt.run)
+			if code != exitUsage || !strings.Contains(stderr, "unknown") {
+				t.Fatalf("code=%d stderr=%q", code, stderr)
+			}
+		})
 	}
 }
 
@@ -92,6 +114,7 @@ func TestRunRejectsUnknownCommandInsteadOfExec(t *testing.T) {
 			if code != exitUsage {
 				t.Fatalf("exit code=%d want %d", code, exitUsage)
 			}
+
 			if !strings.Contains(stderr, `error: unknown command "`+args[0]+`"`) {
 				t.Fatalf("stderr missing unknown command error: %q", stderr)
 			}
@@ -103,22 +126,27 @@ func captureRunStderr(t *testing.T, fn func() int) (int, string) {
 	t.Helper()
 
 	original := os.Stderr
+
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	os.Stderr = writer
 
 	code := fn()
 
 	os.Stderr = original
+
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
+
 	output, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +157,7 @@ func captureRunStderr(t *testing.T, fn func() int) (int, string) {
 func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
 
-	got := formatStatsLine(client.HostStatsInfo{
+	got := formatStatsLine(protocol.HostStatsResponse{
 		Version:     "v1.2.3",
 		Name:        "build-host",
 		Address:     "127.0.0.1:33221",
@@ -180,7 +208,7 @@ func TestFormatStatsLineIncludesMachineFields(t *testing.T) {
 }
 
 func TestFormatStatsLineUsesPlaceholderForMissingPerCoreUsage(t *testing.T) {
-	got := formatStatsLine(client.HostStatsInfo{})
+	got := formatStatsLine(protocol.HostStatsResponse{})
 
 	if !strings.Contains(got, "cpu_per_core_used_percent=-") {
 		t.Fatalf("stats line missing per-core placeholder: %s", got)
@@ -189,13 +217,13 @@ func TestFormatStatsLineUsesPlaceholderForMissingPerCoreUsage(t *testing.T) {
 
 func TestPrintArtifactsIncludesTotalListedSize(t *testing.T) {
 	var out bytes.Buffer
-	printArtifacts(&out, []client.ContextArtifact{
+	printArtifacts(&out, []protocol.ContextArtifact{
 		{Kind: "workspace", Size: 3},
 		{Kind: "volume", Size: 4},
 	})
 
 	got := out.String()
-	for _, line := range strings.Split(got, "\n") {
+	for line := range strings.SplitSeq(got, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 4 && fields[0] == "total" && fields[3] == "7" {
 			return
@@ -207,7 +235,7 @@ func TestPrintArtifactsIncludesTotalListedSize(t *testing.T) {
 
 func TestPrintWorkspaceLeases(t *testing.T) {
 	var out bytes.Buffer
-	printWorkspaceLeases(&out, []client.WorkspaceLeaseInfo{{
+	printWorkspaceLeases(&out, []protocol.WorkspaceLeaseSummary{{
 		ID:        "ws_1234",
 		Path:      "/tmp/workspace",
 		ExpiresAt: time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
@@ -257,6 +285,7 @@ func TestConfirmUsesBufferedInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if selected == nil || selected.Name != "50%" {
 		t.Fatalf("selected=%v", selected)
 	}

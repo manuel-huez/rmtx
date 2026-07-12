@@ -42,7 +42,12 @@ func RemoveAll(path string) error {
 		parsed.LinuxPath,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("remove WSL path in %s: %s: %w", parsed.Distro, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf(
+			"remove WSL path in %s: %s: %w",
+			parsed.Distro,
+			strings.TrimSpace(string(out)),
+			err,
+		)
 	}
 
 	return nil

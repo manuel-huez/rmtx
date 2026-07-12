@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/manuel-huez/rmtx/internal/app"
-	"github.com/manuel-huez/rmtx/internal/client"
 	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/host"
+	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/version"
 	"github.com/manuel-huez/rmtx/internal/wslconfig"
 )
@@ -69,6 +69,7 @@ func main() {
 		<-ctx.Done()
 		stopSignals()
 	}()
+
 	code := run(ctx, os.Args[1:])
 
 	stopSignals()
@@ -109,6 +110,7 @@ func run(ctx context.Context, args []string) int {
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n", args[0])
 		printUsage(os.Stderr)
+
 		return exitUsage
 	}
 }
@@ -131,7 +133,8 @@ func runHost(ctx context.Context, args []string) int {
 	}
 
 	logger := log.New(hostLogWriter(os.Stderr), "rmtx: ", log.LstdFlags)
-	if err := app.RunHost(
+
+	err := app.RunHost(
 		ctx,
 		app.HostParams{
 			ListenAddr:       *listen,
@@ -141,29 +144,25 @@ func runHost(ctx context.Context, args []string) int {
 			DisableDiscovery: *noDiscovery,
 			Logger:           logger,
 		},
-	); err != nil {
-		var restartRequest *host.RestartRequestedError
-		if errors.As(err, &restartRequest) {
-			if restartErr := restartHostProcess(restartRequest.Executable, args); restartErr != nil {
-				fmt.Fprintln(os.Stderr, "error: restart host:", restartErr)
+	)
+	if err == nil {
+		return 0
+	}
 
-				return 1
-			}
-
-			return 0
-		}
-
-		if errors.Is(err, host.ErrRestartRequested) {
-			if restartErr := restartHostProcess("", args); restartErr != nil {
-				fmt.Fprintln(os.Stderr, "error: restart host:", restartErr)
-
-				return 1
-			}
-
-			return 0
-		}
-
+	var (
+		executable     string
+		restartRequest *host.RestartRequestedError
+	)
+	if errors.As(err, &restartRequest) {
+		executable = restartRequest.Executable
+	} else if !errors.Is(err, host.ErrRestartRequested) {
 		fmt.Fprintln(os.Stderr, "error:", err)
+
+		return 1
+	}
+
+	if err := restartHostProcess(executable, args); err != nil {
+		fmt.Fprintln(os.Stderr, "error: restart host:", err)
 
 		return 1
 	}
@@ -496,7 +495,8 @@ func runContext(ctx context.Context, args []string) int {
 	case "artifacts":
 		return runContextArtifacts(ctx, args[1:])
 	default:
-		return runContextList(ctx, args)
+		fmt.Fprintf(os.Stderr, "error: unknown context subcommand %q\n", args[0])
+		return exitUsage
 	}
 }
 
@@ -509,6 +509,11 @@ func runContextList(ctx context.Context, args []string) int {
 	params, cwd, code := parseRemoteFlagsAndCWD(fs, args, remote)
 	if code != 0 {
 		return code
+	}
+
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "error: context list does not accept arguments")
+		return exitUsage
 	}
 
 	contexts, err := app.RunListContexts(ctx, cwd, params)
@@ -554,6 +559,11 @@ func runContextDelete(ctx context.Context, args []string) int {
 
 	current := fs.Bool("current", false, "delete the current context from the local config")
 	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "error: context prune does not accept arguments")
 		return exitUsage
 	}
 
@@ -638,7 +648,8 @@ func runContextWorkspaces(ctx context.Context, args []string) int {
 	case commandDelete, "rm", commandRemove:
 		return runContextWorkspacesDelete(ctx, args[1:])
 	default:
-		return runContextWorkspacesList(ctx, args)
+		fmt.Fprintf(os.Stderr, "error: unknown context workspaces subcommand %q\n", args[0])
+		return exitUsage
 	}
 }
 
@@ -648,7 +659,7 @@ func runContextWorkspacesList(ctx context.Context, args []string) int {
 		args,
 		commandList,
 		false,
-		func(result client.WorkspaceLeasesResult) { printWorkspaceLeases(os.Stdout, result.Workspaces) },
+		func(result protocol.WorkspaceLeasesResponse) { printWorkspaceLeases(os.Stdout, result.Workspaces) },
 	)
 }
 
@@ -658,7 +669,7 @@ func runContextWorkspacesDelete(ctx context.Context, args []string) int {
 		args,
 		commandDelete,
 		true,
-		func(result client.WorkspaceLeasesResult) {
+		func(result protocol.WorkspaceLeasesResponse) {
 			for _, workspace := range result.Deleted {
 				_, _ = fmt.Fprintf(
 					os.Stdout,
@@ -680,7 +691,7 @@ func runContextWorkspacesCommand(
 	args []string,
 	subcommand string,
 	delete bool,
-	printResult func(client.WorkspaceLeasesResult),
+	printResult func(protocol.WorkspaceLeasesResponse),
 ) int {
 	fs := flag.NewFlagSet("rmtx context workspaces "+subcommand, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -739,7 +750,8 @@ func runContextArtifacts(ctx context.Context, args []string) int {
 	case commandDelete, "rm", commandRemove:
 		return runContextArtifactsDelete(ctx, args[1:])
 	default:
-		return runContextArtifactsList(ctx, args)
+		fmt.Fprintf(os.Stderr, "error: unknown context artifacts subcommand %q\n", args[0])
+		return exitUsage
 	}
 }
 
@@ -749,7 +761,7 @@ func runContextArtifactsList(ctx context.Context, args []string) int {
 		args,
 		commandList,
 		func(_ *app.ContextArtifactsParams, _ *flag.FlagSet) {},
-		func(result client.ContextArtifactsResult) { printArtifacts(os.Stdout, result.Artifacts) },
+		func(result protocol.ContextArtifactsResponse) { printArtifacts(os.Stdout, result.Artifacts) },
 	)
 }
 
@@ -759,7 +771,7 @@ func runContextArtifactsPrune(ctx context.Context, args []string) int {
 		args,
 		commandPrune,
 		func(params *app.ContextArtifactsParams, _ *flag.FlagSet) { params.Prune = true },
-		func(result client.ContextArtifactsResult) { printDeletedArtifacts(result.Deleted) },
+		func(result protocol.ContextArtifactsResponse) { printDeletedArtifacts(result.Deleted) },
 	)
 }
 
@@ -773,7 +785,7 @@ func runContextArtifactsDelete(ctx context.Context, args []string) int {
 
 			params.Delete = true
 		},
-		func(result client.ContextArtifactsResult) { printDeletedArtifacts(result.Deleted) },
+		func(result protocol.ContextArtifactsResponse) { printDeletedArtifacts(result.Deleted) },
 	)
 }
 
@@ -782,7 +794,7 @@ func runContextArtifactsCommand(
 	args []string,
 	subcommand string,
 	configure func(*app.ContextArtifactsParams, *flag.FlagSet),
-	printResult func(client.ContextArtifactsResult),
+	printResult func(protocol.ContextArtifactsResponse),
 ) int {
 	fs := flag.NewFlagSet("rmtx context artifacts "+subcommand, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -796,6 +808,16 @@ func runContextArtifactsCommand(
 	parsed := parseContextCommandFlags(fs, args, remote, current, contextID)
 	if parsed.exitCode != 0 {
 		return parsed.exitCode
+	}
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(
+			os.Stderr,
+			"error: context artifacts %s does not accept arguments\n",
+			subcommand,
+		)
+
+		return exitUsage
 	}
 
 	artifactParams.RemoteParams = parsed.params
@@ -874,7 +896,17 @@ func runCache(ctx context.Context, args []string) int {
 		return code
 	}
 
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "error: cache prune does not accept arguments")
+		return exitUsage
+	}
+
 	result, err := app.RunCachePrune(ctx, cwd, params)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
 	for _, artifact := range result.Deleted {
 		_, _ = fmt.Fprintf(
 			os.Stdout,
@@ -886,10 +918,6 @@ func runCache(ctx context.Context, args []string) int {
 	}
 
 	_, _ = fmt.Fprintf(os.Stdout, "deleted\t%d\tbytes=%d\n", len(result.Deleted), result.Bytes)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
 
 	return 0
 }
@@ -912,8 +940,14 @@ func runWSL(ctx context.Context, args []string) int {
 	pathFlag := fs.String("path", "", "path to .wslconfig")
 	yes := fs.Bool("yes", false, "apply without confirmation")
 	noRestart := fs.Bool("no-restart", false, "do not run wsl --shutdown after writing")
+
 	dryRun := fs.Bool("dry-run", false, "print proposed settings without writing")
 	if err := fs.Parse(args[1:]); err != nil {
+		return exitUsage
+	}
+
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "error: wsl config does not accept arguments")
 		return exitUsage
 	}
 
@@ -947,11 +981,13 @@ func runWSL(ctx context.Context, args []string) int {
 	printWSLConfigStatus(os.Stdout, path, specs, file, profiles)
 
 	input := bufio.NewReader(os.Stdin)
+
 	selected, err := selectWSLProfile(*profileFlag, profiles, input, os.Stdout)
 	if errors.Is(err, errSelectionCancelled) {
 		_, _ = fmt.Fprintln(os.Stdout, "cancelled")
 		return 0
 	}
+
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -1019,7 +1055,11 @@ func printWSLConfigStatus(
 	_, _ = fmt.Fprintf(
 		w,
 		"current\tprocessors=%s\tmemory=%s\n",
-		settingOrDefault(file.Settings, "processors", fmt.Sprintf("default:%d", specs.LogicalProcessors)),
+		settingOrDefault(
+			file.Settings,
+			"processors",
+			fmt.Sprintf("default:%d", specs.LogicalProcessors),
+		),
 		settingOrDefault(file.Settings, "memory", "default:50%"),
 	)
 
@@ -1049,7 +1089,8 @@ func selectWSLProfile(
 	value = strings.TrimSpace(value)
 	if value != "" {
 		for i := range profiles {
-			if strings.EqualFold(value, profiles[i].Name) || strings.TrimSuffix(profiles[i].Name, "%") == value {
+			if strings.EqualFold(value, profiles[i].Name) ||
+				strings.TrimSuffix(profiles[i].Name, "%") == value {
 				return &profiles[i], nil
 			}
 		}
@@ -1058,6 +1099,7 @@ func selectWSLProfile(
 	}
 
 	_, _ = fmt.Fprint(out, "Select profile [1-2, q]: ")
+
 	line, err := readLine(in)
 	if err != nil {
 		return nil, err
@@ -1077,6 +1119,7 @@ func selectWSLProfile(
 
 func confirm(in io.Reader, out io.Writer, prompt string) bool {
 	_, _ = fmt.Fprint(out, prompt)
+
 	line, err := readLine(in)
 	if err != nil {
 		return false
@@ -1095,6 +1138,7 @@ func readLine(in io.Reader) (string, error) {
 	if !ok {
 		reader = bufio.NewReader(in)
 	}
+
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
@@ -1156,7 +1200,7 @@ func emptyFallback(value, fallback string) string {
 	return value
 }
 
-func formatStatsLine(stats client.HostStatsInfo) string {
+func formatStatsLine(stats protocol.HostStatsResponse) string {
 	return fmt.Sprintf(
 		"stats\t%s\t%s\tos=%s\tarch=%s\tlogical_cpus=%d\tphysical_cores=%d\tcpu_used_percent=%.1f\tcpu_used_cores=%.2f\tcpu_per_core_used_percent=%s\tmemory_total_bytes=%d\tmemory_used_bytes=%d\tmemory_available_bytes=%d\tmemory_used_percent=%.1f\tactive_runs=%d\tactive_contexts=%d\tcontexts=%d\tversion=%s\tfingerprint=%s\tat=%s",
 		emptyFallback(stats.Name, "rmtx-host"),
@@ -1213,6 +1257,7 @@ func runHelp(args []string) int {
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown help topic %q\n", args[0])
 		fmt.Fprintln(os.Stderr, "topics: commands, config, env")
+
 		return exitUsage
 	}
 }
@@ -1559,13 +1604,13 @@ func printErr(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 }
 
-func printDeletedContexts(deleted []client.ContextInfo) {
+func printDeletedContexts(deleted []protocol.ContextSummary) {
 	for _, context := range deleted {
 		_, _ = fmt.Fprintf(os.Stdout, "deleted\t%s\t%s\n", context.ID, context.Name)
 	}
 }
 
-func printWorkspaceLeases(w io.Writer, workspaces []client.WorkspaceLeaseInfo) {
+func printWorkspaceLeases(w io.Writer, workspaces []protocol.WorkspaceLeaseSummary) {
 	tw := tabwriter.NewWriter(w, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "ID\tEXPIRES\tDIRTY\tACTIVE\tPATH")
 
@@ -1599,7 +1644,7 @@ func printWorkspaceLeases(w io.Writer, workspaces []client.WorkspaceLeaseInfo) {
 	_ = tw.Flush()
 }
 
-func printArtifacts(w io.Writer, artifacts []client.ContextArtifact) {
+func printArtifacts(w io.Writer, artifacts []protocol.ContextArtifact) {
 	tw := tabwriter.NewWriter(w, 0, tabWriterTabWidth, tabWriterPadding, ' ', 0)
 
 	_, _ = fmt.Fprintln(tw, "KIND\tNAME\tREF\tSIZE\tPATH\tDETAIL")
@@ -1624,7 +1669,7 @@ func printArtifacts(w io.Writer, artifacts []client.ContextArtifact) {
 	_ = tw.Flush()
 }
 
-func printDeletedArtifacts(deleted []client.ContextArtifact) {
+func printDeletedArtifacts(deleted []protocol.ContextArtifact) {
 	for _, artifact := range deleted {
 		_, _ = fmt.Fprintf(
 			os.Stdout,

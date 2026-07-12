@@ -1,14 +1,54 @@
+//nolint:goconst // Repeated fixture literals keep each test case self-contained.
 package security
 
 import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestEnsureHostPKIRecoversPendingTransaction(t *testing.T) {
+	stateDir := t.TempDir()
+
+	pki, err := generateHostPKI("test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := json.Marshal(pki)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paths := resolveHostPKIPaths(stateDir)
+	if err := os.MkdirAll(filepath.Dir(paths.Pending), dirMode); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(paths.Pending, content, privateMode); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := EnsureHostPKI(stateDir, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(recovered.CACertPEM) != string(pki.CACertPEM) {
+		t.Fatal("recovery changed host identity")
+	}
+
+	if _, err := os.Stat(paths.Pending); !os.IsNotExist(err) {
+		t.Fatalf("pending transaction remains: %v", err)
+	}
+}
 
 //nolint:cyclop // Certificate rotation test builds custom PKI fixtures and validates post-rotation state.
 func TestEnsureHostPKIRotatesExpiredServerCertificate(t *testing.T) {

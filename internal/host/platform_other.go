@@ -5,7 +5,7 @@ package host
 import (
 	"context"
 
-	"github.com/manuel-huez/rmtx/internal/protocol"
+	"github.com/manuel-huez/rmtx/internal/config"
 )
 
 func hostIsWindows() bool {
@@ -14,7 +14,7 @@ func hostIsWindows() bool {
 
 func (s *Server) platformRuntimeStateDir(
 	context.Context,
-	protocol.RuntimeSpec,
+	config.RuntimeConfig,
 	*hostLogSubscription,
 ) (string, error) {
 	return s.opts.StateDir, nil

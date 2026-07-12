@@ -59,6 +59,7 @@ func startSessionLiveness(
 		sessionHeartbeatInterval,
 		func(error) {
 			cancel()
+
 			if conn != nil && conn.Raw() != nil {
 				_ = conn.Raw().Close()
 			}

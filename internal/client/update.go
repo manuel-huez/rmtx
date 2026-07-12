@@ -20,26 +20,22 @@ func connectUpdatedRemote(
 	ctx context.Context,
 	opts RemoteOptions,
 	logger *runLogger,
-) (*protocol.Conn, PingInfo, bool, error) {
+) (*protocol.Conn, protocol.PingResponse, bool, error) {
 	targetVersion := clientVersion()
 	if !version.ValidRelease(targetVersion) {
 		conn, err := dialRemote(ctx, opts)
-		return conn, PingInfo{}, false, err
+		return conn, protocol.PingResponse{}, false, err
 	}
 
 	for {
 		conn, info, err := pingHostConn(ctx, opts)
 		if err != nil {
-			return nil, PingInfo{}, false, err
+			return nil, protocol.PingResponse{}, false, err
 		}
 
 		cmp, comparable := version.CompareRelease(targetVersion, info.Version)
 		if !comparable {
-			// Old/dev hosts may close after ping, so a fresh conn preserves one-request compatibility.
-			closeQuietly(conn.Raw())
-
-			conn, err := dialRemote(ctx, opts)
-			return conn, PingInfo{}, false, err
+			return conn, info, true, nil
 		}
 
 		if cmp <= 0 {
@@ -56,7 +52,7 @@ func connectUpdatedRemote(
 
 		result, err := UpdateHost(ctx, opts, targetVersion)
 		if err != nil {
-			return nil, PingInfo{}, false, fmt.Errorf(
+			return nil, protocol.PingResponse{}, false, fmt.Errorf(
 				"host update required (%s -> %s): %w; if the host is too old for auto-update, run `go install %s@%s` on the host",
 				info.Version,
 				targetVersion,
@@ -76,12 +72,12 @@ func connectUpdatedRemote(
 			hostUpdateWaitVersion(result, targetVersion),
 			logger,
 		); err != nil {
-			return nil, PingInfo{}, false, err
+			return nil, protocol.PingResponse{}, false, err
 		}
 	}
 }
 
-func hostUpdateWaitVersion(result HostUpdateResult, targetVersion string) string {
+func hostUpdateWaitVersion(result protocol.HostUpdateResponse, targetVersion string) string {
 	if version.ValidRelease(result.Version) {
 		return result.Version
 	}

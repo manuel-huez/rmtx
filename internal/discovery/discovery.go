@@ -27,11 +27,12 @@ const (
 	discoveryPacketSize     = 2048
 	ipv4Len                 = 4
 	reverseRequestIDBytes   = 16
+	maxReverseConnections   = 8
+	maxReverseRequestKeys   = 1024
 )
 
 const (
-	reverseRequestKeyID       = "id"
-	reverseRequestKeyCallback = "callback"
+	reverseRequestKeyID = "id"
 )
 
 type Result struct {
@@ -60,6 +61,10 @@ type Responder struct {
 	conn            *net.UDPConn
 	reverseMu       sync.Mutex
 	reverseRequests map[string]time.Time
+	cancel          context.CancelFunc
+	reverseSlots    chan struct{}
+	wg              sync.WaitGroup
+	closeOnce       sync.Once
 }
 
 type AdvertiseOptions struct {
@@ -97,9 +102,15 @@ func Advertise(
 		return nil, fmt.Errorf("listen for discovery: %w", err)
 	}
 
-	r := &Responder{conn: conn, reverseRequests: map[string]time.Time{}}
-	go r.serve(ctx, service, instance, port, opts)
-	go r.announce(ctx, service, instance, port, opts)
+	ctx, cancel := context.WithCancel(ctx)
+	r := &Responder{
+		conn:            conn,
+		reverseRequests: map[string]time.Time{},
+		cancel:          cancel,
+		reverseSlots:    make(chan struct{}, maxReverseConnections),
+	}
+	r.wg.Go(func() { r.serve(ctx, service, instance, port, opts) })
+	r.wg.Go(func() { r.announce(ctx, service, instance, port, opts) })
 
 	return r, nil
 }
@@ -109,7 +120,19 @@ func (r *Responder) Close() error {
 		return nil
 	}
 
-	return r.conn.Close()
+	var closeErr error
+
+	r.closeOnce.Do(func() {
+		r.cancel()
+		closeErr = r.conn.Close()
+		r.wg.Wait()
+	})
+
+	if errors.Is(closeErr, net.ErrClosed) {
+		return nil
+	}
+
+	return closeErr
 }
 
 func (r *Responder) serve(
@@ -118,9 +141,8 @@ func (r *Responder) serve(
 	port int,
 	opts AdvertiseOptions,
 ) {
-	defer func() { _ = r.conn.Close() }()
-
-	go func() { <-ctx.Done(); _ = r.conn.Close() }()
+	stopClose := context.AfterFunc(ctx, func() { _ = r.conn.Close() })
+	defer stopClose()
 
 	buf := make([]byte, discoveryPacketSize)
 	for {
@@ -172,15 +194,27 @@ func (r *Responder) handleReverseConnect(pkt packet, addr *net.UDPAddr, opts Adv
 	}
 
 	callback := net.JoinHostPort(addr.IP.String(), strconv.Itoa(pkt.CallbackPort))
-	if !r.claimReverseRequest(pkt, callback) {
+	if !r.claimReverseRequest(pkt) {
 		return
 	}
 
-	go opts.OnReverseConnect(callback)
+	select {
+	case r.reverseSlots <- struct{}{}:
+		r.wg.Go(func() {
+			defer func() { <-r.reverseSlots }()
+
+			opts.OnReverseConnect(callback)
+		})
+	default:
+	}
 }
 
-func (r *Responder) claimReverseRequest(pkt packet, callback string) bool {
-	key := reverseRequestKey(pkt, callback)
+func (r *Responder) claimReverseRequest(pkt packet) bool {
+	key := reverseRequestKey(pkt)
+	if key == "" {
+		return false
+	}
+
 	now := time.Now()
 
 	r.reverseMu.Lock()
@@ -200,12 +234,16 @@ func (r *Responder) claimReverseRequest(pkt packet, callback string) bool {
 		return false
 	}
 
+	if len(r.reverseRequests) >= maxReverseRequestKeys {
+		return false
+	}
+
 	r.reverseRequests[key] = now
 
 	return true
 }
 
-func reverseRequestKey(pkt packet, callback string) string {
+func reverseRequestKey(pkt packet) string {
 	fingerprint := strings.TrimSpace(pkt.HostFingerprint)
 	requestID := strings.TrimSpace(pkt.RequestID)
 
@@ -217,11 +255,7 @@ func reverseRequestKey(pkt packet, callback string) string {
 		)
 	}
 
-	return joinReverseRequestKey(
-		fingerprint,
-		reverseRequestKeyCallback,
-		callback,
-	)
+	return ""
 }
 
 func joinReverseRequestKey(parts ...string) string {

@@ -1,11 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,16 +37,16 @@ type ContextConfig struct {
 
 type Config struct {
 	Version         int             `json:"version,omitempty"`
-	Context         ContextConfig   `json:"context,omitempty"`
+	Context         ContextConfig   `json:"context"`
 	Host            string          `json:"host,omitempty"`
-	TLS             TLSConfig       `json:"tls,omitempty"`
-	Runtime         RuntimeConfig   `json:"runtime,omitempty"`
-	Discovery       DiscoveryConfig `json:"discovery,omitempty"`
+	TLS             TLSConfig       `json:"tls"`
+	Runtime         RuntimeConfig   `json:"runtime"`
+	Discovery       DiscoveryConfig `json:"discovery"`
 	Mounts          []Mount         `json:"mounts,omitempty"`
 	SyncBack        []string        `json:"sync_back,omitempty"`
 	Ignore          []string        `json:"ignore,omitempty"`
 	IgnoreGitignore bool            `json:"ignore_gitignore,omitempty"`
-	Env             EnvConfig       `json:"env,omitempty"`
+	Env             EnvConfig       `json:"env"`
 }
 
 type TLSConfig struct {
@@ -69,7 +71,7 @@ type RuntimeConfig struct {
 	User       string          `json:"user,omitempty"`
 	GPU        string          `json:"gpu,omitempty"`
 	WSLDistro  string          `json:"wsl_distro,omitempty"`
-	Setup      RuntimeSetup    `json:"setup,omitempty"`
+	Setup      RuntimeSetup    `json:"setup"`
 	Volumes    []RuntimeVolume `json:"volumes,omitempty"`
 }
 
@@ -153,26 +155,27 @@ func Load(path string) (*Loaded, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(content, &raw); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-
-	for _, field := range []string{"token", "token_env"} {
-		if _, ok := raw[field]; ok {
-			return nil, fmt.Errorf(
-				"config field %q is unsupported; use `rmtx pair` and tls.host_fingerprint",
-				field,
-			)
-		}
-	}
-
 	cfg := Default()
-	if err := json.Unmarshal(content, &cfg); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("parse config: trailing data")
 	}
 
 	cfg = normalize(cfg)
+	if cfg.Version != Default().Version {
+		return nil, fmt.Errorf("unsupported config version %d", cfg.Version)
+	}
+
+	if timeout, err := time.ParseDuration(cfg.Discovery.Timeout); err != nil || timeout <= 0 {
+		return nil, fmt.Errorf("invalid discovery.timeout %q", cfg.Discovery.Timeout)
+	}
+
 	if err := ValidateRuntime(cfg.Runtime); err != nil {
 		return nil, err
 	}
@@ -182,21 +185,15 @@ func Load(path string) (*Loaded, error) {
 
 func Resolve(startDir, explicitConfig string) (*Loaded, error) {
 	loaded, err := loadExplicitOrSearch(startDir, explicitConfig)
-	if err != nil {
-		if errors.Is(err, ErrConfigNotFound) {
-			goto defaultConfig
-		}
-
-		return nil, err
-	}
-
-	if loaded != nil {
+	if err == nil {
 		return loaded, nil
 	}
 
-defaultConfig:
-	root, err := filepath.Abs(startDir)
+	if !errors.Is(err, ErrConfigNotFound) {
+		return nil, err
+	}
 
+	root, err := filepath.Abs(startDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve default root: %w", err)
 	}

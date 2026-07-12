@@ -8,6 +8,13 @@ import (
 	"github.com/manuel-huez/rmtx/internal/protocol"
 )
 
+const (
+	maxQueuedLogBytes = 1 << 20
+	maxQueuedLogItems = 1024
+)
+
+var droppedLogMarker = []byte("rmtx: slow client; older streamed logs dropped\n")
+
 type hostLogHub struct {
 	out io.Writer
 }
@@ -38,6 +45,9 @@ type hostLogSubscription struct {
 	mu          sync.Mutex
 	cond        *sync.Cond
 	queue       [][]byte
+	head        int
+	queuedBytes int
+	dropped     bool
 	writing     bool
 	closed      bool
 	err         error
@@ -94,6 +104,7 @@ func (s *hostLogSubscription) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+//nolint:cyclop // Byte and item limits must be enforced before both marker and payload inserts.
 func (s *hostLogSubscription) Enqueue(p []byte) {
 	if s == nil || len(p) == 0 {
 		return
@@ -108,7 +119,43 @@ func (s *hostLogSubscription) Enqueue(p []byte) {
 		return
 	}
 
+	if len(buf) > maxQueuedLogBytes {
+		buf = buf[len(buf)-maxQueuedLogBytes:]
+	}
+
+	for (s.queuedBytes+len(buf) > maxQueuedLogBytes ||
+		len(s.queue)-s.head >= maxQueuedLogItems) && s.head < len(s.queue) {
+		s.queuedBytes -= len(s.queue[s.head])
+		s.queue[s.head] = nil
+		s.head++
+		s.dropped = true
+	}
+
+	if s.dropped {
+		if len(buf) > maxQueuedLogBytes-len(droppedLogMarker) {
+			buf = buf[len(buf)-(maxQueuedLogBytes-len(droppedLogMarker)):]
+		}
+
+		for (s.queuedBytes+len(droppedLogMarker)+len(buf) > maxQueuedLogBytes ||
+			len(s.queue)-s.head >= maxQueuedLogItems-1) && s.head < len(s.queue) {
+			s.queuedBytes -= len(s.queue[s.head])
+			s.queue[s.head] = nil
+			s.head++
+		}
+
+		marker := append([]byte(nil), droppedLogMarker...)
+		s.queue = append(s.queue, marker)
+		s.queuedBytes += len(marker)
+		s.dropped = false
+	}
+
+	if s.head > 0 && s.head*2 >= len(s.queue) {
+		s.queue = append(s.queue[:0], s.queue[s.head:]...)
+		s.head = 0
+	}
+
 	s.queue = append(s.queue, buf)
+	s.queuedBytes += len(buf)
 	s.cond.Signal()
 }
 
@@ -120,7 +167,7 @@ func (s *hostLogSubscription) Flush() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for s.err == nil && !s.closed && (len(s.queue) > 0 || s.writing) {
+	for s.err == nil && !s.closed && (s.head < len(s.queue) || s.writing) {
 		s.cond.Wait()
 	}
 }
@@ -151,7 +198,7 @@ func (s *hostLogSubscription) run() {
 
 		err := s.conn.WriteBytes(
 			protocol.MsgExecOutput,
-			protocol.OutputInfo{Stream: "stderr"},
+			protocol.OutputInfo{Stream: outputStreamStderr},
 			item,
 		)
 
@@ -162,6 +209,8 @@ func (s *hostLogSubscription) run() {
 			s.err = err
 			s.closed = true
 			s.queue = nil
+			s.head = 0
+			s.queuedBytes = 0
 		}
 
 		s.cond.Broadcast()
@@ -173,17 +222,24 @@ func (s *hostLogSubscription) next() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for len(s.queue) == 0 && !s.closed {
+	for s.head == len(s.queue) && !s.closed {
 		s.cond.Wait()
 	}
 
-	if len(s.queue) == 0 {
+	if s.head == len(s.queue) {
 		return nil, false
 	}
 
-	item := s.queue[0]
-	copy(s.queue, s.queue[1:])
-	s.queue = s.queue[:len(s.queue)-1]
+	item := s.queue[s.head]
+	s.queue[s.head] = nil
+	s.head++
+
+	s.queuedBytes -= len(item)
+	if s.head == len(s.queue) {
+		s.queue = nil
+		s.head = 0
+	}
+
 	s.writing = true
 
 	return item, true

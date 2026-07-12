@@ -77,7 +77,12 @@ func Chmod(path string, mode fs.FileMode) error {
 		target.LinuxPath,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("chmod WSL path in %s: %s: %w", target.Distro, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf(
+			"chmod WSL path in %s: %s: %w",
+			target.Distro,
+			strings.TrimSpace(string(out)),
+			err,
+		)
 	}
 
 	return nil
@@ -92,7 +97,12 @@ func runWSLLink(distro, mode, oldname, newname string) error {
 
 	out, err := exec.Command("wsl.exe", args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("create WSL link in %s: %s: %w", distro, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf(
+			"create WSL link in %s: %s: %w",
+			distro,
+			strings.TrimSpace(string(out)),
+			err,
+		)
 	}
 
 	return nil

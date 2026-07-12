@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/manuel-huez/rmtx/internal/clientstate"
+	"github.com/manuel-huez/rmtx/internal/pathutil"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
 )
 
@@ -54,14 +55,12 @@ func saveCachedManifest(root, contextID string, entries []syncfs.Entry) error {
 		return fmt.Errorf("marshal manifest cache: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(content, '\n'), manifestCacheFileMode); err != nil {
+	if err := pathutil.WriteFileAtomically(
+		path,
+		append(content, '\n'),
+		manifestCacheFileMode,
+	); err != nil {
 		return fmt.Errorf("write manifest cache: %w", err)
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("move manifest cache: %w", err)
 	}
 
 	return nil

@@ -212,6 +212,7 @@ func (s *Server) hostOnlyLogger() *log.Logger {
 	if s != nil && s.opts.Logger != nil {
 		return s.opts.Logger
 	}
+
 	if s != nil {
 		return s.logger
 	}

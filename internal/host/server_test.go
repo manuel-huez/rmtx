@@ -1,10 +1,13 @@
-//nolint:wsl_v5
+//nolint:cyclop,goconst,wsl_v5 // Server scenarios keep protocol fixtures and lifecycle checks together.
 package host
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -17,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manuel-huez/rmtx/internal/config"
 	"github.com/manuel-huez/rmtx/internal/oci"
 	"github.com/manuel-huez/rmtx/internal/protocol"
 	"github.com/manuel-huez/rmtx/internal/syncfs"
@@ -164,10 +168,10 @@ func TestWaitForClientSyncCompleteKeepsFinishedTransferOpen(t *testing.T) {
 		"token",
 		map[string]downloadBlobItem{},
 		1,
-		protocol.DefaultBlobChunkSize,
+		syncfs.DefaultBlobChunkSize,
 		1,
 	)
-	transfer.completeChunk(protocol.BlobChunkInfo{Hash: "hash"})
+	transfer.completeChunk(syncfs.BlobChunkInfo{Hash: "hash"})
 
 	done := make(chan error, 1)
 	go func() {
@@ -405,7 +409,7 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -415,7 +419,7 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 	}
 	storage := defaultTestStorage(t, s)
 
-	hash := "aa-live"
+	hash := testBlobHash("live")
 	if err := storage.blobStore.Store(hash, 4, bytes.NewReader([]byte("live"))); err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +501,7 @@ func TestSyncClientManifestRecoversInterruptedWorkspaceCleanup(t *testing.T) {
 func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 	stateDir := t.TempDir()
 	var logs bytes.Buffer
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(&logs, "", 0),
@@ -581,7 +585,7 @@ func TestDeleteContextsPrunesUnreferencedOCICache(t *testing.T) {
 
 func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	stateDir := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -591,8 +595,8 @@ func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	}
 	storage := defaultTestStorage(t, s)
 
-	liveHash := "aa-live"
-	staleHash := "bb-stale"
+	liveHash := testBlobHash("live")
+	staleHash := testBlobHash("stale")
 	if err := storage.blobStore.Store(liveHash, 4, bytes.NewReader([]byte("live"))); err != nil {
 		t.Fatal(err)
 	}
@@ -619,14 +623,14 @@ func TestPruneUnreferencedBlobsKeepsManifestHashes(t *testing.T) {
 	if bytesDeleted != 5 {
 		t.Fatalf("deleted bytes=%d want 5", bytesDeleted)
 	}
-	assertPathExists(t, storage.blobStore.Path(liveHash))
-	assertPathMissing(t, storage.blobStore.Path(staleHash))
+	assertPathExists(t, mustHostBlobPath(t, storage.blobStore, liveHash))
+	assertPathMissing(t, mustHostBlobPath(t, storage.blobStore, staleHash))
 }
 
 func TestEnsureContextSplitsWorkspaceAndRuntimeRoots(t *testing.T) {
 	stateDir := t.TempDir()
 	runtimeRoot := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -709,7 +713,7 @@ func TestEnsureContextSplitsWorkspaceAndRuntimeRoots(t *testing.T) {
 func TestEnsureContextMigratesLegacyRuntimeDataRoot(t *testing.T) {
 	stateDir := t.TempDir()
 	legacyRuntimeRoot := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -756,7 +760,10 @@ func TestEnsureContextMigratesLegacyRuntimeDataRoot(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveContextSetupState(legacySetupCache, contextSetupState{Key: "old-workspace"}); err != nil {
+	if err := saveContextSetupState(
+		legacySetupCache,
+		contextSetupState{Key: "old-workspace"},
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -797,7 +804,7 @@ func TestEnsureContextMigratesLegacyRuntimeDataRoot(t *testing.T) {
 func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
 	stateDir := t.TempDir()
 	runtimeRoot := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -806,7 +813,7 @@ func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hash := "aa-live"
+	hash := testBlobHash("live")
 	defaultStorage := defaultTestStorage(t, s)
 	runtimeStore := syncfs.NewBlobStore(filepath.Join(runtimeRoot, "blobs"))
 	if err := runtimeStore.Ensure(); err != nil {
@@ -837,14 +844,14 @@ func TestPruneUnreferencedBlobsUsesContextDataRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertPathMissing(t, defaultStorage.blobStore.Path(hash))
-	assertPathExists(t, runtimeStore.Path(hash))
+	assertPathMissing(t, mustHostBlobPath(t, defaultStorage.blobStore, hash))
+	assertPathExists(t, mustHostBlobPath(t, runtimeStore, hash))
 }
 
 func TestPruneUnreferencedBlobsScansLegacyRuntimeRoot(t *testing.T) {
 	stateDir := t.TempDir()
 	legacyRuntimeRoot := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -860,7 +867,7 @@ func TestPruneUnreferencedBlobsScansLegacyRuntimeRoot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	staleHash := "aa-stale"
+	staleHash := testBlobHash("stale")
 	legacyStore := syncfs.NewBlobStore(filepath.Join(legacyRuntimeRoot, "blobs"))
 	if err := legacyStore.Ensure(); err != nil {
 		t.Fatal(err)
@@ -880,12 +887,12 @@ func TestPruneUnreferencedBlobsScansLegacyRuntimeRoot(t *testing.T) {
 	if len(deleted) != 1 || deleted[0].Kind != "blob" || deleted[0].Ref != staleHash {
 		t.Fatalf("unexpected deleted blobs: %#v", deleted)
 	}
-	assertPathMissing(t, legacyStore.Path(staleHash))
+	assertPathMissing(t, mustHostBlobPath(t, legacyStore, staleHash))
 }
 
 func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
 	stateDir := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -895,9 +902,13 @@ func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
 	}
 	storage := defaultTestStorage(t, s)
 
-	deletedHash := "aa-deleted"
-	keptHash := "bb-kept"
-	if err := storage.blobStore.Store(deletedHash, 7, bytes.NewReader([]byte("deleted"))); err != nil {
+	deletedHash := testBlobHash("deleted")
+	keptHash := testBlobHash("kept")
+	if err := storage.blobStore.Store(
+		deletedHash,
+		7,
+		bytes.NewReader([]byte("deleted")),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.blobStore.Store(keptHash, 4, bytes.NewReader([]byte("kept"))); err != nil {
@@ -931,13 +942,13 @@ func TestDeleteContextsPrunesUnreferencedBlobs(t *testing.T) {
 		t.Fatalf("unexpected delete result: %#v", result.Deleted)
 	}
 
-	assertPathMissing(t, storage.blobStore.Path(deletedHash))
-	assertPathExists(t, storage.blobStore.Path(keptHash))
+	assertPathMissing(t, mustHostBlobPath(t, storage.blobStore, deletedHash))
+	assertPathExists(t, mustHostBlobPath(t, storage.blobStore, keptHash))
 }
 
 func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
 	stateDir := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -947,8 +958,12 @@ func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
 	}
 	storage := defaultTestStorage(t, s)
 
-	sharedHash := "aa-shared"
-	if err := storage.blobStore.Store(sharedHash, 6, bytes.NewReader([]byte("shared"))); err != nil {
+	sharedHash := testBlobHash("shared")
+	if err := storage.blobStore.Store(
+		sharedHash,
+		6,
+		bytes.NewReader([]byte("shared")),
+	); err != nil {
 		t.Fatal(err)
 	}
 	for _, contextID := range []string{"delete-me", "keep-me"} {
@@ -969,12 +984,12 @@ func TestPruneUnreferencedBlobsKeepsHashUsedByAnotherContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertPathExists(t, storage.blobStore.Path(sharedHash))
+	assertPathExists(t, mustHostBlobPath(t, storage.blobStore, sharedHash))
 }
 
 func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	stateDir := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -984,7 +999,7 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	}
 	storage := defaultTestStorage(t, s)
 
-	staleHash := "aa-stale"
+	staleHash := testBlobHash("stale")
 	if err := storage.blobStore.Store(staleHash, 5, bytes.NewReader([]byte("stale"))); err != nil {
 		t.Fatal(err)
 	}
@@ -1007,12 +1022,12 @@ func TestCachePruneDeletesUnreferencedBlobs(t *testing.T) {
 	if !found {
 		t.Fatalf("cache prune did not report stale blob: %#v", deleted)
 	}
-	assertPathMissing(t, storage.blobStore.Path(staleHash))
+	assertPathMissing(t, mustHostBlobPath(t, storage.blobStore, staleHash))
 }
 
 func TestCachePruneDeletesExpiredWorkspaceLeases(t *testing.T) {
 	stateDir := t.TempDir()
-	s, err := New(Options{
+	s, err := New(t.Context(), Options{
 		StateDir:         stateDir,
 		DisableDiscovery: true,
 		Logger:           log.New(io.Discard, "", 0),
@@ -1046,7 +1061,11 @@ func TestCachePruneDeletesExpiredWorkspaceLeases(t *testing.T) {
 	if err := os.MkdirAll(workspacePath, defaultDirMode); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspacePath, "marker"), []byte("stale"), 0o644); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(workspacePath, "marker"),
+		[]byte("stale"),
+		0o644,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1233,7 +1252,13 @@ func TestPruneStalePreparedRuntimesRemovesUnreferencedRootFS(t *testing.T) {
 		ConfigDigest:   "sha256:live-config",
 		Layers:         []oci.Descriptor{{Digest: "sha256:live-layer"}},
 	}
-	if err := saveArtifactState(contextDir, image, "live", live, sharedRootFSPath(contextDir, "live")); err != nil {
+	if err := saveArtifactState(
+		contextDir,
+		image,
+		"live",
+		live,
+		sharedRootFSPath(contextDir, "live"),
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1261,7 +1286,7 @@ func TestCompactArtifactStateKeepsLatestPreparedRuntime(t *testing.T) {
 			{Key: "new", Path: filepath.Join(contextDir, "new"), ImageDigest: "sha256:new"},
 		},
 	}
-	if err := writeIndentedJSON(path, state); err != nil {
+	if err := writeJSONAtomically(path, state, contextFileMode); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1282,10 +1307,10 @@ func TestCompactArtifactStateKeepsLatestPreparedRuntime(t *testing.T) {
 }
 
 func TestValidateRuntimeSpecRejectsInvalidVolumeTarget(t *testing.T) {
-	err := validateRuntimeSpec(protocol.RuntimeSpec{
+	err := validateRuntimeSpec(config.RuntimeConfig{
 		Type:  "oci",
 		Image: "node:22",
-		Volumes: []protocol.RuntimeVolume{{
+		Volumes: []config.RuntimeVolume{{
 			Name:   "cache",
 			Target: "relative",
 		}},
@@ -1314,13 +1339,13 @@ func TestOCIWorkspaceTargetsKeepWorkspaceRootForSubdir(t *testing.T) {
 }
 
 func TestRuntimeCacheKeyIncludesSetupRuntimeOptions(t *testing.T) {
-	base := protocol.RuntimeSpec{
+	base := config.RuntimeConfig{
 		Type:    "oci",
 		Image:   "node:22",
 		Network: "host",
 		User:    "root",
 		GPU:     noneValue,
-		Setup: protocol.RuntimeSetup{
+		Setup: config.RuntimeSetup{
 			ImageCommands: []string{"apt-get update"},
 		},
 	}
@@ -1426,14 +1451,14 @@ func TestContextSetupKeyIncludesRuntimeIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtimeSpec := protocol.RuntimeSpec{
+	runtimeSpec := config.RuntimeConfig{
 		Type:    "oci",
 		Image:   "node:22",
 		WorkDir: "/workspace",
 		Network: "host",
 		User:    "root",
 		GPU:     noneValue,
-		Setup: protocol.RuntimeSetup{
+		Setup: config.RuntimeSetup{
 			ContextCommands: []string{"npm ci"},
 			ContextInputs:   []string{"package-lock.json"},
 		},
@@ -1464,14 +1489,14 @@ func TestContextSetupKeyIncludesCommandWorkdir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtimeSpec := protocol.RuntimeSpec{
+	runtimeSpec := config.RuntimeConfig{
 		Type:    "oci",
 		Image:   "node:22",
 		WorkDir: "/workspace",
 		Network: "host",
 		User:    "root",
 		GPU:     noneValue,
-		Setup: protocol.RuntimeSetup{
+		Setup: config.RuntimeSetup{
 			ContextCommands: []string{"npm ci"},
 			ContextInputs:   []string{"package-lock.json"},
 		},
@@ -1496,7 +1521,7 @@ func storeTestOCIImage(t *testing.T, store *oci.Store, ref string, seed string) 
 	t.Helper()
 
 	manifest := []byte("manifest:" + seed)
-	config := []byte("config:" + seed)
+	config := fmt.Appendf(nil, `{"config":{"Env":[%q]}}`, "SEED="+seed)
 	layer := []byte("layer:" + seed)
 	image := oci.Image{
 		Reference:      ref,
@@ -1504,15 +1529,24 @@ func storeTestOCIImage(t *testing.T, store *oci.Store, ref string, seed string) 
 		ConfigDigest:   oci.DigestBytes(config),
 		Layers: []oci.Descriptor{{
 			Digest: oci.DigestBytes(layer),
+			Size:   int64(len(layer)),
 		}},
 	}
 	if err := store.StoreManifest(image.ManifestDigest, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(image.ConfigDigest, bytes.NewReader(config)); err != nil {
+	if err := store.StoreBlob(
+		image.ConfigDigest,
+		int64(len(config)),
+		bytes.NewReader(config),
+	); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreBlob(image.Layers[0].Digest, bytes.NewReader(layer)); err != nil {
+	if err := store.StoreBlob(
+		image.Layers[0].Digest,
+		int64(len(layer)),
+		bytes.NewReader(layer),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StoreRef(mustOCIReference(t, ref), image); err != nil {
@@ -1558,4 +1592,21 @@ func assertPathMissing(t *testing.T, path string) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected %s to be missing, got %v", path, err)
 	}
+}
+
+func mustHostBlobPath(t *testing.T, store *syncfs.BlobStore, hash string) string {
+	t.Helper()
+
+	path, err := store.Path(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return path
+}
+
+func testBlobHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+
+	return hex.EncodeToString(sum[:])
 }

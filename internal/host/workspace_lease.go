@@ -23,6 +23,7 @@ const (
 	workspaceLeaseWorkspace  = "workspace"
 	workspaceLeaseIDPrefix   = "ws_"
 	workspaceLeaseIDHexChars = 16
+	workspaceLeaseFileMode   = 0o644
 )
 
 var errWorkspaceLeaseNotFound = errors.New("workspace lease not found")
@@ -46,9 +47,6 @@ type workspaceLeaseMetadata struct {
 	ExpiresAt   time.Time `json:"expires_at"`
 	Dirty       bool      `json:"dirty,omitempty"`
 	LastSession string    `json:"last_session,omitempty"`
-
-	// Older development builds embedded manifests in workspace.json.
-	WorkspaceManifest []syncfs.Entry `json:"workspace_manifest,omitempty"`
 }
 
 type runWorkspace struct {
@@ -327,13 +325,9 @@ func workspaceLeaseManifestPath(contextDir, id string) string {
 }
 
 func loadWorkspaceLease(contextDir, id string) (workspaceLeaseState, error) {
-	state, legacyManifest, err := loadWorkspaceLeaseMetadata(contextDir, id)
+	state, err := loadWorkspaceLeaseMetadata(contextDir, id)
 	if err != nil {
 		return workspaceLeaseState{}, err
-	}
-
-	if len(legacyManifest) > 0 {
-		state.WorkspaceManifest = legacyManifest
 	}
 
 	content, err := os.ReadFile(workspaceLeaseManifestPath(contextDir, state.ID))
@@ -357,25 +351,25 @@ func loadWorkspaceLease(contextDir, id string) (workspaceLeaseState, error) {
 func loadWorkspaceLeaseMetadata(
 	contextDir,
 	id string,
-) (workspaceLeaseState, []syncfs.Entry, error) {
+) (workspaceLeaseState, error) {
 	id, err := normalizeWorkspaceLeaseID(id)
 	if err != nil {
-		return workspaceLeaseState{}, nil, err
+		return workspaceLeaseState{}, err
 	}
 
 	content, err := os.ReadFile(workspaceLeaseMetaPath(contextDir, id))
 	if errors.Is(err, os.ErrNotExist) {
-		return workspaceLeaseState{}, nil,
+		return workspaceLeaseState{},
 			fmt.Errorf("workspace lease %s: %w", id, errWorkspaceLeaseNotFound)
 	}
 
 	if err != nil {
-		return workspaceLeaseState{}, nil, fmt.Errorf("read workspace lease %s: %w", id, err)
+		return workspaceLeaseState{}, fmt.Errorf("read workspace lease %s: %w", id, err)
 	}
 
 	var meta workspaceLeaseMetadata
 	if err := json.Unmarshal(content, &meta); err != nil {
-		return workspaceLeaseState{}, nil, fmt.Errorf("parse workspace lease %s: %w", id, err)
+		return workspaceLeaseState{}, fmt.Errorf("parse workspace lease %s: %w", id, err)
 	}
 
 	if meta.ID == "" {
@@ -390,7 +384,7 @@ func loadWorkspaceLeaseMetadata(
 		ExpiresAt:   meta.ExpiresAt,
 		Dirty:       meta.Dirty,
 		LastSession: meta.LastSession,
-	}, meta.WorkspaceManifest, nil
+	}, nil
 }
 
 func saveWorkspaceLease(contextDir string, state workspaceLeaseState) error {
@@ -407,13 +401,18 @@ func saveWorkspaceLease(contextDir string, state workspaceLeaseState) error {
 		Dirty:       state.Dirty,
 		LastSession: state.LastSession,
 	}
-	if err := writeJSONAtomically(workspaceLeaseMetaPath(contextDir, state.ID), meta); err != nil {
+	if err := writeJSONAtomically(
+		workspaceLeaseMetaPath(contextDir, state.ID),
+		meta,
+		workspaceLeaseFileMode,
+	); err != nil {
 		return err
 	}
 
 	return writeJSONAtomically(
 		workspaceLeaseManifestPath(contextDir, state.ID),
 		state.WorkspaceManifest,
+		workspaceLeaseFileMode,
 	)
 }
 
@@ -480,7 +479,7 @@ func (s *Server) listWorkspaceLeases(
 	var out []protocol.WorkspaceLeaseSummary
 
 	err := forEachWorkspaceLeaseDir(contextDir, func(id string) error {
-		state, _, err := loadWorkspaceLeaseMetadata(contextDir, id)
+		state, err := loadWorkspaceLeaseMetadata(contextDir, id)
 		if err != nil {
 			return err
 		}
@@ -531,7 +530,7 @@ func (s *Server) deleteWorkspaceLeases(
 			return nil, nil, err
 		}
 
-		state, _, loadErr := loadWorkspaceLeaseMetadata(contextDir, id)
+		state, loadErr := loadWorkspaceLeaseMetadata(contextDir, id)
 		if loadErr != nil {
 			releaseDelete()
 
@@ -610,7 +609,7 @@ func (s *Server) pruneExpiredWorkspaceLeasesInContext(
 	var removed []protocol.ContextArtifact
 
 	err := forEachWorkspaceLeaseDir(contextDir, func(id string) error {
-		state, _, err := loadWorkspaceLeaseMetadata(contextDir, id)
+		state, err := loadWorkspaceLeaseMetadata(contextDir, id)
 		if err != nil {
 			if errors.Is(err, errWorkspaceLeaseNotFound) {
 				artifact := workspaceLeaseArtifact(contextDir, id)
@@ -659,7 +658,7 @@ func workspaceLeaseArtifact(contextDir, id string) protocol.ContextArtifact {
 	size, _ := dirSize(path)
 
 	return protocol.ContextArtifact{
-		Kind: "workspace",
+		Kind: workspaceLeaseWorkspace,
 		Name: id,
 		Path: path,
 		Size: size,

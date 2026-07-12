@@ -13,7 +13,10 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-const systemStatsSampleInterval = 250 * time.Millisecond
+const (
+	systemStatsSampleInterval = 250 * time.Millisecond
+	percentScale              = 100
+)
 
 func (s *Server) handleHostStats(
 	ctx context.Context,
@@ -69,10 +72,7 @@ func collectMachineStats(
 ) (protocol.HostCPUStats, protocol.HostMemoryStats, []string, error) {
 	var warnings []string
 
-	logicalCores := runtime.NumCPU()
-	if logicalCores < 1 {
-		logicalCores = 1
-	}
+	logicalCores := max(runtime.NumCPU(), 1)
 
 	physicalCores, err := cpu.CountsWithContext(ctx, false)
 	if err != nil {
@@ -110,6 +110,7 @@ func collectCPUStats(
 	if err != nil {
 		return protocol.HostCPUStats{}, nil, err
 	}
+
 	if len(perCore) > 0 {
 		logicalCores = len(perCore)
 	}
@@ -150,10 +151,10 @@ func summarizeCPUUsage(perCore []float64, logicalCores int) (float64, float64) {
 	var usedCores float64
 
 	for _, percent := range perCore {
-		usedCores += percent / 100
+		usedCores += percent / percentScale
 	}
 
-	return usedCores / float64(logicalCores) * 100, usedCores
+	return usedCores / float64(logicalCores) * percentScale, usedCores
 }
 
 func collectMemoryStats(ctx context.Context) (protocol.HostMemoryStats, []string, error) {

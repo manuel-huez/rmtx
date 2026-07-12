@@ -255,12 +255,14 @@ func (s *Server) ensureContext(
 
 	oldDataDir := contextDataDir(contextDataRoot(meta, s.opts.StateDir), id)
 	oldRuntimeDir := contextDataDir(contextRuntimeRoot(meta, s.opts.StateDir), id)
+
 	meta = hydrateContextMetadata(meta, id, name, rootHint, time.Now().UTC())
 	if samePath(storage.dataRoot, s.opts.StateDir) {
 		meta.DataRoot = ""
 	} else {
 		meta.DataRoot = storage.dataRoot
 	}
+
 	if samePath(storage.runtimeRoot, storage.dataRoot) {
 		meta.RuntimeRoot = ""
 	} else {
@@ -285,6 +287,7 @@ func (s *Server) ensureContext(
 	if err := os.MkdirAll(handle.workspace, defaultDirMode); err != nil {
 		return contextHandle{}, fmt.Errorf("create context workspace: %w", err)
 	}
+
 	if err := os.MkdirAll(handle.runtimeDir, defaultDirMode); err != nil {
 		return contextHandle{}, fmt.Errorf("create context runtime dir: %w", err)
 	}
@@ -320,7 +323,7 @@ func loadContextMetadata(dir string) (contextMetadata, error) {
 }
 
 func saveContextMetadata(dir string, meta contextMetadata) error {
-	return writeJSONAtomically(filepath.Join(dir, contextMetaFile), meta)
+	return writeJSONAtomically(filepath.Join(dir, contextMetaFile), meta, contextFileMode)
 }
 
 func (s *Server) loadTrackedManifest(id string) ([]syncfs.Entry, error) {
@@ -344,7 +347,11 @@ func (s *Server) loadTrackedManifest(id string) ([]syncfs.Entry, error) {
 }
 
 func (s *Server) saveTrackedManifest(id string, entries []syncfs.Entry) error {
-	return writeJSONAtomically(filepath.Join(s.contextsRoot(), id, contextManifestFile), entries)
+	return writeJSONAtomically(
+		filepath.Join(s.contextsRoot(), id, contextManifestFile),
+		entries,
+		contextFileMode,
+	)
 }
 
 func (s *Server) workspaceWasCleaned(id string) bool {
@@ -355,7 +362,11 @@ func (s *Server) workspaceWasCleaned(id string) bool {
 }
 
 func (s *Server) markWorkspaceCleaned(id string) error {
-	return writeJSONAtomically(filepath.Join(s.contextsRoot(), id, contextCleanFile), true)
+	return writeJSONAtomically(
+		filepath.Join(s.contextsRoot(), id, contextCleanFile),
+		true,
+		contextFileMode,
+	)
 }
 
 func (s *Server) clearWorkspaceCleaned(id string) error {
@@ -379,11 +390,13 @@ func cleanWorkspace(path string) error {
 	return nil
 }
 
+//nolint:cyclop,gocognit // Each old/new root combination has distinct data-loss boundaries.
 func resetContextStorageAfterRootChange(
 	metaDir, oldDataDir, newDataDir string,
 	oldRuntimeDir, newRuntimeDir string,
 ) error {
 	dataRootChanged := !samePath(oldDataDir, newDataDir)
+
 	runtimeRootChanged := !samePath(oldRuntimeDir, newRuntimeDir)
 	if !dataRootChanged && !runtimeRootChanged {
 		return nil
@@ -395,15 +408,18 @@ func resetContextStorageAfterRootChange(
 		if err := removeContextWorkspaceData(oldDataDir); err != nil {
 			return fmt.Errorf("delete replaced context workspace data: %w", err)
 		}
+
 		if err := removeContextWorkspaceData(newDataDir); err != nil {
 			return fmt.Errorf("delete replacement context workspace data: %w", err)
 		}
+
 		for _, name := range []string{contextManifestFile, contextCleanFile} {
 			if err := os.Remove(filepath.Join(metaDir, name)); err != nil &&
 				!errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("delete replaced context metadata %s: %w", name, err)
 			}
 		}
+
 		for _, runtimeDir := range uniqueCleanPaths([]string{oldRuntimeDir, newRuntimeDir}) {
 			if err := removeContextSetupCache(runtimeDir); err != nil {
 				return fmt.Errorf("delete replaced context setup cache: %w", err)
@@ -411,20 +427,25 @@ func resetContextStorageAfterRootChange(
 		}
 	}
 
-	if runtimeRootChanged {
-		if !samePath(oldRuntimeDir, oldDataDir) {
-			if err := removeContextWorkspaceData(oldRuntimeDir); err != nil {
-				return fmt.Errorf("delete replaced context runtime workspace data: %w", err)
-			}
+	if runtimeRootChanged && !samePath(oldRuntimeDir, oldDataDir) {
+		if err := removeContextWorkspaceData(oldRuntimeDir); err != nil {
+			return fmt.Errorf("delete replaced context runtime workspace data: %w", err)
 		}
+	}
+
+	if runtimeRootChanged {
 		if err := removeContextRuntimeData(oldRuntimeDir); err != nil {
 			return fmt.Errorf("delete replaced context runtime data: %w", err)
 		}
-		if !samePath(newRuntimeDir, newDataDir) {
-			if err := removeContextWorkspaceData(newRuntimeDir); err != nil {
-				return fmt.Errorf("delete replacement context runtime workspace data: %w", err)
-			}
+	}
+
+	if runtimeRootChanged && !samePath(newRuntimeDir, newDataDir) {
+		if err := removeContextWorkspaceData(newRuntimeDir); err != nil {
+			return fmt.Errorf("delete replacement context runtime workspace data: %w", err)
 		}
+	}
+
+	if runtimeRootChanged {
 		if err := removeContextRuntimeData(newRuntimeDir); err != nil {
 			return fmt.Errorf("delete replacement context runtime data: %w", err)
 		}
@@ -465,29 +486,6 @@ func samePath(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
 }
 
-func writeJSONAtomically(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), defaultDirMode); err != nil {
-		return fmt.Errorf("create parent dir: %w", err)
-	}
-
-	content, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal json: %w", err)
-	}
-
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(content, '\n'), contextFileMode); err != nil {
-		return fmt.Errorf("write temp json: %w", err)
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename temp json: %w", err)
-	}
-
-	return nil
-}
-
 func fallbackContextName(name, rootHint, id string) string {
 	name = strings.TrimSpace(name)
 	if name != "" {
@@ -503,6 +501,10 @@ func fallbackContextName(name, rootHint, id string) string {
 }
 
 func validContextID(id string) bool {
+	if id == "." || id == ".." {
+		return false
+	}
+
 	for _, r := range id {
 		switch {
 		case r >= 'a' && r <= 'z',
@@ -642,6 +644,7 @@ func (s *Server) deleteContexts(
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
 	}
+
 	roots, err := s.stateRootsForContexts(contexts)
 	if err != nil {
 		return protocol.DeleteContextsResponse{}, err
@@ -700,7 +703,9 @@ func (s *Server) pruneCachesAfterContextDelete(ctx context.Context, roots contex
 	return nil
 }
 
-func (s *Server) pruneWSLStagedRootFS(ctx context.Context) ([]protocol.ContextArtifact, int64, error) {
+func (s *Server) pruneWSLStagedRootFS(
+	ctx context.Context,
+) ([]protocol.ContextArtifact, int64, error) {
 	dirs, err := s.contextRuntimeDirs()
 	if err != nil {
 		return nil, 0, err
@@ -889,6 +894,7 @@ func (s *Server) removeContext(id string) error {
 	if err != nil {
 		return err
 	}
+
 	runtimePath, err := s.contextRuntimeDir(id)
 	if err != nil {
 		return err
@@ -901,6 +907,7 @@ func (s *Server) removeContext(id string) error {
 				return fmt.Errorf("delete context %s runtime data: %w", id, err)
 			}
 		}
+
 		if err := pathutil.RemoveAll(metaPath); err != nil {
 			return fmt.Errorf("delete context %s: %w", id, err)
 		}
@@ -911,11 +918,13 @@ func (s *Server) removeContext(id string) error {
 	if err := pathutil.RemoveAll(dataPath); err != nil {
 		return fmt.Errorf("delete context %s data: %w", id, err)
 	}
+
 	if !samePath(runtimePath, dataPath) && !samePath(runtimePath, metaPath) {
 		if err := pathutil.RemoveAll(runtimePath); err != nil {
 			return fmt.Errorf("delete context %s runtime data: %w", id, err)
 		}
 	}
+
 	if err := pathutil.RemoveAll(metaPath); err != nil {
 		return fmt.Errorf("delete context %s metadata: %w", id, err)
 	}
@@ -938,9 +947,22 @@ func (s *Server) syncContextFromClient(
 
 	missing := store.MissingHashes(changed)
 
-	transfer, err := s.prepareBlobReceiveSession(contextID, session, store, changed, missing)
-	if err != nil {
-		return err
+	var transfer *blobTransferSession
+
+	if len(missing) > 0 {
+		created, err := s.prepareBlobReceiveSession(
+			ctx,
+			contextID,
+			session,
+			store,
+			changed,
+			missing,
+		)
+		if err != nil {
+			return err
+		}
+
+		transfer = created
 	}
 
 	if transfer != nil {
@@ -966,7 +988,14 @@ func (s *Server) syncContextFromClient(
 		return err
 	}
 
-	if err := s.waitForClientBlobTransfer(ctx, conn, contextID, session, len(missing), transfer); err != nil {
+	if err := s.waitForClientBlobTransfer(
+		ctx,
+		conn,
+		contextID,
+		session,
+		len(missing),
+		transfer,
+	); err != nil {
 		return err
 	}
 
@@ -983,69 +1012,12 @@ func (s *Server) syncContextFromClient(
 		fileBytes,
 	)
 
-	if err := syncfs.DeletePaths(workspace, deleted); err != nil {
-		return fmt.Errorf("delete tracked paths in context %s: %w", contextID, err)
-	}
-
-	if err := syncfs.ApplyNonFileEntries(
-		workspace,
-		syncfs.NonFileEntries(changed),
-	); err != nil {
-		return fmt.Errorf("apply non-file entries in context %s: %w", contextID, err)
-	}
-
-	if err := s.applyClientFiles(
-		ctx,
-		contextID,
-		session,
-		workspace,
-		store,
-		changed,
-		fileTotal,
-		fileBytes,
-		runLogs,
-	); err != nil {
-		return err
-	}
-
-	s.logRun(runLogs, "sync from client complete: context=%s session=%s", contextID, session)
-
-	return nil
-}
-
-func (s *Server) applyClientFiles(
-	parent context.Context,
-	contextID,
-	session,
-	workspace string,
-	store *syncfs.BlobStore,
-	changed []syncfs.Entry,
-	fileTotal int,
-	fileBytes int64,
-	runLogs *hostLogSubscription,
-) error {
-	if fileTotal == 0 {
-		return nil
-	}
-
-	workers := materializeWorkerCount(fileTotal)
-	s.logRun(
-		runLogs,
-		"apply client files started: context=%s session=%s workers=%d",
-		contextID,
-		session,
-		workers,
-	)
-
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
-
-	jobs := make(chan syncfs.Entry)
-	errCh := make(chan error, 1)
-
 	var progressMu sync.Mutex
+
 	materialized := 0
+
 	var bytesApplied int64
+
 	lastProgress := time.Time{}
 
 	reportLocked := func() {
@@ -1055,6 +1027,7 @@ func (s *Server) applyClientFiles(
 		}
 
 		lastProgress = now
+
 		s.logRun(
 			runLogs,
 			"apply client file progress: context=%s session=%s files=%d/%d bytes=%d/%d",
@@ -1067,84 +1040,24 @@ func (s *Server) applyClientFiles(
 		)
 	}
 
-	addBytes := func(n int) {
+	applyOpts := syncfs.ApplyOptions{}
+	applyOpts.OnWrite = func(n int) {
 		progressMu.Lock()
 		bytesApplied += int64(n)
+
 		reportLocked()
 		progressMu.Unlock()
 	}
 
-	finishEntry := func(copied, size int64) {
+	applyOpts.OnFile = func(syncfs.Entry) {
 		progressMu.Lock()
-		if copied < size {
-			bytesApplied += size - copied
-		}
 		materialized++
+
 		reportLocked()
 		progressMu.Unlock()
 	}
-
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case entry, ok := <-jobs:
-					if !ok {
-						return
-					}
-
-					copied, err := s.materializeClientFile(workspace, store, entry, addBytes)
-					if err != nil {
-						select {
-						case errCh <- fmt.Errorf(
-							"materialize %s in context %s: %w",
-							entry.Path,
-							contextID,
-							err,
-						):
-						default:
-						}
-						cancel()
-
-						return
-					}
-
-					finishEntry(copied, entry.Size)
-				}
-			}
-		}()
-	}
-
-sendJobs:
-	for _, entry := range changed {
-		if entry.Kind != syncfs.KindFile {
-			continue
-		}
-
-		select {
-		case jobs <- entry:
-		case <-ctx.Done():
-			break sendJobs
-		}
-	}
-
-	close(jobs)
-	wg.Wait()
-
-	select {
-	case err := <-errCh:
-		return err
-	default:
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
+	if err := syncfs.ApplyChanges(ctx, workspace, store, changed, deleted, applyOpts); err != nil {
+		return fmt.Errorf("apply sync changes in context %s: %w", contextID, err)
 	}
 
 	progressMu.Lock()
@@ -1159,58 +1072,14 @@ sendJobs:
 		fileBytes,
 	)
 	progressMu.Unlock()
+	s.logRun(runLogs, "sync from client complete: context=%s session=%s", contextID, session)
 
 	return nil
 }
 
-func (s *Server) materializeClientFile(
-	workspace string,
-	store *syncfs.BlobStore,
-	entry syncfs.Entry,
-	onWrite func(int),
-) (int64, error) {
-	targetPath, err := pathutil.SecureJoin(workspace, filepath.FromSlash(entry.Path))
-	if err != nil {
-		return 0, err
-	}
-
-	mode := os.FileMode(entry.Mode)
-	if mode == 0 {
-		mode = defaultFileMode
-	}
-
-	var copied int64
-	err = store.MaterializeWithProgress(
-		entry.Hash,
-		targetPath,
-		mode,
-		entry.ModTime,
-		func(n int) {
-			copied += int64(n)
-			onWrite(n)
-		},
-	)
-	if err != nil {
-		return copied, err
-	}
-
-	return copied, nil
-}
-
-func materializeWorkerCount(files int) int {
-	if files <= 1 {
-		return 1
-	}
-
-	if files < materializeParallel {
-		return files
-	}
-
-	return materializeParallel
-}
-
 func syncFileTotals(entries []syncfs.Entry) (int, int64) {
 	files := 0
+
 	var bytes int64
 
 	for _, entry := range entries {
@@ -1228,40 +1097,39 @@ func syncFileTotals(entries []syncfs.Entry) (int, int64) {
 func blobDescriptorsForHashes(
 	entries []syncfs.Entry,
 	hashes []string,
-) ([]protocol.BlobDescriptor, error) {
+) ([]syncfs.BlobDescriptor, error) {
 	byHash := make(map[string]int64, len(entries))
 	for _, entry := range entries {
 		if entry.Kind != syncfs.KindFile || entry.Hash == "" {
 			continue
 		}
+
 		if _, ok := byHash[entry.Hash]; !ok {
 			byHash[entry.Hash] = entry.Size
 		}
 	}
 
-	descriptors := make([]protocol.BlobDescriptor, 0, len(hashes))
+	descriptors := make([]syncfs.BlobDescriptor, 0, len(hashes))
 	for _, hash := range hashes {
 		size, ok := byHash[hash]
 		if !ok {
 			return nil, fmt.Errorf("unknown blob hash %s", hash)
 		}
-		descriptors = append(descriptors, protocol.BlobDescriptor{Hash: hash, Size: size})
+
+		descriptors = append(descriptors, syncfs.BlobDescriptor{Hash: hash, Size: size})
 	}
 
 	return descriptors, nil
 }
 
 func (s *Server) prepareBlobReceiveSession(
+	ctx context.Context,
 	contextID string,
 	session string,
 	store *syncfs.BlobStore,
 	changed []syncfs.Entry,
 	missing []string,
 ) (*blobTransferSession, error) {
-	if len(missing) == 0 {
-		return nil, nil
-	}
-
 	token, err := protocol.RandomNonce()
 	if err != nil {
 		return nil, err
@@ -1272,10 +1140,18 @@ func (s *Server) prepareBlobReceiveSession(
 		return nil, err
 	}
 
-	chunkSize := protocol.DefaultBlobChunkSize
-	chunks := len(protocol.PlanBlobChunks(descriptors, chunkSize))
+	chunkSize := syncfs.DefaultBlobChunkSize
+
+	chunkPlan, err := syncfs.PlanBlobChunks(descriptors, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := len(chunkPlan)
 	parallel := transferParallelism(chunks)
+
 	transfer, err := newBlobReceiveSession(
+		ctx,
 		contextID,
 		session,
 		token,
